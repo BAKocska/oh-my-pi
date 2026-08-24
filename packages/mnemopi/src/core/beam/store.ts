@@ -147,13 +147,29 @@ function emitEvent(beam: BeamMemoryState, type: string, data: EventPayload): voi
 	void beam.pluginManager?.emit?.(event);
 }
 
+/**
+ * Invalidate every cache derived from `working_memory` / `facts` / `gists` state
+ * after a store, forget, or invalidate write:
+ *  - the polyphonic recall query cache (`queryCache` / legacy `_queryCache`);
+ *  - the polyphonic engine's memoized subject dictionary (`polyphonicEngine`),
+ *    built from `facts.subject` + `gists.participants_json`.
+ *
+ * The dictionary's own staleness check compares `MAX(rowid)` of `facts` and
+ * `gists`, which cannot see a deletion of a non-maximal row, an in-place
+ * `UPDATE`, or SQLite rowid reuse (neither table is `AUTOINCREMENT`, so a
+ * delete-then-insert at the old max rowid leaves the stamp unchanged). Every
+ * write path that can change those tables must therefore call this explicitly
+ * rather than rely on the engine noticing on its own.
+ */
 function invalidateCaches(beam: BeamMemoryState): void {
 	const cache = beam.caches as {
 		queryCache?: { invalidate?: () => void };
 		_queryCache?: { invalidate?: () => void };
+		polyphonicEngine?: { invalidateDictionary?: () => void };
 	};
 	cache.queryCache?.invalidate?.();
 	cache._queryCache?.invalidate?.();
+	cache.polyphonicEngine?.invalidateDictionary?.();
 }
 
 function findDuplicate(beam: BeamMemoryState, content: string): string | null {
@@ -223,12 +239,20 @@ function purgeWorkingMemoryArtifacts(db: BeamMemoryState["db"], ids: readonly st
 }
 
 /**
- * TTL / overflow trim for transient working memory. Only genuine scratch is
- * eligible: `consolidated_at IS NULL` no longer suffices on its own, since
- * restored or imported durable rows legitimately carry a NULL consolidation
- * marker with an old event timestamp (issue #4819). Rows flagged `IMPORTED`
- * are treated as durable and never trimmed, and trimmed rows cascade all linked
- * artifacts via `purgeWorkingMemoryArtifacts`.
+ * TTL / overflow trim for transient working memory. Only rows that have
+ * already been promoted to episodic memory (`consolidated_at IS NOT NULL`)
+ * are eligible for deletion here: a row that has not yet been consolidated
+ * is exactly the data `sleep()` still needs to promote, so trimming it would
+ * destroy memory before it ever reached episodic storage (D7 — promote, or
+ * skip, but never delete un-promoted memory). Rows flagged `IMPORTED` are
+ * additionally exempt even once consolidated, treating restored/imported
+ * banks as durable. Trimmed rows cascade all linked artifacts via
+ * `purgeWorkingMemoryArtifacts`.
+ *
+ * Consequence: consolidation (`sleep`) is now the ONLY path that reclaims
+ * un-consolidated working rows. If consolidation never runs for a session,
+ * its working memory can grow past `workingMemoryLimit` — that unbounded
+ * growth is the accepted cost of never silently losing un-promoted memory.
  */
 function trimWorkingMemory(beam: BeamMemoryState): void {
 	const limit = beam.config.workingMemoryLimit;
@@ -239,13 +263,13 @@ function trimWorkingMemory(beam: BeamMemoryState): void {
 		using selectStatement = beam.db.prepare(`
 			SELECT id FROM working_memory
 			WHERE session_id = ?
-			  AND consolidated_at IS NULL
+			  AND consolidated_at IS NOT NULL
 			  AND trust_tier IS NOT 'IMPORTED'
 			  AND (
 				timestamp < ? OR
 				id NOT IN (
 					SELECT id FROM working_memory
-					WHERE session_id = ? AND consolidated_at IS NULL AND trust_tier IS NOT 'IMPORTED'
+					WHERE session_id = ? AND consolidated_at IS NOT NULL AND trust_tier IS NOT 'IMPORTED'
 					ORDER BY timestamp DESC
 					LIMIT ?
 				)
@@ -889,10 +913,11 @@ export function importFromDict(beam: BeamMemoryState, data: Record<string, unkno
 		consolidation_log: { inserted: 0 },
 	} satisfies ImportStats;
 	const db: Database = beam.db;
-	// Imported working-memory rows are durable, not scratch: stamp any that
-	// arrive unconsolidated so the TTL trim treats them as consolidated and can
-	// never silently discard a restored bank (issue #4819).
-	const importedAt = toUtcIso();
+	// Imported working-memory rows are durable, not scratch, but under D7 the
+	// TTL/overflow trim only ever reclaims rows that ARE consolidated — so an
+	// arriving row with no `consolidated_at` is passed through as NULL, which
+	// is now the protected state (and leaves it eligible for real promotion
+	// via `sleep()` instead of being permanently marked as already handled).
 	const oldToNewRowid = new Map<number, number>();
 
 	transaction(db, () => {
@@ -937,7 +962,7 @@ export function importFromDict(beam: BeamMemoryState, data: Record<string, unkno
 					sqlBinding(item.last_recalled, null),
 					sqlBinding(item.created_at, null),
 					clampVeracity(item.veracity),
-					item.consolidated_at == null ? importedAt : sqlBinding(item.consolidated_at, importedAt),
+					sqlBinding(item.consolidated_at, null),
 					sqlBinding(item.memory_type, "unknown"),
 					sqlBinding(item.embed_text, null),
 					sqlBinding(item.author_id, null),

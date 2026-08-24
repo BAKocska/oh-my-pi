@@ -279,14 +279,27 @@ describe("beam store free functions", () => {
 			.run(durableId, oldTimestamp);
 		seedArtifacts(durableId);
 
-		// (2) Transient scratch row: old timestamp, consolidated_at NULL, STATED tier.
-		const transientId = "transient-scratch";
+		// (2) Un-consolidated scratch row: old timestamp, consolidated_at NULL,
+		// STATED tier (no IMPORTED exemption). D7: the TTL/overflow trim only
+		// ever reclaims rows that ARE consolidated, so this row must survive
+		// purely because `sleep()` has not promoted it yet.
+		const unconsolidatedId = "unconsolidated-scratch";
 		beam.db
 			.prepare(
 				"INSERT INTO working_memory (id, content, source, timestamp, session_id, importance, trust_tier, consolidated_at) VALUES (?, 'idle chatter', 'conversation', ?, 'trim-4819', 0.2, 'STATED', NULL)",
 			)
-			.run(transientId, oldTimestamp);
-		seedArtifacts(transientId);
+			.run(unconsolidatedId, oldTimestamp);
+		seedArtifacts(unconsolidatedId);
+
+		// (3) Already-consolidated old row: past TTL, STATED tier, consolidated_at
+		// set. This is the only shape the TTL/overflow trim may still reclaim.
+		const consolidatedOldId = "consolidated-old";
+		beam.db
+			.prepare(
+				"INSERT INTO working_memory (id, content, source, timestamp, session_id, importance, trust_tier, consolidated_at) VALUES (?, 'already promoted', 'conversation', ?, 'trim-4819', 0.2, 'STATED', ?)",
+			)
+			.run(consolidatedOldId, oldTimestamp, oldTimestamp);
+		seedArtifacts(consolidatedOldId);
 
 		// A normal write triggers the automatic trim.
 		remember(beam, "a fresh conversational note", { source: "conversation" });
@@ -295,17 +308,20 @@ describe("beam store free functions", () => {
 		expect(get(beam, durableId)?.content).toBe("canonical fact");
 		expect(artifactCount(durableId)).toBe(7);
 
-		// Transient old row is trimmed and every linked artifact cascades.
-		expect(get(beam, durableId) === null).toBe(false);
-		expect(countOf("SELECT COUNT(*) AS count FROM working_memory WHERE id = ?", transientId)).toBe(0);
-		expect(artifactCount(transientId)).toBe(0);
+		// Un-consolidated row survives too: trim never deletes un-promoted memory.
+		expect(get(beam, unconsolidatedId)?.content).toBe("idle chatter");
+		expect(artifactCount(unconsolidatedId)).toBe(7);
 
-		// (3) forgetWorking cascades every linked artifact, not just annotations.
+		// Already-consolidated old row is trimmed and every linked artifact cascades.
+		expect(countOf("SELECT COUNT(*) AS count FROM working_memory WHERE id = ?", consolidatedOldId)).toBe(0);
+		expect(artifactCount(consolidatedOldId)).toBe(0);
+
+		// (4) forgetWorking cascades every linked artifact, not just annotations.
 		expect(forgetWorking(beam, durableId)).toBe(true);
 		expect(artifactCount(durableId)).toBe(0);
 	});
 
-	it("marks imported working memory as consolidated so restored banks survive trim (issue #4819)", () => {
+	it("leaves imported un-consolidated working memory NULL so restored banks survive trim (issue #4819, D7)", () => {
 		const dest = makeState("import-4819");
 		const oldTimestamp = new Date(Date.now() - 1000 * 3_600_000).toISOString();
 		importFromDict(
@@ -327,7 +343,12 @@ describe("beam store free functions", () => {
 		const importedRow = dest.db
 			.prepare("SELECT consolidated_at FROM working_memory WHERE id = 'restored-import'")
 			.get() as { consolidated_at: string | null };
-		expect(importedRow.consolidated_at).not.toBeNull();
+		// D7: trim now only reclaims rows that ARE consolidated, so protection
+		// comes from staying NULL — which also leaves the row free to actually
+		// promote via `sleep()` later — rather than from a fake "already
+		// consolidated" stamp that would otherwise make it immediately eligible
+		// for deletion.
+		expect(importedRow.consolidated_at).toBeNull();
 
 		remember(dest, "a fresh note", { source: "conversation" });
 		expect(get(dest, "restored-import")?.content).toBe("durable restored fact");
