@@ -34,12 +34,16 @@ impl builtins::Command for BuiltinCommand {
 		}
 
 		let builtin_name = args[0].to_string();
+		let execute_func = context
+			.shell
+			.builtins()
+			.get(&builtin_name)
+			.filter(|builtin| !builtin.disabled)
+			.map(|builtin| builtin.execute_func.clone());
 
-		if let Some(builtin) = context.shell.builtins().get(&builtin_name)
-			&& !builtin.disabled
-		{
+		if let Some(execute_func) = execute_func {
 			context.command_name = builtin_name;
-			(builtin.execute_func)(context, args).await
+			execute_func(context, args).await
 		} else {
 			Err(ErrorKind::BuiltinNotFound(builtin_name).into())
 		}

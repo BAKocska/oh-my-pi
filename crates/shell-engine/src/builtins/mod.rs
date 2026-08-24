@@ -55,7 +55,7 @@ mod unalias;
 mod unset;
 mod wait;
 
-use std::{ffi, future, io::Write, iter, marker, string};
+use std::{ffi, future, io::Write, iter, marker, string, sync::Arc};
 
 use clap::builder::styling;
 pub use factory::default_builtins;
@@ -74,11 +74,14 @@ use crate::{BuiltinError, CommandArg, commands, error, extensions, results};
 	type_alias_bounds,
 	reason = "the bound documents the callback's shell extension requirement"
 )]
-pub type CommandExecuteFunc<SE: extensions::ShellExtensions> =
-	fn(
-		commands::ExecutionContext<'_, SE>,
-		Vec<commands::CommandArg>,
-	) -> BoxFuture<'_, Result<results::ExecutionResult, error::Error>>;
+pub type CommandExecuteFunc<SE: extensions::ShellExtensions> = Arc<
+	dyn for<'ctx> Fn(
+			commands::ExecutionContext<'ctx, SE>,
+			Vec<commands::CommandArg>,
+		) -> BoxFuture<'ctx, Result<results::ExecutionResult, error::Error>>
+		+ Send
+		+ Sync,
+>;
 
 /// Type of a function to retrieve help content for a built-in command.
 ///
@@ -231,7 +234,7 @@ pub struct Registration<SE: extensions::ShellExtensions> {
 
 impl<SE: extensions::ShellExtensions> Registration<SE> {
 	/// Updates the given registration to mark it for a special builtin.
-	pub const fn special(self) -> Self {
+	pub fn special(self) -> Self {
 		Self { special_builtin: true, ..self }
 	}
 
@@ -239,7 +242,7 @@ impl<SE: extensions::ShellExtensions> Registration<SE> {
 	/// background command. The first word argument becomes the launched command,
 	/// and the wrapper itself is skipped so `$!` can refer to the real child
 	/// PID.
-	pub const fn transparent_background_wrapper(self) -> Self {
+	pub fn transparent_background_wrapper(self) -> Self {
 		Self { transparent_background_wrapper: true, ..self }
 	}
 }
@@ -572,10 +575,10 @@ pub trait SimpleCommand {
 
 /// Returns a built-in command registration, given an implementation of the
 /// `SimpleCommand` trait.
-pub fn simple_builtin<B: SimpleCommand + Send + Sync, SE: extensions::ShellExtensions>()
+pub fn simple_builtin<B: SimpleCommand + Send + Sync + 'static, SE: extensions::ShellExtensions>()
 -> Registration<SE> {
 	Registration {
-		execute_func: exec_simple_builtin::<B, SE>,
+		execute_func: Arc::new(exec_simple_builtin::<B, SE>),
 		content_func: B::get_content,
 		disabled: false,
 		special_builtin: false,
@@ -586,9 +589,10 @@ pub fn simple_builtin<B: SimpleCommand + Send + Sync, SE: extensions::ShellExten
 
 /// Returns a built-in command registration, given an implementation of the
 /// `Command` trait.
-pub fn builtin<B: Command + Send + Sync, SE: extensions::ShellExtensions>() -> Registration<SE> {
+pub fn builtin<B: Command + Send + Sync + 'static, SE: extensions::ShellExtensions>()
+-> Registration<SE> {
 	Registration {
-		execute_func: exec_builtin::<B, SE>,
+		execute_func: Arc::new(exec_builtin::<B, SE>),
 		content_func: get_builtin_content::<B>,
 		disabled: false,
 		special_builtin: false,
@@ -600,10 +604,12 @@ pub fn builtin<B: Command + Send + Sync, SE: extensions::ShellExtensions>() -> R
 /// Returns a built-in command registration, given an implementation of the
 /// `DeclarationCommand` trait. Used for select commands that can take parsed
 /// declarations as arguments.
-pub fn decl_builtin<B: DeclarationCommand + Send + Sync, SE: extensions::ShellExtensions>()
--> Registration<SE> {
+pub fn decl_builtin<
+	B: DeclarationCommand + Send + Sync + 'static,
+	SE: extensions::ShellExtensions,
+>() -> Registration<SE> {
 	Registration {
-		execute_func: exec_declaration_builtin::<B, SE>,
+		execute_func: Arc::new(exec_declaration_builtin::<B, SE>),
 		content_func: get_builtin_content::<B>,
 		disabled: false,
 		special_builtin: false,
@@ -623,11 +629,11 @@ pub fn decl_builtin<B: DeclarationCommand + Send + Sync, SE: extensions::ShellEx
 /// via `set_declarations`. This is primarily only expected to be used with
 /// select builtin commands that wrap other builtins (e.g., "builtin").
 pub fn raw_arg_builtin<
-	B: DeclarationCommand + Default + Send + Sync,
+	B: DeclarationCommand + Default + Send + Sync + 'static,
 	SE: extensions::ShellExtensions,
 >() -> Registration<SE> {
 	Registration {
-		execute_func: exec_raw_arg_builtin::<B, SE>,
+		execute_func: Arc::new(exec_raw_arg_builtin::<B, SE>),
 		content_func: get_builtin_content::<B>,
 		disabled: false,
 		special_builtin: false,
