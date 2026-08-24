@@ -1976,6 +1976,36 @@ impl Editor {
 	pub fn atom_ranges(&self) -> SmallVec<(usize, usize), 4> {
 		self.buffer.atom_ranges()
 	}
+	/// Opens a replacement picker for `range`; acceptance replaces that range.
+	pub fn show_replacements(
+		&mut self,
+		range: Range<usize>,
+		items: impl IntoIterator<Item = Str>,
+	) -> bool {
+		if range.start >= range.end
+			|| range.end > self.buffer.text().len()
+			|| range.end != self.buffer.cursor()
+			|| !self.buffer.text().is_char_boundary(range.start)
+			|| !self.buffer.text().is_char_boundary(range.end)
+		{
+			return false;
+		}
+		let suggestions: SuggestionList = items
+			.into_iter()
+			.take(PICKER_ROWS)
+			.map(|item| Suggestion::new(item.clone(), item))
+			.collect();
+		if suggestions.is_empty() {
+			return false;
+		}
+		self.picker = Some(Picker {
+			prefix_start: range.start,
+			suggestions,
+			selected: 0,
+			provided: false,
+		});
+		true
+	}
 
 	fn submit(&mut self) -> EditOutcome {
 		if self.buffer.text().trim().is_empty() {

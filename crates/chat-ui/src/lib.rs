@@ -17,6 +17,7 @@ pub mod debug_selector;
 pub mod frame;
 pub mod gradient;
 pub mod host;
+pub mod extension_inspector;
 pub mod inspector;
 pub mod log_viewer;
 pub mod modes;
@@ -43,6 +44,11 @@ use std::{sync::Arc, time::Instant};
 pub use agent_hub::{AgentHub, AgentHubEvent};
 pub use blocks::{BlockOrdinal, BlockPhase, BlockTarget, Blocks, Overflow, Plan};
 pub mod image_overlay;
+pub use extension_inspector::{
+	ExtensionCatalogSource, ExtensionDetail, ExtensionDisposition, ExtensionInspector,
+	ExtensionInspectorEvent, ExtensionKind, ExtensionOrigin, ExtensionRow, ExtensionSnapshot,
+	LiveToolView, McpCatalogEntry, McpHealth, McpLiveSnapshot, McpToolView,
+};
 pub use gradient::{EditorGradient, EditorHighlight, GradientStop};
 pub use image_overlay::{ImageOverlay, ImageOverlayEvent};
 pub use inspector::{HistoryInspector, HistoryInspectorEvent};
@@ -80,6 +86,14 @@ pub struct ModelRow {
 	pub input_mtok:  Option<f64>,
 	/// Output price in dollars per million tokens, when known.
 	pub output_mtok: Option<f64>,
+}
+/// Immutable projection of the environment-owned todo tree for the sticky HUD.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TodoHud {
+	/// Pre-rendered Markdown lines from the canonical todo tool result.
+	pub lines:       Vec<Str>,
+	/// Number of task rows represented by `lines`.
+	pub total_tasks: usize,
 }
 
 /// One reflected setting shown by schema-driven TUI surfaces.
@@ -537,8 +551,30 @@ pub enum Intent {
 	ToggleThinking,
 	/// Cycle to the next supported reasoning effort.
 	CycleThinking,
+	/// Request an enablement change from the extension configuration owner.
+	ToggleExtension {
+		/// Stable inspector row identity.
+		id:      Str,
+		/// Requested enabled state.
+		enabled: bool,
+	},
+	/// Release the live MCP subscription owned for the extension inspector.
+	CloseExtensionInspector,
 	/// Toggle planning mode through the backend mode authority.
 	TogglePlan,
+	/// Generate a safe suggested destination for reviewed plan Markdown.
+	PlanSavePathRequest {
+		/// Exact approved Markdown shown by the review overlay.
+		content: Str,
+	},
+	/// Persist approved Markdown through the environment authority, exit plan
+	/// mode, and start a fresh session.
+	SavePlanAndQuit {
+		/// User-selected environment-relative destination.
+		path:    Str,
+		/// Exact approved Markdown shown by the review overlay.
+		content: Str,
+	},
 	/// Toggle real-time voice mode.
 	ToggleLive,
 	/// Toggle speech-to-text capture.
@@ -592,6 +628,17 @@ pub enum BackendEvent {
 		/// Exact approved or proposed plan Markdown.
 		content: Str,
 	},
+	/// Open destination selection after the backend generated a safe topic name.
+	OpenPlanSavePrompt {
+		/// Exact approved Markdown to persist after confirmation.
+		content:        Str,
+		/// Editable safe destination suggestion.
+		suggested_path: Str,
+	},
+	/// Replace the sticky todo HUD from one canonical environment result.
+	TodoHud(TodoHud),
+	/// Deterministically select the full or bounded todo HUD presentation.
+	TodoExpanded(bool),
 	/// Present one pending durable approval ticket.
 	ApprovalPending(ApprovalTicketView),
 	/// Present explicit upload consent for one redacted AutoQA report.
@@ -748,6 +795,14 @@ pub enum BackendEvent {
 	SlashCommands(Vec<omp_tui::Command>),
 	/// Request the live agent hierarchy overlay.
 	OpenAgentTree,
+	/// Open the retained extension inspector over one immutable catalog generation.
+	OpenExtensionInspector(ExtensionSnapshot),
+	/// Atomically replace the declared extension catalog while preserving the overlay.
+	ExtensionSnapshotUpdated(ExtensionSnapshot),
+	/// Merge one live MCP server generation into the open extension inspector.
+	ExtensionMcpUpdated(McpLiveSnapshot),
+	/// Drop live MCP catalogs after one discovery provider is disabled.
+	ExtensionProviderDisabled(Str),
 	/// Copy backend-produced text through the terminal host clipboard authority.
 	CopyToClipboard(Str),
 	/// Request the pause overlay.
@@ -766,6 +821,8 @@ pub enum BackendEvent {
 	ThemePreview(omp_tui::Theme),
 	/// Replace the composer's live chrome without reconstructing the chat.
 	ComposerStyleChanged(ComposerStyle),
+	/// Replace the editor's live spelling feature policy.
+	SpellingFeaturesChanged(omp_tui::SpellingFeatures),
 	/// Update tiny-title model download activity.
 	ModelDownloadProgress(ModelDownloadProgress),
 	/// Start realtime voice composer takeover.

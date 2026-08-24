@@ -154,9 +154,10 @@ impl AgentHub {
 				self.rebuild();
 				return AgentHubEvent::Consumed;
 			},
-			Key::Char('s') | Key::Enter => {
+			Key::Char('s') => {
 				return self.capability_event(|row| row.can_steer, AgentHubEvent::Steer);
 			},
+			Key::Enter => return self.activate_selected(),
 			Key::Char('r') => {
 				return self.capability_event(|row| row.can_revive, AgentHubEvent::Revive);
 			},
@@ -194,6 +195,26 @@ impl AgentHub {
 			self.rebuild();
 		}
 		Layer { frame: self.ui.frame(), options: &self.options, active: true }
+	}
+
+	fn activate_selected(&mut self) -> AgentHubEvent {
+		let Some(row) = self.rows.get(self.selected) else {
+			return AgentHubEvent::Consumed;
+		};
+		if row.can_steer {
+			return AgentHubEvent::Steer(row.id.clone());
+		}
+		if row.can_revive {
+			return AgentHubEvent::Revive(row.id.clone());
+		}
+		if row.frozen
+			|| row.status.eq_ignore_ascii_case("aborted")
+			|| row.status.eq_ignore_ascii_case("dead")
+		{
+			self.view = HubView::Transcript;
+			self.rebuild();
+		}
+		AgentHubEvent::Consumed
 	}
 
 	fn capability_event(
@@ -479,4 +500,63 @@ fn build(
 		})
 	};
 	Ui::from_root(root, width, ctx.clone())
+}
+#[cfg(test)]
+mod tests {
+	use super::{AgentHub, AgentHubEvent, HubView};
+	use crate::AgentRow;
+	use omp_core::Str;
+	use omp_tui::{Key, UiContext};
+
+	fn row(status: &'static str, can_steer: bool, can_revive: bool) -> AgentRow {
+		AgentRow {
+			id: Str::new_static("agent"),
+			name: Str::new_static("agent"),
+			parent: Some(Str::new_static("root")),
+			depth: 1,
+			status: Str::new_static(status),
+			tool: None,
+			tokens: None,
+			definition: None,
+			model: None,
+			serving_model: None,
+			transcript: Str::new_static("final transcript"),
+			assignment: None,
+			requests: 0,
+			tool_calls: 0,
+			context_tokens: 0,
+			cost_micros: 0,
+			terminal_kind: None,
+			terminal_summary: None,
+			artifact_uri: None,
+			frozen: false,
+			can_steer,
+			can_revive,
+			can_kill: false,
+		}
+	}
+
+	#[test]
+	fn enter_opens_terminal_transcripts_and_preserves_live_actions() {
+		let ctx = UiContext::default();
+		let mut dead = AgentHub::open(&[row("dead", false, false)], &ctx);
+		assert_eq!(dead.handle_key(Key::Enter), AgentHubEvent::Consumed);
+		assert_eq!(dead.view, HubView::Transcript);
+
+		let mut aborted = AgentHub::open(&[row("aborted", false, false)], &ctx);
+		assert_eq!(aborted.handle_key(Key::Enter), AgentHubEvent::Consumed);
+		assert_eq!(aborted.view, HubView::Transcript);
+
+		let mut live = AgentHub::open(&[row("running", true, false)], &ctx);
+		assert_eq!(
+			live.handle_key(Key::Enter),
+			AgentHubEvent::Steer(Str::new_static("agent")),
+		);
+
+		let mut parked = AgentHub::open(&[row("parked", false, true)], &ctx);
+		assert_eq!(
+			parked.handle_key(Key::Enter),
+			AgentHubEvent::Revive(Str::new_static("agent")),
+		);
+	}
 }

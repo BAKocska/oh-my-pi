@@ -46,6 +46,7 @@ pub mod scene;
 /// CPU fragment-shader effects packed into half-block cells.
 pub mod shader;
 mod sixel;
+pub mod spelling;
 pub mod syntax;
 mod terminal;
 #[doc(hidden)]
@@ -86,6 +87,7 @@ pub use input::{
 	Chord, InputDecoder, InputEvent, Key, Keymap, Mods, Mouse, MouseButton, MouseReport,
 	TerminalResponse, UiEvent, decode_keys,
 };
+pub use spelling::{SpellingAssist, SpellingResult, SpellingFeatures, TypoRange};
 pub use markup::{Border, Dim, MarkupOrigin, ParseError, parse_with_origin};
 pub use notify::{
 	Notification, NotificationAction, NotificationBuilder, NotificationSound, Urgency, notify,

@@ -9,7 +9,8 @@ use omp_tui::{
 
 use crate::{OverlayPanel, panel_divider};
 
-const REVIEW_HINT: &str = "↑/↓ section · Ctrl+A annotate section · Ctrl+S submit · Esc close";
+const REVIEW_HINT: &str =
+	"↑/↓ section · Ctrl+A annotate · Ctrl+S submit · Ctrl+Q save and quit · Esc close";
 
 /// One parsed plan segment shown in the table of contents.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -66,6 +67,8 @@ pub enum PlanReviewEvent {
 	AnnotationsChanged(PlanReviewAnnotations),
 	/// Submit all feedback to the live host.
 	Submit(PlanReviewAnnotations),
+	/// Save the exact reviewed Markdown and start a fresh session.
+	SaveAndQuit(Str),
 	/// Close without submitting.
 	Cancel,
 }
@@ -76,6 +79,7 @@ pub struct PlanReviewOverlay {
 	ctx:         UiContext,
 	options:     OverlayOptions,
 	sections:    Vec<PlanReviewSection>,
+	content:     Str,
 	current:     usize,
 	annotations: PlanReviewAnnotations,
 	width:       u16,
@@ -100,6 +104,7 @@ impl PlanReviewOverlay {
 				.fill_height()
 				.z(35),
 			sections,
+			content: Str::new(plan),
 			current: 0,
 			annotations,
 			width,
@@ -116,6 +121,7 @@ impl PlanReviewOverlay {
 				self.capture_overall();
 				PlanReviewEvent::Submit(self.annotations.clone())
 			},
+			Key::Ctrl('q') => PlanReviewEvent::SaveAndQuit(self.content.clone()),
 			_ => {
 				let event = self.ui.handle_key(key);
 				self.route(event)
@@ -327,4 +333,19 @@ fn line_offsets(text: &str) -> impl Iterator<Item = (usize, &str)> {
 		offset += line.len();
 		(start, line.trim_end_matches(['\r', '\n']))
 	})
+}
+#[cfg(test)]
+mod tests {
+	use super::{PlanReviewEvent, PlanReviewOverlay};
+	use omp_tui::{Key, UiContext};
+
+	#[test]
+	fn save_and_quit_returns_exact_reviewed_markdown() {
+		let plan = "# Topic\n\nApproved body.\n";
+		let mut review = PlanReviewOverlay::open(plan, Default::default(), &UiContext::default());
+		let PlanReviewEvent::SaveAndQuit(content) = review.handle_key(Key::Ctrl('q')) else {
+			panic!("Ctrl+Q must request plan save");
+		};
+		assert_eq!(content, plan);
+	}
 }

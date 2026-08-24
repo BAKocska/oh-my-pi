@@ -13,8 +13,8 @@ use std::{
 use omp_core::{IntoStr, Str, StrMut, fmts_mut, sf};
 use omp_tui::{
 	Border, Cached, Charset, Color, Command, Component, Decor, DecorKind, Frame, Icon, Key,
-	MouseReport, PaintCtx, Prop, Props, Rect, Size, SlashCommands, Slot, Style, Theme, Ui,
-	UiContext, UiEvent,
+	MouseReport, PaintCtx, Prop, Props, Rect, Size, SlashCommands, Slot, SpellingFeatures, Style,
+	Theme, Ui, UiContext, UiEvent,
 	anim::{self, Easing, Shimmer, Tween},
 	components::{
 		Attachment, AttachmentContent, Attachments, ComposerStatusAttachment, ComposerStyle,
@@ -28,7 +28,7 @@ use smallvec::SmallVec;
 
 use crate::{
 	ActivityWaveform, AgentRow, BackendEvent, CompactionSpeculationStatus, ModelDownloadProgress,
-	QueuedPrompt, StatusFacts, StatusLayout, StatusSeparator, SubmitMode, ThinkingLevel,
+	QueuedPrompt, StatusFacts, StatusLayout, StatusSeparator, SubmitMode, ThinkingLevel, TodoHud,
 	TranscriptFrame, TranscriptFrameKind,
 	blocks::{BlockOrdinal, Blocks},
 	frame::{FrameError, FrameMutation, RetainedFrames, render_frame_tml},
@@ -1438,6 +1438,8 @@ struct ChromeLayout {
 	working_y:     u16,
 	error_rows:    u16,
 	download_rows: u16,
+	/// Rows reserved for the sticky todo HUD.
+	todo_rows:     u16,
 	/// Rows available to the live transcript region.
 	h_live:        u16,
 }
@@ -1472,6 +1474,9 @@ pub struct Chat {
 	slots:                   Slots,
 	agents:                  Vec<AgentRow>,
 	agent_labels:            Vec<Str>,
+	todo_lines:              Vec<Str>,
+	todo_collapsed_lines:    Vec<Str>,
+	todo_expanded:           bool,
 	retained_frames:         RetainedFrames,
 	pinned_error:            Option<Str>,
 	download_activity:       Option<DownloadActivity>,
@@ -1531,6 +1536,9 @@ impl Chat {
 			layout_width: 0,
 			agents: Vec::new(),
 			agent_labels: Vec::new(),
+			todo_lines: Vec::new(),
+			todo_collapsed_lines: Vec::new(),
+			todo_expanded: false,
 			retained_frames: RetainedFrames::new(),
 			pinned_error: None,
 			download_activity: None,
@@ -1557,6 +1565,16 @@ impl Chat {
 			self.blocks.finalize(assistant.ordinal);
 		}
 		self.bump_live();
+	}
+
+	/// Replaces the editor's live spelling feature policy.
+	pub fn set_spelling_features(&mut self, features: SpellingFeatures) {
+		self
+			.editor_ui
+			.update_component::<EditorPane>(INPUT_ID, |pane| {
+				pane.set_spelling_features(features);
+				true
+			});
 	}
 
 	/// Switches the built-in composer chrome and its status attachment.
@@ -1858,6 +1876,7 @@ impl Chat {
 
 	/// Begins a live assistant message.
 	pub fn begin_assistant(&mut self, id: impl Into<Str>) {
+		self.finalize_abandoned_streams();
 		let ordinal = self.blocks.create();
 		self.live_assistant = Some(LiveAssistant {
 			ordinal,
@@ -1868,6 +1887,20 @@ impl Chat {
 			allocation: 0,
 		});
 		self.bump_live();
+	}
+
+	/// Finalizes and drops streams which did not receive their terminal event.
+	///
+	/// The abandoned producer has no durable transcript item, so cleanup only
+	/// settles its allocation block; it never invents replacement transcript
+	/// content.
+	fn finalize_abandoned_streams(&mut self) {
+		if let Some(assistant) = self.live_assistant.take() {
+			self.blocks.finalize(assistant.ordinal);
+		}
+		for tool in self.live_tools.drain(..) {
+			self.blocks.finalize(tool.ordinal);
+		}
 	}
 
 	/// Appends a delta to a matching live assistant message.
@@ -2236,6 +2269,36 @@ impl Chat {
 		&self.agents
 	}
 
+	/// Replaces the sticky todo HUD from a canonical environment projection.
+	pub fn set_todo_hud(&mut self, todo: TodoHud) {
+		self.todo_lines = todo.lines;
+		self.todo_collapsed_lines.clear();
+		let mut visible_tasks = 0_usize;
+		for line in &self.todo_lines {
+			let task = line.trim_start().starts_with("- [");
+			if task && visible_tasks == 5 {
+				break;
+			}
+			self.todo_collapsed_lines.push(line.clone());
+			visible_tasks += usize::from(task);
+		}
+		let hidden = todo.total_tasks.saturating_sub(visible_tasks);
+		if hidden > 0 {
+			self
+				.todo_collapsed_lines
+				.push(sf!("{hidden} more todo{}", if hidden == 1 { "" } else { "s" }));
+		}
+		self.bump_live();
+	}
+
+	/// Selects the full or bounded sticky todo HUD presentation.
+	pub fn set_todo_expanded(&mut self, expanded: bool) {
+		if self.todo_expanded != expanded {
+			self.todo_expanded = expanded;
+			self.bump_live();
+		}
+	}
+
 	/// Replaces the complete status snapshot.
 	pub fn set_status(&mut self, facts: StatusFacts) {
 		let now = self.started_at.elapsed();
@@ -2448,12 +2511,15 @@ impl Chat {
 				}
 			},
 			BackendEvent::AgentRoster(rows) => self.set_agent_roster(rows),
+			BackendEvent::TodoHud(todo) => self.set_todo_hud(todo),
+			BackendEvent::TodoExpanded(expanded) => self.set_todo_expanded(expanded),
 			BackendEvent::SlashCommands(commands) => self.set_slash_commands(commands),
 			BackendEvent::Notice(text) => self.push_notice(text),
 			BackendEvent::Error(text) => self.push_error(text),
 			BackendEvent::Status(facts) => self.set_status(facts),
 			BackendEvent::ThemePreview(theme) => self.preview_theme(theme),
 			BackendEvent::ComposerStyleChanged(style) => self.set_composer_style(style),
+			BackendEvent::SpellingFeaturesChanged(features) => self.set_spelling_features(features),
 			BackendEvent::ModelDownloadProgress(progress) => {
 				let now = self.started_at.elapsed();
 				self.download_activity = Some(DownloadActivity::new(progress, now));
@@ -2491,6 +2557,11 @@ impl Chat {
 			| BackendEvent::HistoryInspect { .. }
 			| BackendEvent::OpenGuidedGoal
 			| BackendEvent::OpenPlanReview { .. }
+			| BackendEvent::OpenPlanSavePrompt { .. }
+			| BackendEvent::OpenExtensionInspector(_)
+			| BackendEvent::ExtensionSnapshotUpdated(_)
+			| BackendEvent::ExtensionMcpUpdated(_)
+			| BackendEvent::ExtensionProviderDisabled(_)
 			| BackendEvent::ApprovalSettled { .. }
 			| BackendEvent::PtyStarted { .. }
 			| BackendEvent::PtyOutput { .. }
@@ -2632,7 +2703,23 @@ impl Chat {
 				.is_some_and(|activity| activity.visible(elapsed)),
 		)
 		.min(available_chrome.saturating_sub(error_rows));
-		let h_live = working_y.saturating_sub(error_rows.saturating_add(download_rows));
+		let todo_len = if self.todo_expanded {
+			self.todo_lines.len()
+		} else {
+			self.todo_collapsed_lines.len()
+		};
+		let todo_rows = if todo_len == 0 {
+			0
+		} else {
+			u16::try_from(todo_len.saturating_add(1))
+				.unwrap_or(u16::MAX)
+				.min(available_chrome.saturating_sub(error_rows.saturating_add(download_rows)))
+		};
+		let h_live = working_y.saturating_sub(
+			error_rows
+				.saturating_add(download_rows)
+				.saturating_add(todo_rows),
+		);
 		ChromeLayout {
 			editor_height,
 			editor_y,
@@ -2640,6 +2727,7 @@ impl Chat {
 			working_y,
 			error_rows,
 			download_rows,
+			todo_rows,
 			h_live,
 		}
 	}
@@ -2666,6 +2754,7 @@ impl Chat {
 			working_y,
 			error_rows,
 			download_rows,
+			todo_rows,
 			h_live,
 		} = chrome;
 		// Settled snapshots stay in the mutable viewport, re-measured at the
@@ -2910,6 +2999,31 @@ impl Chat {
 				&activity.label,
 				ink(self.ctx.theme.muted),
 			)]);
+			chrome_y = chrome_y.saturating_add(download_rows);
+		}
+		if todo_rows > 0 {
+			draw_line(&mut self.frame, 1, chrome_y, content_width.saturating_sub(2), &[Span::new(
+				"TODO",
+				ink(self.ctx.theme.accent).bold(),
+			)]);
+			let lines = if self.todo_expanded {
+				&self.todo_lines
+			} else {
+				&self.todo_collapsed_lines
+			};
+			for (offset, line) in lines
+				.iter()
+				.take(usize::from(todo_rows.saturating_sub(1)))
+				.enumerate()
+			{
+				draw_line(
+					&mut self.frame,
+					1,
+					chrome_y.saturating_add(u16::try_from(offset).unwrap_or(u16::MAX)).saturating_add(1),
+					content_width.saturating_sub(2),
+					&[Span::new(line.as_str(), ink(self.ctx.theme.muted))],
+				);
+			}
 		}
 		if self.is_working() {
 			self.draw_working_owned(working_y, elapsed);
@@ -3957,6 +4071,47 @@ mod tests {
 				.iter()
 				.all(|(start, end)| { start <= end && *end <= viewport.height })
 		);
+	}
+
+	#[test]
+	fn next_assistant_begin_finalizes_orphan_without_transcript_content() {
+		let mut chat = Chat::new(&ctx());
+		chat.begin_assistant("orphan");
+		chat.append_assistant("orphan", "partial transport output");
+		assert_eq!(chat.blocks.phase(BlockOrdinal(0)), Some(BlockPhase::Queued));
+
+		chat.begin_assistant("retry");
+
+		assert_eq!(
+			chat.blocks.phase(BlockOrdinal(0)),
+			Some(BlockPhase::FinalizedPending),
+		);
+		assert!(!chat.entries.contains_key(&BlockOrdinal(0)));
+		assert_eq!(chat.live_assistant.as_ref().map(|message| message.id.as_str()), Some("retry"));
+	}
+
+	#[test]
+	fn todo_hud_expands_and_collapses_deterministically() {
+		let mut chat = Chat::new(&ctx());
+		let lines = (1..=8)
+			.map(|task| sf!("- [ ] Task {task}"))
+			.collect::<Vec<_>>();
+		chat.set_todo_hud(TodoHud { lines, total_tasks: 8 });
+		let viewport = Size::new(60, 20);
+
+		let collapsed = frame_text(chat.render(viewport).frame);
+		assert!(collapsed.contains("Task 5"), "{collapsed}");
+		assert!(!collapsed.contains("Task 8"), "{collapsed}");
+		assert!(collapsed.contains("3 more todos"), "{collapsed}");
+
+		chat.set_todo_expanded(true);
+		let expanded = frame_text(chat.render(viewport).frame);
+		assert!(expanded.contains("Task 8"), "{expanded}");
+		assert!(!expanded.contains("more todos"), "{expanded}");
+
+		chat.set_todo_expanded(false);
+		let collapsed_again = frame_text(chat.render(viewport).frame);
+		assert!(!collapsed_again.contains("Task 8"), "{collapsed_again}");
 	}
 
 	#[test]

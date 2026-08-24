@@ -21,8 +21,9 @@ use smallvec::SmallVec;
 
 use crate::{
 	AgentHub, AgentHubEvent, ApprovalAction, ApprovalTicketView, BackendEvent, Chat, ChatKey,
-	CommandPalette, HistoryInspector, HistoryInspectorEvent, ImageOverlay, ImageOverlayEvent,
-	Intent, ListPicker, ListRow, ModelPicker, ModelRow, PaletteAction, PaletteEntry, PaletteEvent,
+	CommandPalette, ExtensionInspector, ExtensionInspectorEvent, HistoryInspector,
+	HistoryInspectorEvent, ImageOverlay, ImageOverlayEvent, Intent, ListPicker, ListRow, ModelPicker,
+	ModelRow, PaletteAction, PaletteEntry, PaletteEvent,
 	PickerEvent, PromptEvent, PromptOverlay, ProviderPicker, PtyEvent, PtyOverlay, RewindTargetRow,
 	SelectionPurpose, SessionRow, SettingChange, SettingRow, Sidebar, SubmitMode, Welcome,
 	WelcomeEvent,
@@ -836,6 +837,8 @@ enum Overlay {
 	Models(ModelPicker),
 	GuidedGoal(GuidedGoalInterview),
 	PlanReview(PlanReviewOverlay),
+	PlanSave { prompt: PromptOverlay, content: Str },
+	Extensions(ExtensionInspector),
 	Pty(PtyOverlay),
 	Palette(CommandPalette),
 	List { picker: ListPicker, rows: Vec<ListRow>, prefill: Vec<Str>, purpose: ListPurpose },
@@ -857,6 +860,9 @@ enum OverlayEvent {
 	Consumed,
 	GoalComplete { objective: Str, token_budget: Option<u64> },
 	PlanReviewComplete(Str),
+	PlanSavePathRequest(Str),
+	PlanSaveSubmit { path: Str, content: Str },
+	ExtensionToggle { id: Str, enabled: bool },
 	PtyInput { id: Str, data: bytes::Bytes },
 	PtyKill { id: Str },
 	Close,
@@ -889,6 +895,14 @@ impl Overlay {
 				let event = review.handle_key(key);
 				plan_review_event(event, review.sections())
 			},
+			Self::PlanSave { prompt, content } => match prompt_event(prompt.handle_key(key)) {
+				OverlayEvent::Prompt(path) => {
+					OverlayEvent::PlanSaveSubmit { path, content: content.clone() }
+				},
+				OverlayEvent::PromptCancel => OverlayEvent::Close,
+				event => event,
+			},
+			Self::Extensions(inspector) => extension_inspector_event(inspector.handle_key(key)),
 			Self::Pty(pty) => match pty.handle_key(key) {
 				PtyEvent::Input(data) => OverlayEvent::PtyInput { id: pty.id().clone(), data },
 				PtyEvent::ForceKill => OverlayEvent::PtyKill { id: pty.id().clone() },
@@ -937,6 +951,14 @@ impl Overlay {
 				let event = review.handle_paste(text);
 				plan_review_event(event, review.sections())
 			},
+			Self::PlanSave { prompt, content } => match prompt_event(prompt.handle_paste(text)) {
+				OverlayEvent::Prompt(path) => {
+					OverlayEvent::PlanSaveSubmit { path, content: content.clone() }
+				},
+				OverlayEvent::PromptCancel => OverlayEvent::Close,
+				event => event,
+			},
+			Self::Extensions(_) => OverlayEvent::Consumed,
 			Self::Pty(pty) => match pty.handle_paste(text) {
 				PtyEvent::Input(data) => OverlayEvent::PtyInput { id: pty.id().clone(), data },
 				PtyEvent::ForceKill => OverlayEvent::PtyKill { id: pty.id().clone() },
@@ -986,6 +1008,18 @@ impl Overlay {
 				let event = review.handle_mouse(col, row, kind, viewport);
 				plan_review_event(event, review.sections())
 			},
+			Self::PlanSave { prompt, content } => {
+				match prompt_event(prompt.handle_mouse(col, row, kind, viewport)) {
+					OverlayEvent::Prompt(path) => {
+						OverlayEvent::PlanSaveSubmit { path, content: content.clone() }
+					},
+					OverlayEvent::PromptCancel => OverlayEvent::Close,
+					event => event,
+				}
+			},
+			Self::Extensions(inspector) => {
+				extension_inspector_event(inspector.handle_mouse(col, row, kind, viewport))
+			},
 			Self::Pty(_) => OverlayEvent::Consumed,
 			Self::Palette(palette) => palette_event(palette.handle_mouse(col, row, kind, viewport)),
 			Self::List { picker, .. } => picker_event(picker.handle_mouse(col, row, kind, viewport)),
@@ -1024,6 +1058,8 @@ impl Overlay {
 			Self::Models(picker) => picker.layer(viewport),
 			Self::GuidedGoal(interview) => interview.layer(viewport),
 			Self::PlanReview(review) => review.layer(viewport),
+			Self::PlanSave { prompt, .. } => prompt.layer(viewport),
+			Self::Extensions(inspector) => inspector.layer(viewport),
 			Self::Pty(pty) => pty.layer(viewport),
 			Self::Palette(palette) => palette.layer(viewport),
 			Self::List { picker, .. } => picker.layer(viewport),
@@ -1069,9 +1105,20 @@ fn plan_review_event(event: PlanReviewEvent, sections: &[PlanReviewSection]) -> 
 		PlanReviewEvent::Submit(annotations) => {
 			OverlayEvent::PlanReviewComplete(annotations.prompt(sections))
 		},
+		PlanReviewEvent::SaveAndQuit(content) => OverlayEvent::PlanSavePathRequest(content),
 		PlanReviewEvent::Cancel => OverlayEvent::Close,
 	}
 }
+fn extension_inspector_event(event: ExtensionInspectorEvent) -> OverlayEvent {
+	match event {
+		ExtensionInspectorEvent::Consumed => OverlayEvent::Consumed,
+		ExtensionInspectorEvent::Close => OverlayEvent::Close,
+		ExtensionInspectorEvent::Toggle { id, enabled } => {
+			OverlayEvent::ExtensionToggle { id, enabled }
+		},
+	}
+}
+
 fn agent_hub_event(event: AgentHubEvent) -> OverlayEvent {
 	match event {
 		AgentHubEvent::Consumed => OverlayEvent::Consumed,
@@ -1605,6 +1652,30 @@ fn apply_backend(host: &mut ChatHost, event: BackendEvent, ctx: &UiContext) {
 				ctx,
 			)));
 		},
+		BackendEvent::OpenPlanSavePrompt { content, suggested_path } => {
+			host.overlay = Some(Overlay::PlanSave {
+				prompt: PromptOverlay::open_prefilled("Save plan and quit", suggested_path, ctx),
+				content,
+			});
+		},
+		BackendEvent::OpenExtensionInspector(snapshot) => {
+			host.overlay = Some(Overlay::Extensions(ExtensionInspector::open(snapshot, ctx)));
+		},
+		BackendEvent::ExtensionSnapshotUpdated(snapshot) => {
+			if let Some(Overlay::Extensions(inspector)) = host.overlay.as_mut() {
+				inspector.update_snapshot(snapshot);
+			}
+		},
+		BackendEvent::ExtensionMcpUpdated(snapshot) => {
+			if let Some(Overlay::Extensions(inspector)) = host.overlay.as_mut() {
+				inspector.update_mcp(snapshot);
+			}
+		},
+		BackendEvent::ExtensionProviderDisabled(provider_id) => {
+			if let Some(Overlay::Extensions(inspector)) = host.overlay.as_mut() {
+				inspector.provider_disabled(provider_id.as_str());
+			}
+		},
 		BackendEvent::HistoryInspect { frame } => {
 			host.overlay = Some(Overlay::History(HistoryInspector::open(frame)));
 		},
@@ -1820,9 +1891,25 @@ fn apply_overlay_event(
 			});
 			host.overlay = None;
 		},
+		OverlayEvent::PlanSavePathRequest(content) => {
+			send(intents, Intent::PlanSavePathRequest { content });
+			host.overlay = None;
+		},
+		OverlayEvent::PlanSaveSubmit { path, content } => {
+			send(intents, Intent::SavePlanAndQuit { path, content });
+			host.overlay = None;
+		},
+		OverlayEvent::ExtensionToggle { id, enabled } => {
+			send(intents, Intent::ToggleExtension { id, enabled });
+		},
 		OverlayEvent::PtyInput { id, data } => send(intents, Intent::PtyInput { id, data }),
 		OverlayEvent::PtyKill { id } => send(intents, Intent::PtyKill { id }),
-		OverlayEvent::Close => host.overlay = None,
+		OverlayEvent::Close => {
+			if matches!(host.overlay, Some(Overlay::Extensions(_))) {
+				send(intents, Intent::CloseExtensionInspector);
+			}
+			host.overlay = None;
+		},
 		OverlayEvent::OpenAgentPrompt(agent_id) => {
 			host.overlay = Some(Overlay::AgentPrompt {
 				prompt: PromptOverlay::open("Steer selected agent", false, ctx),

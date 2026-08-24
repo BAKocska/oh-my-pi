@@ -55,6 +55,8 @@ pub enum TerminalId {
 	Alacritty,
 	/// Warp.
 	Warp,
+	/// Orca.
+	Orca,
 }
 
 impl TerminalId {
@@ -70,6 +72,7 @@ impl TerminalId {
 			Self::Vscode => "vscode",
 			Self::Alacritty => "alacritty",
 			Self::Warp => "warp",
+			Self::Orca => "orca",
 		}
 	}
 }
@@ -884,6 +887,7 @@ fn detect_terminal_id(vars: &impl Fn(&str) -> Option<String>) -> TerminalId {
 			("vscode", TerminalId::Vscode),
 			("alacritty", TerminalId::Alacritty),
 			("warpterminal", TerminalId::Warp),
+			("orca", TerminalId::Orca),
 			("apple_terminal", TerminalId::Base),
 		] {
 			if program.eq_ignore_ascii_case(name) {
@@ -927,6 +931,7 @@ fn detect_charset(vars: &impl Fn(&str) -> Option<String>, id: TerminalId) -> Cha
 		| TerminalId::Iterm2
 		| TerminalId::Vscode
 		| TerminalId::Alacritty => Charset::Unicode,
+		TerminalId::Orca => Charset::Unicode,
 	}
 }
 
@@ -1032,6 +1037,7 @@ fn default_protocol(
 		TerminalId::Iterm2 => Some(ImageProtocol::Iterm2),
 		TerminalId::Warp => warp_protocol(vars, platform),
 		TerminalId::Base | TerminalId::TrueColor | TerminalId::Vscode | TerminalId::Alacritty => None,
+		TerminalId::Orca => None,
 	};
 	known.or_else(|| fallback_protocol(vars, id, tty))
 }
@@ -1128,6 +1134,7 @@ const fn terminal_feature_table(id: TerminalId) -> (bool, bool, bool, bool) {
 		| TerminalId::Vscode
 		| TerminalId::Alacritty => (true, false, false, false),
 		TerminalId::Base | TerminalId::TrueColor | TerminalId::Warp => (false, false, false, false),
+		TerminalId::Orca => (false, false, false, false),
 	}
 }
 
@@ -1138,7 +1145,7 @@ const fn terminal_feature_table(id: TerminalId) -> (bool, bool, bool, bool) {
 /// scrollback-with-region profile), Alacritty (`region.start == 0`), and
 /// xterm.js/VS Code (`scrollTop === 0`).
 const fn margin_scrollback_default(id: TerminalId) -> bool {
-	!matches!(id, TerminalId::Base | TerminalId::TrueColor | TerminalId::Warp)
+	!matches!(id, TerminalId::Base | TerminalId::TrueColor | TerminalId::Warp | TerminalId::Orca)
 }
 
 fn parse_major_minor(version: &str) -> Option<(u32, u32)> {
@@ -1189,6 +1196,7 @@ const fn notification_protocol(id: TerminalId) -> NotifyProtocol {
 		TerminalId::Base | TerminalId::TrueColor | TerminalId::Vscode | TerminalId::Alacritty => {
 			NotifyProtocol::Bell
 		},
+		TerminalId::Orca => NotifyProtocol::Bell,
 	}
 }
 
@@ -1196,6 +1204,7 @@ const fn jamo_width(id: TerminalId) -> u8 {
 	match id {
 		TerminalId::Ghostty => 2,
 		TerminalId::Warp => 1,
+		TerminalId::Orca => 2,
 		_ => 0,
 	}
 }
@@ -1341,6 +1350,24 @@ mod tests {
 		}
 		.with_terminal_caps(&caps);
 		assert_eq!(context.theme.accent, Color::Indexed(223));
+	}
+	#[test]
+	fn orca_uses_wide_hangul_compatibility_jamo_only_for_orca() {
+		let orca = detect(
+			&[
+				("TERM_PROGRAM", "Orca"),
+				("TERM", "xterm-256color"),
+				("COLORTERM", "truecolor"),
+			],
+			TerminalPlatform::MacOs,
+		);
+		assert_eq!(orca.id, TerminalId::Orca);
+		assert_eq!(orca.jamo_width, 2);
+		let iterm = detect(
+			&[("TERM_PROGRAM", "iTerm.app"), ("TERM", "xterm-256color")],
+			TerminalPlatform::MacOs,
+		);
+		assert_eq!(iterm.jamo_width, 0);
 	}
 
 	#[test]

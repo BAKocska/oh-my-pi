@@ -286,6 +286,18 @@ impl PromptOverlay {
 		}
 	}
 
+	/// Opens a plain prompt with an editable suggested value.
+	pub fn open_prefilled(
+		title: impl IntoStr,
+		value: impl IntoStr,
+		ctx: &UiContext,
+	) -> Self {
+		let mut prompt = Self::open(title, false, ctx);
+		let value = value.into_str();
+		prompt.ui.set_text("prompt-input", value.as_str());
+		prompt
+	}
+
 	/// Routes a key into the prompt.
 	pub fn handle_key(&mut self, key: Key) -> PromptEvent {
 		if key == Key::Esc {
@@ -383,6 +395,28 @@ mod tests {
 		}];
 		let picker = ListPicker::open("Resume", &rows, 0, &UiContext::default());
 		assert_eq!(picker.key(0).map(Str::as_str), Some("session/opaque"));
+	}
+
+	#[test]
+	fn prefilled_prompt_submits_default_or_custom_destination() {
+		let mut suggested =
+			PromptOverlay::open_prefilled("Save", "TOPIC_PLAN.md", &UiContext::default());
+		assert!(matches!(
+			suggested.handle_key(Key::Enter),
+			PromptEvent::Submit(path) if path == "TOPIC_PLAN.md"
+		));
+
+		let mut custom = PromptOverlay::open_prefilled("Save", "TOPIC_PLAN.md", &UiContext::default());
+		for _ in 0.."TOPIC_PLAN.md".len() {
+			let _ = custom.handle_key(Key::Backspace);
+		}
+		for character in "plans/custom.md".chars() {
+			let _ = custom.handle_key(Key::Char(character));
+		}
+		assert!(matches!(
+			custom.handle_key(Key::Enter),
+			PromptEvent::Submit(path) if path == "plans/custom.md"
+		));
 	}
 
 	#[test]

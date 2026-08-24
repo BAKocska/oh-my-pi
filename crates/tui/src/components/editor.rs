@@ -2,6 +2,7 @@ use std::{
 	cell::RefCell,
 	fs, io, mem,
 	path::Path,
+	ops::Range,
 	rc::Rc,
 	sync::Arc,
 	time,
@@ -30,6 +31,7 @@ use crate::{
 	props::{Prop, PropValue, Props},
 	rich::cell_width,
 	syntax::{SyntaxRun, highlight_xml, xml_comment_state},
+	spelling::{SpellingAssist, SpellingFeatures},
 };
 /// Built-in composer chrome selected by the `composer.shape` setting.
 ///
@@ -272,6 +274,9 @@ pub struct EditInput {
 	last_click:     Option<((u16, u16), Instant)>,
 	keyword_accent: KeywordAccent,
 	keyword_spans:  SmallVec<(usize, usize), 8>,
+	spelling:       SpellingAssist,
+	spelling_features: SpellingFeatures,
+	spelling_mask:  SmallVec<Range<usize>, 8>,
 }
 
 impl EditInput {
@@ -287,6 +292,9 @@ impl EditInput {
 			last_click:     None,
 			keyword_accent: KeywordAccent::default(),
 			keyword_spans:  SmallVec::new(),
+			spelling:       SpellingAssist::new(),
+			spelling_features: SpellingFeatures::default(),
+			spelling_mask:  SmallVec::new(),
 		}
 	}
 
@@ -318,6 +326,22 @@ impl EditInput {
 
 	fn refresh_keyword_spans(&mut self) {
 		self.keyword_spans = self.keyword_accent.matched_spans(self.editor.text());
+		self.refresh_spelling();
+	}
+	fn refresh_spelling(&mut self) {
+		if !self.spelling_features.typo_detection {
+			self.spelling.clear();
+			return;
+		}
+		self.spelling_mask.clear();
+		self.spelling_mask.extend(self.editor.atom_ranges().into_iter().map(|(start, end)| start..end));
+		self.spelling_mask.extend(code_ranges(self.editor.text()));
+		self.spelling.check(self.editor.text(), &self.spelling_mask);
+	}
+	/// Applies native spelling feature gates.
+	pub fn set_spelling_features(&mut self, features: SpellingFeatures) {
+		self.spelling_features = features;
+		self.refresh_spelling();
 	}
 
 	/// Hides staged attachments whose chip left the buffer (an undo that
@@ -569,6 +593,45 @@ fn prefix_byte_at_width(text: &str, width: u16) -> usize {
 	}
 	text.len()
 }
+fn code_ranges(text: &str) -> SmallVec<Range<usize>, 8> {
+	let mut ranges = SmallVec::new();
+	let bytes = text.as_bytes();
+	let mut at = 0;
+	while at < bytes.len() {
+		if bytes[at..].starts_with(b"```") {
+			let end = text[at + 3..]
+				.find("```")
+				.map_or(bytes.len(), |offset| at + 3 + offset + 3);
+			ranges.push(at..end);
+			at = end;
+		} else if bytes[at] == b'`' {
+			let end = text[at + 1..]
+				.find('`')
+				.map_or(bytes.len(), |offset| at + 1 + offset + 1);
+			ranges.push(at..end);
+			at = end;
+		} else {
+			at += 1;
+		}
+	}
+	ranges
+}
+
+fn word_range_at_cursor(text: &str, cursor: usize) -> Option<Range<usize>> {
+	if cursor > text.len() || !text.is_char_boundary(cursor) {
+		return None;
+	}
+	let start = text[..cursor]
+		.char_indices()
+		.rev()
+		.find_map(|(at, character)| (!character.is_alphabetic() && character != '\'').then_some(at + character.len_utf8()))
+		.unwrap_or(0);
+	let end = text[cursor..]
+		.char_indices()
+		.find_map(|(offset, character)| (!character.is_alphabetic() && character != '\'').then_some(cursor + offset))
+		.unwrap_or(text.len());
+	(start < end).then_some(start..end)
+}
 
 impl Default for EditInput {
 	fn default() -> Self {
@@ -609,6 +672,15 @@ impl Component for EditInput {
 	}
 
 	fn paint(&mut self, pc: &mut PaintCtx<'_>, rect: Rect) {
+		let spelling_changed = self.spelling.poll(self.editor.text());
+		if let Some((range, items)) = self.spelling.take_guesses() {
+			let _ = self.editor.show_replacements(range, items);
+		}
+		if spelling_changed {
+			pc.wake(self.slot, pc.now);
+		} else if self.spelling.awaiting() {
+			pc.wake(self.slot, pc.now.saturating_add(time::Duration::from_millis(16)));
+		}
 		pc.hits
 			.push(Hit { rect, slot: self.slot, tag: HitTag::Press });
 		let focused = pc.focus == Some(self.slot);
@@ -762,6 +834,21 @@ impl Component for EditInput {
 				}
 			}
 			let mut runs = overlay_chip_runs(&runs, &chips, content.text.len());
+			let mut typo_runs: SmallVec<(usize, usize, Style), 8> = SmallVec::new();
+			let mut typo_cursor = 0;
+			for typo in self.spelling.typo_ranges() {
+				let from = typo.start.max(start);
+				let to = typo.end.min(scanned);
+				if from < to && from >= typo_cursor {
+					typo_runs.push((
+						from - start,
+						to - start,
+						Style::new().underline().underline_color(pc.ctx.theme.err),
+					));
+					typo_cursor = to;
+				}
+			}
+			runs = overlay_chip_runs(&runs, &typo_runs, content.text.len());
 			let mut keyword_runs: SmallVec<(usize, usize, Style), 16> = SmallVec::new();
 			for &(keyword_start, keyword_end) in &self.keyword_spans {
 				let from = keyword_start.max(start);
@@ -862,6 +949,13 @@ impl Component for EditInput {
 	}
 
 	fn key(&mut self, ec: &mut EventCtx<'_>, key: Key) -> Flow {
+		if key == Key::Ctrl('.')
+			&& self.spelling_features.typo_detection
+			&& let Some(range) = word_range_at_cursor(self.editor.text(), self.editor.buffer().cursor())
+		{
+			self.spelling.request_guesses(self.editor.text(), range);
+			return Flow::Consumed;
+		}
 		if key == Key::Enter && self.props.flag(Prop::Submit) && self.editor.picker().is_none() {
 			if !self.editor.text().trim().is_empty() {
 				return Flow::Event(UiEvent::Submit);
@@ -1475,6 +1569,19 @@ impl EditorPane {
 	pub fn set_keyword_accent(&mut self, accent: KeywordAccent) {
 		if let Some(input) = self.children[0].comp_mut().downcast_mut::<EditInput>() {
 			input.set_keyword_accent(accent);
+			self.children[0].invalidate();
+		}
+	}
+	/// Selects native editor spelling features.
+	pub fn spelling_features(mut self, features: SpellingFeatures) -> Self {
+		self.set_spelling_features(features);
+		self
+	}
+
+	/// Applies native editor spelling feature gates immediately.
+	pub fn set_spelling_features(&mut self, features: SpellingFeatures) {
+		if let Some(input) = self.children[0].comp_mut().downcast_mut::<EditInput>() {
+			input.set_spelling_features(features);
 			self.children[0].invalidate();
 		}
 	}

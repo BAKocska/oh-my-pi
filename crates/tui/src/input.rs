@@ -117,6 +117,8 @@ const PASTE_INACTIVITY_TIMEOUT: Duration = Duration::from_millis(1000);
 const KITTY_DEDUP_TIMEOUT: Duration = Duration::from_millis(25);
 const MAX_CSI_BYTES: usize = 4096;
 const MAX_STRING_SEQ_BYTES: usize = 16 * 1024 * 1024;
+const STRING_DISCARD_MAX_BYTES: usize = 2 * MAX_STRING_SEQ_BYTES;
+const STRING_DISCARD_INACTIVITY_TIMEOUT: Duration = Duration::from_millis(1000);
 const MAX_PASTE_BYTES: usize = 64 * 1024 * 1024;
 const PASTE_END: &[u8] = b"\x1b[201~";
 
@@ -259,6 +261,13 @@ pub struct InputDecoder {
 	/// partial hold; empty when disarmed. See
 	/// [`InputDecoder::reassemble_private_csi`].
 	private_csi_partial:   Vec<u8>,
+	string_discard:        Option<StringDiscard>,
+}
+#[derive(Clone, Copy, Debug)]
+struct StringDiscard {
+	bytes:    usize,
+	esc_held: bool,
+	last:     Instant,
 }
 
 impl InputDecoder {
@@ -275,6 +284,7 @@ impl InputDecoder {
 			paste_last_input:      None,
 			paste_scan_from:       0,
 			private_csi_partial:   Vec::new(),
+			string_discard:        None,
 		}
 	}
 
@@ -303,6 +313,11 @@ impl InputDecoder {
 	pub fn feed(&mut self, bytes: &[u8], now: Instant, out: &mut Vec<InputEvent>) {
 		self.expire_paste(now, out);
 		self.expire_partial(now, out);
+		self.expire_string_discard(now);
+		let bytes = self.consume_string_discard(bytes, now);
+		if bytes.is_empty() {
+			return;
+		}
 		let bytes = self.reassemble_private_csi(bytes, out);
 		if self.paste_active {
 			self.paste.extend_from_slice(bytes);
@@ -381,6 +396,9 @@ impl InputDecoder {
 			self
 				.pending_kitty_print
 				.map(|(_, at)| at + KITTY_DEDUP_TIMEOUT),
+			self
+				.string_discard
+				.map(|discard| discard.last + STRING_DISCARD_INACTIVITY_TIMEOUT),
 		]
 		.into_iter()
 		.flatten()
@@ -405,6 +423,11 @@ impl InputDecoder {
 					return;
 				},
 				FrameResolution::Overflow(length) => {
+					if is_string_sequence(&self.buffer) {
+						self.buffer.clear();
+						self.enter_string_discard(now);
+						continue;
+					}
 					if !emit_unterminated_response(&self.buffer[..length], out) {
 						emit_raw(&self.buffer[..length], &self.keymap, out);
 					}
@@ -498,6 +521,10 @@ impl InputDecoder {
 			self.private_csi_partial = buffered;
 			return;
 		}
+		if is_string_sequence(&buffered) {
+			self.enter_string_discard(now);
+			return;
+		}
 		if !emit_unterminated_response(&buffered, out) {
 			if buffered == b"\x1b\x1b" {
 				emit_chord(&self.keymap, Chord::plain(Key::Esc), out);
@@ -538,6 +565,54 @@ impl InputDecoder {
 			emit_chord(&self.keymap, chord, out);
 		}
 	}
+	fn enter_string_discard(&mut self, now: Instant) {
+		self.string_discard = Some(StringDiscard { bytes: 0, esc_held: false, last: now });
+	}
+
+	fn expire_string_discard(&mut self, now: Instant) {
+		if self.string_discard.is_some_and(|discard| {
+			now.saturating_duration_since(discard.last) >= STRING_DISCARD_INACTIVITY_TIMEOUT
+		}) {
+			self.string_discard = None;
+		}
+	}
+
+	fn consume_string_discard<'a>(&mut self, bytes: &'a [u8], now: Instant) -> &'a [u8] {
+		let Some(discard) = self.string_discard.as_mut() else {
+			return bytes;
+		};
+		if discard.esc_held {
+			discard.esc_held = false;
+			if bytes.first() == Some(&b'\\') {
+				self.string_discard = None;
+				return &bytes[1..];
+			}
+		}
+		for (index, byte) in bytes.iter().copied().enumerate() {
+			if byte == 0x07 {
+				self.string_discard = None;
+				return &bytes[index + 1..];
+			}
+			if byte == 0x1b {
+				if bytes.get(index + 1) == Some(&b'\\') {
+					self.string_discard = None;
+					return &bytes[index + 2..];
+				}
+				if index + 1 == bytes.len() {
+					discard.esc_held = true;
+				}
+			}
+		}
+		discard.bytes = discard.bytes.saturating_add(bytes.len());
+		discard.last = now;
+		if discard.bytes > STRING_DISCARD_MAX_BYTES {
+			self.string_discard = None;
+		}
+		&[]
+	}
+}
+fn is_string_sequence(bytes: &[u8]) -> bool {
+	matches!(bytes, [0x1b, b']' | b'P' | b'_', ..])
 }
 
 #[derive(Clone, Debug)]
@@ -1805,6 +1880,7 @@ mod tests {
 	use super::{
 		Chord, ChordParseError, InputDecoder, InputEvent, Key, Keymap, Mods, Mouse, MouseButton,
 		MouseReport, TerminalResponse, decode_keys, mods_from_bits,
+		STRING_DISCARD_MAX_BYTES,
 	};
 
 	#[test]
@@ -2073,6 +2149,43 @@ mod tests {
 		decoder.tick(start + Duration::from_millis(75), &mut events);
 		assert_eq!(events, [InputEvent::Key(Key::Esc), InputEvent::Key(Key::Char('['))]);
 		assert_eq!(decoder.deadline(), None);
+	}
+
+	#[test]
+	fn torn_string_payload_is_discarded_and_recovers_after_split_st() {
+		let start = Instant::now();
+		let mut decoder = InputDecoder::new();
+		let mut events = Vec::new();
+		decoder.feed(b"\x1b]5522;partial", start, &mut events);
+		decoder.tick(start + Duration::from_millis(75), &mut events);
+		assert!(events.is_empty());
+		decoder.feed(b"base64\x1b", start + Duration::from_millis(76), &mut events);
+		decoder.feed(b"\\ok", start + Duration::from_millis(77), &mut events);
+		assert_eq!(events, [
+			InputEvent::Key(Key::Char('o')),
+			InputEvent::Key(Key::Char('k')),
+		]);
+	}
+
+	#[test]
+	fn torn_string_discard_has_inactivity_and_byte_bounds() {
+		let start = Instant::now();
+		let mut decoder = InputDecoder::new();
+		let mut events = Vec::new();
+		decoder.feed(b"\x1bPpartial", start, &mut events);
+		decoder.tick(start + Duration::from_millis(75), &mut events);
+		decoder.tick(start + Duration::from_millis(1075), &mut events);
+		decoder.feed(b"x", start + Duration::from_millis(1076), &mut events);
+		assert_eq!(events, [InputEvent::Key(Key::Char('x'))]);
+
+		events.clear();
+		decoder.feed(b"\x1b_partial", start + Duration::from_millis(1080), &mut events);
+		decoder.tick(start + Duration::from_millis(1155), &mut events);
+		let oversized = vec![b'a'; STRING_DISCARD_MAX_BYTES + 1];
+		decoder.feed(&oversized, start + Duration::from_millis(1156), &mut events);
+		assert!(events.is_empty());
+		decoder.feed(b"z", start + Duration::from_millis(1157), &mut events);
+		assert_eq!(events, [InputEvent::Key(Key::Char('z'))]);
 	}
 
 	#[test]
