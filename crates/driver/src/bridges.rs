@@ -36,7 +36,7 @@ use parking_lot::RwLock;
 use crate::{
 	discovery,
 	discovery::{managed_skills, native},
-	modes::{CampaignHandle, Goal as DriverGoal, GoalStatus, RegimeError},
+	modes::{Goal as DriverGoal, GoalStatus, RegimeError, RegimeHandle},
 	rulebook::RuleResolver,
 	skills::SkillResolver,
 	telemetry_upload,
@@ -204,7 +204,7 @@ where
 #[derive(Clone)]
 struct GoalBinding {
 	id:     u64,
-	modes:  Arc<CampaignHandle>,
+	modes:  Arc<RegimeHandle>,
 	sender: omp_agent::ControlSender,
 }
 
@@ -216,11 +216,11 @@ pub struct AgentGoalControl {
 }
 
 impl AgentGoalControl {
-	/// Binds the active goal projection and agent campaign authority until the
+	/// Binds the active goal projection and agent regime authority until the
 	/// returned lease is dropped.
 	pub fn bind(
 		&self,
-		modes: Arc<CampaignHandle>,
+		modes: Arc<RegimeHandle>,
 		sender: omp_agent::ControlSender,
 	) -> AgentGoalBinding {
 		let id = self
@@ -278,61 +278,61 @@ impl omp_envd::GoalAuthority for AgentGoalControl {
 				if params.token_budget == Some(0) {
 					return Err(goal::Fault::InvalidBudget);
 				}
-				let (engagement, newly_engaged) = ensure_goal_campaign(&sender).await?;
+				let (activation, newly_started) = ensure_goal_regime(&sender).await?;
 				let goal = match modes.set_goal(objective, params.token_budget, now) {
 					Ok(goal) => goal,
 					Err(error) => {
-						if newly_engaged {
-							let _ = sender.disengage_campaign(engagement).await;
+						if newly_started {
+							let _ = sender.stop_regime(activation).await;
 						}
 						return Err(map_goal_error(error));
 					},
 				};
-				if let Err(error) = update_goal_campaign_state(&sender, &engagement, &goal).await {
+				if let Err(error) = update_goal_regime_state(&sender, &activation, &goal).await {
 					let _ = modes.drop_goal(now);
-					let _ = sender.disengage_campaign(engagement).await;
+					let _ = sender.stop_regime(activation).await;
 					return Err(error);
 				}
 				Some(goal)
 			},
 			goal::Operation::Get => modes.goal(),
 			goal::Operation::Complete => {
-				let engagement = active_goal_engagement(&sender)
+				let activation = active_goal_activation(&sender)
 					.await?
 					.ok_or(goal::Fault::Unavailable)?;
 				let goal = modes.complete_goal(now).map_err(map_goal_error)?;
 				sender
-					.disengage_campaign(engagement)
+					.stop_regime(activation)
 					.await
-					.map_err(map_goal_campaign_error)?;
+					.map_err(map_goal_regime_error)?;
 				Some(goal)
 			},
 			goal::Operation::Resume => {
-				let (engagement, newly_engaged) = ensure_goal_campaign(&sender).await?;
+				let (activation, newly_started) = ensure_goal_regime(&sender).await?;
 				let goal = match modes.resume_goal(now) {
 					Ok(goal) => goal,
 					Err(error) => {
-						if newly_engaged {
-							let _ = sender.disengage_campaign(engagement).await;
+						if newly_started {
+							let _ = sender.stop_regime(activation).await;
 						}
 						return Err(map_goal_error(error));
 					},
 				};
-				if let Err(error) = update_goal_campaign_state(&sender, &engagement, &goal).await {
-					let _ = sender.disengage_campaign(engagement).await;
+				if let Err(error) = update_goal_regime_state(&sender, &activation, &goal).await {
+					let _ = sender.stop_regime(activation).await;
 					return Err(error);
 				}
 				Some(goal)
 			},
 			goal::Operation::Drop => {
-				let engagement = active_goal_engagement(&sender)
+				let activation = active_goal_activation(&sender)
 					.await?
 					.ok_or(goal::Fault::Unavailable)?;
 				let goal = modes.drop_goal(now).map_err(map_goal_error)?;
 				sender
-					.disengage_campaign(engagement)
+					.stop_regime(activation)
 					.await
-					.map_err(map_goal_campaign_error)?;
+					.map_err(map_goal_regime_error)?;
 				Some(goal)
 			},
 		};
@@ -340,60 +340,60 @@ impl omp_envd::GoalAuthority for AgentGoalControl {
 	}
 }
 
-async fn update_goal_campaign_state(
+async fn update_goal_regime_state(
 	sender: &omp_agent::ControlSender,
-	engagement: &Str,
+	activation: &Str,
 	goal: &DriverGoal,
 ) -> Result<(), goal::Fault> {
-	let state = omp_agent::GoalCampaignState {
+	let state = omp_agent::GoalRegimeState {
 		objective:          goal.objective.clone(),
 		budget_tokens:      goal.token_budget,
 		spent_tokens:       goal.tokens_used,
 		thresholds_crossed: 0,
 	};
 	let payload = bytes::Bytes::from(
-		serde_json::to_vec(&state).expect("goal campaign state has infallible JSON serialization"),
+		serde_json::to_vec(&state).expect("goal regime state has infallible JSON serialization"),
 	);
 	sender
-		.update_campaign_state(engagement.clone(), payload)
+		.update_regime_state(activation.clone(), payload)
 		.await
-		.map_err(map_goal_campaign_error)?;
+		.map_err(map_goal_regime_error)?;
 	Ok(())
 }
 
-async fn active_goal_engagement(
+async fn active_goal_activation(
 	sender: &omp_agent::ControlSender,
 ) -> Result<Option<Str>, goal::Fault> {
 	Ok(sender
-		.active_campaigns()
+		.active_regimes()
 		.await
-		.map_err(map_goal_campaign_error)?
+		.map_err(map_goal_regime_error)?
 		.into_iter()
 		.find(|entry| {
-			entry.spec_id.as_str() == "goal" && entry.status == omp_agent::CampaignEntryStatus::Engaged
+			entry.spec_id.as_str() == "goal" && entry.status == omp_agent::RegimeStatus::Active
 		})
-		.map(|entry| entry.engagement))
+		.map(|entry| entry.activation))
 }
 
-async fn ensure_goal_campaign(
-	sender: &omp_agent::ControlSender,
-) -> Result<(Str, bool), goal::Fault> {
-	if let Some(engagement) = active_goal_engagement(sender).await? {
-		return Ok((engagement, false));
+async fn ensure_goal_regime(sender: &omp_agent::ControlSender) -> Result<(Str, bool), goal::Fault> {
+	if let Some(activation) = active_goal_activation(sender).await? {
+		return Ok((activation, false));
 	}
 	let receipt = sender
-		.engage_regime("goal", false)
+		.start_core_regime("goal", false)
 		.await
-		.map_err(map_goal_campaign_error)?;
-	Ok((receipt.engagement, true))
+		.map_err(map_goal_regime_error)?;
+	Ok((receipt.activation, true))
 }
 
-fn map_goal_campaign_error(error: control::ControlError) -> goal::Fault {
+fn map_goal_regime_error(error: control::ControlError) -> goal::Fault {
 	match error {
-		control::ControlError::CampaignEngage(omp_agent::EngageError::Claim {
-			outcome: omp_agent::ClaimOutcome::Denied { holder, since },
-			..
-		}) => goal::Fault::ClaimDenied { holder, since },
+		control::ControlError::RegimeStart(omp_agent::StartError::Acquire {
+			resource,
+			outcome: omp_agent::AcquireOutcome::Denied { holder, since },
+		}) => {
+			goal::Fault::ResourceConflict { resource: Str::new(resource.name()), owner: holder, since }
+		},
 		_ => goal::Fault::Unavailable,
 	}
 }
@@ -403,7 +403,7 @@ fn map_goal_error(error: RegimeError) -> goal::Fault {
 		RegimeError::NoGoal => goal::Fault::NoGoal,
 		RegimeError::EmptyObjective => goal::Fault::ObjectiveRequired,
 		RegimeError::InvalidBudget => goal::Fault::InvalidBudget,
-		RegimeError::CampaignInactive { .. } | RegimeError::InvalidPlanArtifact => {
+		RegimeError::RegimeInactive { .. } | RegimeError::InvalidPlanArtifact => {
 			goal::Fault::ModeConflict
 		},
 		RegimeError::InvalidGoalTransition { .. } | RegimeError::GoalExists => {

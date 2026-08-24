@@ -15,8 +15,8 @@ pub mod types;
 pub use command::{Command, ParseError, completions, parse};
 pub use dashboard::{Dashboard, RunRow};
 pub use engine::{
-	AutoresearchCampaigns, AutoresearchHost, ClearTree, DEFAULT_TIMEOUT, Engine, EngineError,
-	HARNESS, HarnessOutput, InitExperiment, LogExperiment,
+	AutoresearchHost, AutoresearchRegimes, ClearTree, DEFAULT_TIMEOUT, Engine, EngineError, HARNESS,
+	HarnessOutput, InitExperiment, LogExperiment,
 };
 use omp_core::{Str, sf};
 use omp_storage::transcript::Custom;

@@ -1,11 +1,6 @@
 //! Granted-root context-file discovery and immutable prompt projection.
 
-use std::{
-	collections::BTreeSet,
-	fs,
-	path::PathBuf,
-	sync::Arc,
-};
+use std::{collections::BTreeSet, fs, path::PathBuf, sync::Arc};
 
 use omp_agent::{ContextFile, dedupe_context_file_indices};
 use omp_core::Str;
@@ -70,8 +65,8 @@ pub struct ContextItem {
 /// Immutable discovered context snapshot.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ContextSnapshot {
-	/// Deterministically merged sources ordered from least to most authoritative,
-	/// with normalized paragraph-contained sources removed.
+	/// Deterministically merged sources ordered from least to most
+	/// authoritative, with normalized paragraph-contained sources removed.
 	pub items:       Arc<[ContextItem]>,
 	/// Bounded non-fatal diagnostics.
 	pub diagnostics: Arc<[ContextDiagnostic]>,

@@ -1,6 +1,6 @@
 //! Application execution modes and autonomous goal-loop policy.
 
-/// Durable encoding and restoration of autonomous campaign state.
+/// Durable encoding and restoration of autonomous regime state.
 pub mod persistence;
 
 use std::sync::{
@@ -9,19 +9,19 @@ use std::sync::{
 };
 
 use omp_agent::{
-	AgentState, CachedContribution, CampaignEntry, CampaignEntryStatus, CampaignStack, Continuation,
-	ContinuationPolicy, ContinuationSource, LoopSignal, PromptError, PromptSlotSource, PromptSource,
-	Props, SLOT_TABLE, SlotAssembler, SlotClaim, SlotClass, SlotDecl, SlotId, SlotRegistration,
+	AgentState, CachedContribution, Continuation, ContinuationPolicy, ContinuationSource,
+	LoopSignal, PromptError, PromptSlotSource, PromptSource, Props, RESOURCE_TABLE, RegimeRecord,
+	RegimeSet, RegimeStatus, Resource, SlotAssembler, SlotClass, SlotDecl, SlotId, SlotRegistration,
 };
 use omp_core::{Str, sf};
-/// One visible campaign-slot holder projected by the driver.
+/// One visible resource owner projected by the driver.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct VisibleSlotFacts {
-	/// Canonical slot name.
-	pub slot:        Str,
-	/// Campaign declaration currently holding the slot.
-	pub holder:      Str,
-	/// Durable FIFO tickets waiting behind the holder.
+pub struct VisibleResourceFacts {
+	/// Canonical resource name.
+	pub resource:    Str,
+	/// Regime declaration currently owning the resource.
+	pub owner:       Str,
+	/// Durable FIFO tickets waiting behind the owner.
 	pub queue_depth: usize,
 }
 use omp_proto::thread::v1::{Item, Message, Part, Role, item, part};
@@ -90,7 +90,7 @@ impl StartupMode {
 	/// Rejects `@file` shorthand in RPC UI, where stdin and references belong to
 	/// the framed protocol.
 	pub fn validate_prompt_words(self, words: &[Str]) -> Result<(), StartupRegimeError> {
-		if self == Self::RpcUi && words.iter().any(|word| word.starts_with("@")) {
+		if self == Self::RpcUi && words.iter().any(|word| word.starts_with('@')) {
 			return Err(StartupRegimeError::RpcUiReference);
 		}
 		Ok(())
@@ -162,13 +162,13 @@ impl GoalUsage {
 	}
 }
 
-/// Invalid goal or campaign-projection transition.
+/// Invalid goal or regime-projection transition.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum RegimeError {
-	/// An operation requires a campaign that is not the visible mode holder.
-	#[error("the {required} campaign is not active")]
-	CampaignInactive {
-		/// Required campaign declaration.
+	/// An operation requires a regime that is not the visible mode holder.
+	#[error("the {required} regime is not active")]
+	RegimeInactive {
+		/// Required regime declaration.
 		required: &'static str,
 	},
 	/// A goal operation was requested without a goal.
@@ -196,12 +196,12 @@ pub enum RegimeError {
 	GoalExists,
 }
 
-/// App-owned metadata paired with the authoritative campaign-slot projection.
+/// App-owned metadata paired with the authoritative regime-resource projection.
 #[derive(Debug, Default)]
 struct RegimeProjectionState {
 	mode_holder:             Option<Str>,
-	mode_engagement:         Option<Str>,
-	visible_slots:           Arc<[VisibleSlotFacts]>,
+	mode_activation:         Option<Str>,
+	visible_resources:       Arc<[VisibleResourceFacts]>,
 	goal:                    Option<Goal>,
 	plan:                    PlanState,
 	plan_seen:               bool,
@@ -217,10 +217,10 @@ struct PlanBinding {
 	handoff:   Option<ModelSelection>,
 }
 
-/// Read projection of the agent-owned [`CampaignStack`] plus app goal/plan
+/// Read projection of the agent-owned [`RegimeSet`] plus app goal/plan
 /// metadata.
 #[derive(Clone, Debug)]
-pub struct CampaignHandle {
+pub struct RegimeHandle {
 	state:            Arc<Mutex<RegimeProjectionState>>,
 	policy:           ContinuationPolicy,
 	plan_binding:     Arc<Mutex<Option<PlanBinding>>>,
@@ -229,7 +229,7 @@ pub struct CampaignHandle {
 }
 struct ModeAwarePromptSource {
 	base:  Arc<dyn PromptSource>,
-	modes: CampaignHandle,
+	modes: RegimeHandle,
 }
 
 impl PromptSource for ModeAwarePromptSource {
@@ -264,8 +264,14 @@ impl PromptSource for ModeAwarePromptSource {
 	}
 }
 
-impl CampaignHandle {
-	/// Creates an empty read projection. [`Self::sync_campaigns`] supplies
+impl Default for RegimeHandle {
+	fn default() -> Self {
+		Self::new()
+	}
+}
+
+impl RegimeHandle {
+	/// Creates an empty read projection. [`Self::sync_regimes`] supplies
 	/// authority.
 	pub fn new() -> Self {
 		Self {
@@ -277,101 +283,102 @@ impl CampaignHandle {
 		}
 	}
 
-	/// Refreshes user-facing slot facts from the authoritative agent campaign
-	/// stack.
-	pub fn sync_campaigns(&self, campaigns: &CampaignStack) {
-		let claims = [
-			SlotClaim::Worktree,
-			SlotClaim::Director,
-			SlotClaim::EditorSurface,
-			SlotClaim::BatchExecution,
-			SlotClaim::Mode,
+	/// Refreshes user-facing resource facts from the authoritative agent regime
+	/// set.
+	pub fn sync_regimes(&self, regimes: &RegimeSet) {
+		let resources = [
+			Resource::Worktree,
+			Resource::Director,
+			Resource::EditorSurface,
+			Resource::BatchExecution,
+			Resource::Mode,
 		];
-		let visible_slots = claims
+		let visible_resources = resources
 			.iter()
-			.filter(|claim| {
-				campaigns
-					.slots()
-					.declaration(claim)
+			.filter(|resource| {
+				regimes
+					.resources()
+					.declaration(resource)
 					.is_some_and(|declaration| declaration.visible)
 			})
-			.filter_map(|claim| {
-				let engagement = campaigns.slots().owner(claim)?;
-				let holder = campaigns.spec_id(engagement).unwrap_or(engagement);
-				Some(VisibleSlotFacts {
-					slot:        Str::new(claim.name()),
-					holder:      Str::new(holder),
-					queue_depth: campaigns.slots().queue_depth(claim),
+			.filter_map(|resource| {
+				let activation = regimes.resources().owner(resource)?;
+				let owner = regimes.spec_id(activation).unwrap_or(activation);
+				Some(VisibleResourceFacts {
+					resource:    Str::new(resource.name()),
+					owner:       Str::new(owner),
+					queue_depth: regimes.resources().queue_depth(resource),
 				})
 			})
 			.collect::<Vec<_>>();
-		let mode_engagement = campaigns.slots().owner(&SlotClaim::Mode);
-		let mode_holder = mode_engagement.and_then(|id| campaigns.spec_id(id));
+		let mode_activation = regimes.resources().owner(&Resource::Mode);
+		let mode_holder = mode_activation.and_then(|id| regimes.spec_id(id));
 		self.apply_projection(
-			visible_slots.into(),
+			visible_resources.into(),
 			mode_holder.map(Str::new),
-			mode_engagement.map(Str::new),
+			mode_activation.map(Str::new),
 		);
 	}
 
-	/// Refreshes slot facts from campaign entries returned by an actor command.
-	pub fn sync_entries(&self, entries: &[CampaignEntry]) {
-		let campaigns = entries
+	/// Refreshes resource facts from regime records returned by an actor
+	/// command.
+	pub fn sync_records(&self, records: &[RegimeRecord]) {
+		let regimes = records
 			.iter()
 			.filter_map(|entry| {
 				omp_agent::core_regime(entry.spec_id.as_str()).map(|(spec, _)| (entry, spec))
 			})
 			.collect::<Vec<_>>();
-		let visible_slots = SLOT_TABLE
+		let visible_resources = RESOURCE_TABLE
 			.iter()
 			.filter(|declaration| declaration.visible)
 			.filter_map(|declaration| {
-				let holder = campaigns.iter().find(|(entry, spec)| {
-					entry.status == CampaignEntryStatus::Engaged
+				let owner = regimes.iter().find(|(entry, spec)| {
+					entry.status == RegimeStatus::Active
 						&& spec
-							.claims
+							.owns
 							.iter()
-							.any(|claim| claim.name() == declaration.name)
+							.any(|resource| resource.name() == declaration.name)
 				})?;
-				let queue_depth = campaigns
+				let queue_depth = regimes
 					.iter()
 					.filter(|(entry, spec)| {
-						entry.status == CampaignEntryStatus::Queued
+						entry.status == RegimeStatus::Queued
 							&& spec
-								.claims
+								.owns
 								.iter()
-								.any(|claim| claim.name() == declaration.name)
+								.any(|resource| resource.name() == declaration.name)
 					})
 					.count();
-				Some(VisibleSlotFacts {
-					slot: Str::new_static(declaration.name),
-					holder: holder.0.spec_id.clone(),
+				Some(VisibleResourceFacts {
+					resource: Str::new_static(declaration.name),
+					owner: owner.0.spec_id.clone(),
 					queue_depth,
 				})
 			})
 			.collect::<Vec<_>>();
-		let mode = campaigns.iter().find(|(entry, spec)| {
-			entry.status == CampaignEntryStatus::Engaged
-				&& spec.claims.iter().any(|claim| claim == &SlotClaim::Mode)
+		let mode = regimes.iter().find(|(entry, spec)| {
+			entry.status == RegimeStatus::Active
+				&& spec.owns.iter().any(|resource| resource == &Resource::Mode)
 		});
 		self.apply_projection(
-			visible_slots.into(),
+			visible_resources.into(),
 			mode.map(|(entry, _)| entry.spec_id.clone()),
-			mode.map(|(entry, _)| entry.engagement.clone()),
+			mode.map(|(entry, _)| entry.activation.clone()),
 		);
 	}
 
 	fn apply_projection(
 		&self,
-		visible_slots: Arc<[VisibleSlotFacts]>,
+		visible_resources: Arc<[VisibleResourceFacts]>,
 		mode_holder: Option<Str>,
-		mode_engagement: Option<Str>,
+		mode_activation: Option<Str>,
 	) {
 		let mut state = self.state.lock();
 		let previous_holder = state.mode_holder.clone();
-		state.visible_slots = visible_slots;
+		state.visible_resources = visible_resources;
 		state.mode_holder = mode_holder;
-		state.mode_engagement = mode_engagement;
+		state.mode_activation = mode_activation;
 		let plan_entered =
 			previous_holder.as_deref() != Some("plan") && state.mode_holder.as_deref() == Some("plan");
 		let plan_exited =
@@ -390,9 +397,9 @@ impl CampaignHandle {
 		self.revision.load(Ordering::Acquire)
 	}
 
-	/// Returns the visible slot projection without rebuilding it per frame.
-	pub fn visible_slots(&self) -> Arc<[VisibleSlotFacts]> {
-		Arc::clone(&self.state.lock().visible_slots)
+	/// Returns the visible resource projection without rebuilding it per frame.
+	pub fn visible_resources(&self) -> Arc<[VisibleResourceFacts]> {
+		Arc::clone(&self.state.lock().visible_resources)
 	}
 
 	/// Returns the visible mode-holder declaration.
@@ -400,19 +407,19 @@ impl CampaignHandle {
 		self.state.lock().mode_holder.clone()
 	}
 
-	/// Returns the current mode-holder engagement identity.
-	pub fn mode_engagement(&self) -> Option<Str> {
-		self.state.lock().mode_engagement.clone()
+	/// Returns the current mode-holder activation identity.
+	pub fn mode_activation(&self) -> Option<Str> {
+		self.state.lock().mode_activation.clone()
 	}
 
-	/// Returns whether `holder` owns the canonical mode slot.
-	pub fn holds_mode(&self, holder: &str) -> bool {
+	/// Returns whether `owner` owns the canonical mode resource.
+	pub fn holds_mode(&self, owner: &str) -> bool {
 		self
 			.state
 			.lock()
 			.mode_holder
 			.as_ref()
-			.is_some_and(|active| active == holder)
+			.is_some_and(|active| active == owner)
 	}
 
 	/// Binds the active agent selection authority. Plan entry and exit then
@@ -421,7 +428,7 @@ impl CampaignHandle {
 		*self.plan_binding.lock() = Some(PlanBinding { agent, selection, handoff: None });
 	}
 
-	/// Arms a one-shot selection applied when the plan campaign exits,
+	/// Arms a one-shot selection applied when the plan regime exits,
 	/// replacing restoration of the pre-plan selection (`--plan-yolo-into`).
 	///
 	/// Requires a prior [`Self::bind_plan_selection`]; the handoff is consumed
@@ -448,7 +455,7 @@ impl CampaignHandle {
 			})
 	}
 
-	/// Applies app plan metadata after the plan campaign acquires the mode slot.
+	/// Applies app plan metadata after the plan regime acquires the mode slot.
 	pub fn activate_plan(&self, _plan_yolo: bool) {
 		{
 			let mut state = self.state.lock();
@@ -472,12 +479,12 @@ impl CampaignHandle {
 	/// Selects the approved-plan workflow.
 	pub fn set_plan_workflow(&self, workflow: PlanWorkflow) -> Result<PlanState, RegimeError> {
 		if !self.holds_mode("plan") {
-			return Err(RegimeError::CampaignInactive { required: "plan" });
+			return Err(RegimeError::RegimeInactive { required: "plan" });
 		}
 		let plan = {
 			let mut state = self.state.lock();
 			if !state.plan.enabled {
-				return Err(RegimeError::CampaignInactive { required: "plan" });
+				return Err(RegimeError::RegimeInactive { required: "plan" });
 			}
 			state.plan.workflow = workflow;
 			state.plan.clone()
@@ -491,12 +498,12 @@ impl CampaignHandle {
 		let artifact =
 			canonical_url(artifact.as_str()).map_err(|_| RegimeError::InvalidPlanArtifact)?;
 		if !self.holds_mode("plan") {
-			return Err(RegimeError::CampaignInactive { required: "plan" });
+			return Err(RegimeError::RegimeInactive { required: "plan" });
 		}
 		let plan = {
 			let mut state = self.state.lock();
 			if !state.plan.enabled {
-				return Err(RegimeError::CampaignInactive { required: "plan" });
+				return Err(RegimeError::RegimeInactive { required: "plan" });
 			}
 			state.plan.artifact = artifact;
 			state.plan.clone()
@@ -509,7 +516,7 @@ impl CampaignHandle {
 		Arc::new(ModeAwarePromptSource { base, modes: self.clone() })
 	}
 
-	/// Applies app plan metadata after the plan campaign releases the mode slot.
+	/// Applies app plan metadata after the plan regime releases the mode slot.
 	pub fn deactivate_plan(&self) {
 		let mut state = self.state.lock();
 		state.plan = state.plan.exited();
@@ -777,7 +784,7 @@ impl CampaignHandle {
 				),
 				now_ms,
 			),
-			label:          Some(goal.id.clone()),
+			label:          Some(goal.id),
 			collapse_prior: true,
 		}
 	}
@@ -807,7 +814,7 @@ impl CampaignHandle {
 	}
 }
 
-impl ContinuationSource for CampaignHandle {
+impl ContinuationSource for RegimeHandle {
 	fn decide(&self, signal: &LoopSignal, now_ms: u64) -> (Continuation, ContinuationPolicy) {
 		(self.goal_continuation(signal, now_ms), self.continuation_policy())
 	}
@@ -837,65 +844,65 @@ mod tests {
 	use super::*;
 
 	#[test]
-	fn mode_slot_denials_preserve_holder_and_since_at_the_app_projection_seam() {
-		let mut stack = CampaignStack::new();
-		let (plan, plan_machine) = omp_agent::core_regime("plan").expect("plan regime");
-		let granted = stack
-			.engage(plan, plan_machine, omp_agent::EngageOptions { now_ms: 41, queue: false })
+	fn mode_resource_denials_preserve_owner_and_since_at_the_app_projection_seam() {
+		let mut regimes = RegimeSet::new();
+		let (plan, plan_regime) = omp_agent::core_regime("plan").expect("plan regime");
+		let granted = regimes
+			.start(plan, plan_regime, omp_agent::StartOptions { now_ms: 41, queue: false })
 			.expect("plan grant");
 		for contender in ["vibe", "goal"] {
-			let (spec, machine) = omp_agent::core_regime(contender).expect("contender regime");
-			let error = stack
-				.engage(spec, machine, omp_agent::EngageOptions { now_ms: 42, queue: false })
-				.expect_err("mode claim must deny");
-			assert_eq!(error, omp_agent::EngageError::Claim {
-				slot:    SlotClaim::Mode,
-				outcome: omp_agent::ClaimOutcome::Denied {
-					holder: granted.engagement.clone(),
+			let (spec, regime) = omp_agent::core_regime(contender).expect("contender regime");
+			let error = regimes
+				.start(spec, regime, omp_agent::StartOptions { now_ms: 42, queue: false })
+				.expect_err("mode resource must deny");
+			assert_eq!(error, omp_agent::StartError::Acquire {
+				resource: Resource::Mode,
+				outcome:  omp_agent::AcquireOutcome::Denied {
+					holder: granted.activation.clone(),
 					since:  41,
 				},
 			});
 		}
-		let projection = CampaignHandle::new();
-		projection.sync_campaigns(&stack);
+		let projection = RegimeHandle::new();
+		projection.sync_regimes(&regimes);
 		assert_eq!(projection.mode_holder().as_deref(), Some("plan"));
-		assert_eq!(projection.mode_engagement(), Some(granted.engagement));
+		assert_eq!(projection.mode_activation(), Some(granted.activation));
 	}
 
 	#[test]
-	fn queued_mode_ticket_projects_depth_and_auto_grants_on_release() {
-		let mut stack = CampaignStack::new();
-		let (plan, plan_machine) = omp_agent::core_regime("plan").expect("plan regime");
-		let granted = stack
-			.engage(plan, plan_machine, omp_agent::EngageOptions { now_ms: 41, queue: false })
+	fn queued_mode_resource_projects_depth_and_auto_grants_on_release() {
+		let mut regimes = RegimeSet::new();
+		let (plan, plan_regime) = omp_agent::core_regime("plan").expect("plan regime");
+		let granted = regimes
+			.start(plan, plan_regime, omp_agent::StartOptions { now_ms: 41, queue: false })
 			.expect("plan grant");
-		let (vibe, vibe_machine) = omp_agent::core_regime("vibe").expect("vibe regime");
-		let ticket = stack
-			.engage(vibe, vibe_machine, omp_agent::EngageOptions { now_ms: 42, queue: true })
+		let (vibe, vibe_regime) = omp_agent::core_regime("vibe").expect("vibe regime");
+		let ticket = regimes
+			.start(vibe, vibe_regime, omp_agent::StartOptions { now_ms: 42, queue: true })
 			.expect("vibe queue ticket");
-		assert!(matches!(ticket.outcome, omp_agent::ClaimOutcome::Queued { .. }));
-		let projection = CampaignHandle::new();
-		projection.sync_campaigns(&stack);
+		assert!(matches!(ticket.outcome, omp_agent::AcquireOutcome::Queued { .. }));
+		let projection = RegimeHandle::new();
+		projection.sync_regimes(&regimes);
 		let mode = projection
-			.visible_slots()
+			.visible_resources()
 			.iter()
-			.find(|slot| slot.slot == "mode")
+			.find(|resource| resource.resource == "mode")
 			.cloned()
 			.expect("mode projection");
-		assert_eq!(mode.holder, "plan");
+		assert_eq!(mode.owner, "plan");
 		assert_eq!(mode.queue_depth, 1);
 
-		stack
-			.disengage(granted.engagement.as_str(), 43)
+		regimes
+			.stop(granted.activation.as_str(), 43)
 			.expect("plan exit");
-		projection.sync_campaigns(&stack);
+		projection.sync_regimes(&regimes);
 		assert_eq!(projection.mode_holder().as_deref(), Some("vibe"));
-		assert_eq!(projection.mode_engagement(), Some(ticket.engagement));
+		assert_eq!(projection.mode_activation(), Some(ticket.activation));
 	}
 
 	#[test]
 	fn goal_accounting_excludes_cached_input_and_hard_stops() {
-		let modes = CampaignHandle::new();
+		let modes = RegimeHandle::new();
 		modes.set_goal("ship", Some(10), 1_000).expect("set goal");
 		let goal = modes
 			.record_goal_usage(
@@ -914,13 +921,13 @@ mod tests {
 
 	#[test]
 	fn stalled_loop_signal_prevents_goal_continuation() {
-		let mut stack = CampaignStack::new();
-		let (spec, machine) = omp_agent::core_regime("goal").expect("goal regime");
-		stack
-			.engage(spec, machine, omp_agent::EngageOptions { now_ms: 0, queue: false })
+		let mut regimes = RegimeSet::new();
+		let (spec, regime) = omp_agent::core_regime("goal").expect("goal regime");
+		regimes
+			.start(spec, regime, omp_agent::StartOptions { now_ms: 0, queue: false })
 			.expect("goal grant");
-		let modes = CampaignHandle::new();
-		modes.sync_campaigns(&stack);
+		let modes = RegimeHandle::new();
+		modes.sync_regimes(&regimes);
 		modes.set_goal("ship <safely>", None, 0).expect("set goal");
 		assert!(matches!(
 			modes.goal_continuation(&LoopSignal::default(), 1),

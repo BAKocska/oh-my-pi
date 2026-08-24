@@ -94,13 +94,13 @@ fn embedded_workflow_commands() -> [CommandContribution; 1] {
 #[derive(Clone, Debug)]
 pub struct ActiveContentSnapshots {
 	/// Active skills.
-	pub skills:   Arc<SkillSnapshot>,
+	pub skills:       Arc<SkillSnapshot>,
 	/// Active declarative rules.
-	pub rules:    Arc<RuleSnapshot>,
+	pub rules:        Arc<RuleSnapshot>,
 	/// Active native Markdown slash commands in discovery precedence order.
-	pub commands: Arc<[CommandContribution]>,
+	pub commands:     Arc<[CommandContribution]>,
 	/// Bounded non-fatal diagnostics emitted while loading static content.
-	pub warnings: Arc<[Str]>,
+	pub warnings:     Arc<[Str]>,
 	/// Frozen declarations from the same startup discovery pass.
 	pub declarations: Arc<[DiscoveredCapability]>,
 }
@@ -158,8 +158,8 @@ pub fn active_content_snapshots(root: &Path) -> ActiveContentSnapshots {
 		commands.extend(embedded_workflow_commands());
 	}
 	ActiveContentSnapshots {
-		skills:   Arc::new(SkillSnapshot::from_declarations(&discovered.declarations)),
-		rules:    Arc::new(RuleSnapshot::from_declarations(
+		skills:       Arc::new(SkillSnapshot::from_declarations(&discovered.declarations)),
+		rules:        Arc::new(RuleSnapshot::from_declarations(
 			&discovered.declarations,
 			&RulebookSettings::default(),
 		)),

@@ -460,46 +460,46 @@ impl SettingsDomain for AppearanceSettings {
 #[serde(default, rename_all = "camelCase")]
 pub struct InteractionSettings {
 	/// Approval timeout for an unanswered interactive question, in seconds.
-	pub ask_timeout_seconds: u64,
+	pub ask_timeout_seconds:       u64,
 	/// Per-event notification overrides.
-	pub notifications:       BTreeMap<Str, bool>,
+	pub notifications:             BTreeMap<Str, bool>,
 	/// Enable speech output.
-	pub tts_enabled:         bool,
+	pub tts_enabled:               bool,
 	/// Enable speech-to-text input.
-	pub stt_enabled:         bool,
+	pub stt_enabled:               bool,
 	/// Enable live duplex voice mode.
-	pub live_voice_enabled:  bool,
+	pub live_voice_enabled:        bool,
 	/// Optional speech voice identifier.
-	pub voice:               Option<Str>,
+	pub voice:                     Option<Str>,
 	/// Automatic agent loop mode.
-	pub loop_mode:           bool,
+	pub loop_mode:                 bool,
 	/// Unexpected assistant-stop recovery policy.
 	pub unexpected_stop_detection: UnexpectedStopMode,
 	/// Line threshold above which the large-paste menu is offered.
-	pub paste_threshold:     usize,
+	pub paste_threshold:           usize,
 	/// User-defined composer keyword expansions.
-	pub magic_keywords:      BTreeMap<Str, Str>,
+	pub magic_keywords:            BTreeMap<Str, Str>,
 	/// Whether follow-up submissions enter the pending queue.
-	pub queue_follow_ups:    bool,
+	pub queue_follow_ups:          bool,
 	/// Whether microphone input is pushed to talk rather than always live.
-	pub push_to_talk:        bool,
+	pub push_to_talk:              bool,
 }
 
 impl Default for InteractionSettings {
 	fn default() -> Self {
 		Self {
-			ask_timeout_seconds: 0,
-			notifications:       BTreeMap::new(),
-			tts_enabled:         false,
-			stt_enabled:         false,
-			live_voice_enabled:  false,
-			voice:               None,
-			loop_mode:           false,
+			ask_timeout_seconds:       0,
+			notifications:             BTreeMap::new(),
+			tts_enabled:               false,
+			stt_enabled:               false,
+			live_voice_enabled:        false,
+			voice:                     None,
+			loop_mode:                 false,
 			unexpected_stop_detection: UnexpectedStopMode::Mechanical,
-			paste_threshold:     default_paste_threshold(),
-			magic_keywords:      BTreeMap::new(),
-			queue_follow_ups:    true,
-			push_to_talk:        true,
+			paste_threshold:           default_paste_threshold(),
+			magic_keywords:            BTreeMap::new(),
+			queue_follow_ups:          true,
+			push_to_talk:              true,
 		}
 	}
 }

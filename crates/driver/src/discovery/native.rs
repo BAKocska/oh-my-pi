@@ -608,7 +608,10 @@ struct ToolHeader {
 fn script_tool_header(path: &Path) -> ToolHeader {
 	const HEADER_BYTES: u64 = 4096;
 	let mut source = String::new();
-	let Some(mut file) = fs::File::open(path).ok().map(|file| file.take(HEADER_BYTES)) else {
+	let Some(mut file) = fs::File::open(path)
+		.ok()
+		.map(|file| file.take(HEADER_BYTES))
+	else {
 		return ToolHeader::default();
 	};
 	if file.read_to_string(&mut source).is_err() {
@@ -617,7 +620,10 @@ fn script_tool_header(path: &Path) -> ToolHeader {
 	let Some(start) = source.find("/**").map(|start| start.saturating_add(3)) else {
 		return ToolHeader::default();
 	};
-	let Some(end) = source[start..].find("*/").map(|end| end.saturating_add(start)) else {
+	let Some(end) = source[start..]
+		.find("*/")
+		.map(|end| end.saturating_add(start))
+	else {
 		return ToolHeader::default();
 	};
 	let description = source[start..end]
@@ -826,7 +832,8 @@ mod tests {
 		let path = tree.path().join("bundle.ts");
 		fs::write(
 			&path,
-			"/**\n * Inspect and control system services.\n *\n * Symlink: ~/.omp/tools/bundle.ts\n */\nexport default {};\n",
+			"/**\n * Inspect and control system services.\n *\n * Symlink: ~/.omp/tools/bundle.ts\n \
+			 */\nexport default {};\n",
 		)
 		.expect("tool");
 		let header = script_tool_header(&path);

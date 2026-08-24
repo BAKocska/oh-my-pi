@@ -47,7 +47,7 @@ use crate::{
 	bridges::{AgentGoalBinding, AgentGoalControl, InferenceBridge, builtin},
 	chat::{self},
 	discovery,
-	modes::CampaignHandle,
+	modes::RegimeHandle,
 	registry::{
 		InferenceSessionOverrides, ProductionInference, production_inference_for_session,
 		production_redemption_authority,
@@ -65,11 +65,11 @@ pub struct HeadlessSessionOptions {
 	pub additional_roots:      Box<[PathBuf]>,
 	/// Resolved catalog model selector.
 	pub model:                 Str,
-	/// Built-in regime engaged before the agent moves into its runtime actor.
-	pub initial_campaign:      Option<&'static str>,
-	/// Optional prompt-slot override for the initial campaign.
+	/// Built-in regime started before the agent moves into its runtime actor.
+	pub initial_regime:        Option<&'static str>,
+	/// Optional prompt-slot override for the initial regime.
 	pub initial_prompt_slot:   Option<&'static str>,
-	/// One-shot model selection applied when the plan campaign exits.
+	/// One-shot model selection applied when the plan regime exits.
 	pub plan_handoff:          Option<crate::plan::ModelSelection>,
 	/// Existing durable session to resume, or a fresh journal when absent.
 	pub resume:                Option<Str>,
@@ -103,7 +103,7 @@ pub struct HeadlessSession {
 	state:               AgentState,
 	control:             omp_agent::ControlSender,
 	env:                 omp_env::EnvClient,
-	campaigns:           Arc<CampaignHandle>,
+	regimes:             Arc<RegimeHandle>,
 	tree:                Arc<AgentTree>,
 	events:              Option<EventSubscription>,
 	lifecycle:           HeadlessLifecycleSink,
@@ -300,35 +300,32 @@ impl HeadlessSession {
 			.set_session_generation(options.session_generation);
 		let control = agent.control();
 		agent
-			.recover_campaigns(omp_agent::core_regime, now_ms())
+			.recover_regimes(omp_agent::core_regime, now_ms())
 			.map_err(composition)?;
-		if let Some(spec_id) = options.initial_campaign
+		if let Some(spec_id) = options.initial_regime
 			&& agent
 				.arbiter()
-				.campaigns()
-				.slots()
-				.owner(&omp_agent::SlotClaim::Mode)
+				.regimes()
+				.resources()
+				.owner(&omp_agent::Resource::Mode)
 				.is_none()
 		{
-			let (spec, machine) =
+			let (spec, regime) =
 				omp_agent::core_regime(spec_id).expect("headless startup names a core regime");
 			let mut spec = spec;
 			if let Some(prompt_slot) = options.initial_prompt_slot {
-				Arc::make_mut(&mut spec).binds = Arc::from([omp_agent::ScopedBinding {
-					slot:  omp_agent::BindSlot::PromptSlot,
+				Arc::make_mut(&mut spec).sets = Arc::from([omp_agent::ScopedSetting {
+					slot:  omp_agent::SettingSlot::PromptSlot,
 					value: Str::new_static(prompt_slot),
 				}]);
 			}
 			let _ = agent
-				.engage_campaign(spec, machine, omp_agent::EngageOptions {
-					now_ms: now_ms(),
-					queue:  false,
-				})
+				.start_regime(spec, regime, omp_agent::StartOptions { now_ms: now_ms(), queue: false })
 				.map_err(composition)?;
 		}
-		let modes = Arc::new(CampaignHandle::new());
+		let modes = Arc::new(RegimeHandle::new());
 		let goal_binding = goal_control.bind(Arc::clone(&modes), control.clone());
-		modes.sync_campaigns(agent.arbiter().campaigns());
+		modes.sync_regimes(agent.arbiter().regimes());
 		modes.bind_plan_selection(state.clone(), None);
 		if let Some(handoff) = options.plan_handoff.clone() {
 			modes.bind_plan_handoff(handoff);
@@ -368,7 +365,7 @@ impl HeadlessSession {
 			state,
 			control,
 			env,
-			campaigns: modes,
+			regimes: modes,
 			tree,
 			events: Some(events),
 			lifecycle,
@@ -560,37 +557,31 @@ impl HeadlessSession {
 		Ok(())
 	}
 
-	/// Returns the session-scoped campaign projection.
-	pub fn campaigns(&self) -> &CampaignHandle {
-		self.campaigns.as_ref()
+	/// Returns the session-scoped regime projection.
+	pub fn regimes(&self) -> &RegimeHandle {
+		self.regimes.as_ref()
 	}
 
-	/// Engages a built-in regime on the actor-owned campaign stack.
-	pub async fn engage_regime(
+	/// Starts a built-in regime on the actor-owned regime set.
+	pub async fn start_regime(
 		&self,
 		spec_id: &'static str,
 		queue: bool,
-	) -> Result<omp_agent::EngageReceipt, omp_sdk::SessionHandleError> {
-		let (spec, machine) =
+	) -> Result<omp_agent::StartReceipt, omp_sdk::SessionHandleError> {
+		let (spec, regime) =
 			omp_agent::core_regime(spec_id).expect("headless command names a built-in regime");
 		let (receipt, entries) = self
 			.session
-			.engage_campaign(spec, machine, omp_agent::EngageOptions { now_ms: now_ms(), queue })
+			.start_regime(spec, regime, omp_agent::StartOptions { now_ms: now_ms(), queue })
 			.await?;
-		self.campaigns.sync_entries(&entries);
+		self.regimes.sync_records(&entries);
 		Ok(receipt)
 	}
 
-	/// Disengages an active campaign on the actor-owned stack.
-	pub async fn disengage_campaign(
-		&self,
-		engagement: Str,
-	) -> Result<bool, omp_sdk::SessionHandleError> {
-		let (removed, entries) = self
-			.session
-			.disengage_campaign(engagement, now_ms())
-			.await?;
-		self.campaigns.sync_entries(&entries);
+	/// Stops an active regime on the actor-owned regime set.
+	pub async fn stop_regime(&self, activation: Str) -> Result<bool, omp_sdk::SessionHandleError> {
+		let (removed, entries) = self.session.stop_regime(activation, now_ms()).await?;
+		self.regimes.sync_records(&entries);
 		Ok(removed)
 	}
 

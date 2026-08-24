@@ -241,8 +241,8 @@ pub enum JournalFact {
 /// Reconstructed session-local runtime state.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct RuntimeState {
-	/// Durable campaign engagement restored by the Agent journal.
-	pub engagement:   Option<Str>,
+	/// Durable regime activation restored by the Agent journal.
+	pub activation:   Option<Str>,
 	/// Current user goal.
 	pub goal:         Option<Str>,
 	/// Active session projection.

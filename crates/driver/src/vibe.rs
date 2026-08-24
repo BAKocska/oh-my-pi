@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::{sync::Notify, time, time::MissedTickBehavior};
 
-use crate::{chat::ChatParentHost, modes::CampaignHandle};
+use crate::{chat::ChatParentHost, modes::RegimeHandle};
 
 /// A worker requested in a vibe-mode spawn wave.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
@@ -524,7 +524,7 @@ struct Worker {
 /// Chat-scoped wave runner backed by durable registered agent loops.
 pub(crate) struct ChatVibeBackend<C: omp_agent::TurnClient + Clone + Send + 'static> {
 	parent:      Arc<ChatParentHost<C>>,
-	modes:       Arc<CampaignHandle>,
+	modes:       Arc<RegimeHandle>,
 	workers:     Arc<Mutex<BTreeMap<Str, Worker>>>,
 	monitor:     Arc<Mutex<VibeSwarmMonitor>>,
 	seen_active: AtomicBool,
@@ -532,7 +532,7 @@ pub(crate) struct ChatVibeBackend<C: omp_agent::TurnClient + Clone + Send + 'sta
 
 impl<C: omp_agent::TurnClient + Clone + Send + 'static> ChatVibeBackend<C> {
 	/// Creates a wave runner and its app-owned TTL/mode-exit scheduler.
-	pub(crate) fn new(parent: Arc<ChatParentHost<C>>, modes: Arc<CampaignHandle>) -> Arc<Self> {
+	pub(crate) fn new(parent: Arc<ChatParentHost<C>>, modes: Arc<RegimeHandle>) -> Arc<Self> {
 		let backend = Arc::new(Self {
 			parent,
 			modes,
@@ -955,7 +955,7 @@ impl<C: omp_agent::TurnClient + Clone + Send + 'static> VibeBackend for ChatVibe
 /// Attaches the vibe device to one chat session.
 pub fn attach_chat<C: omp_agent::TurnClient + Clone + Send + 'static>(
 	parent: Arc<ChatParentHost<C>>,
-	modes: Arc<CampaignHandle>,
+	modes: Arc<RegimeHandle>,
 ) -> Attachment {
 	attach(ChatVibeBackend::new(parent, modes))
 }

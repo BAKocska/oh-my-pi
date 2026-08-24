@@ -1,9 +1,9 @@
-//! Complete autoresearch experiment state machine.
+//! Complete autoresearch experiment engine.
 
 use std::{error::Error as StdError, future::Future, time::Duration};
 
 use omp_agent::{
-	CampaignEntry, CampaignEntryStatus, ClaimOutcome, EngageReceipt,
+	AcquireOutcome, RegimeRecord, RegimeStatus, StartReceipt,
 	control::{ControlError, ControlSender},
 };
 use omp_core::{Str, sf};
@@ -26,7 +26,7 @@ pub const HARNESS: &str = "./autoresearch.sh";
 /// Pi's default per-run timeout.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(600);
 
-const CAMPAIGN_ID: &str = "autoresearch";
+const REGIME_ID: &str = "autoresearch";
 
 /// Streaming harness outcome supplied by Environment process authority.
 #[derive(Clone, Debug, PartialEq)]
@@ -45,49 +45,46 @@ pub struct HarnessOutput {
 	pub benchmark_bytes: u64,
 }
 
-/// Campaign authority used by the autoresearch engine.
+/// Regime authority used by the autoresearch engine.
 ///
-/// Production uses [`ControlSender`], keeping all slot arbitration and durable
-/// lifecycle transitions on the Agent's sole mutable owner.
-pub trait AutoresearchCampaigns: Send + Sync {
-	/// Returns active and queued durable campaign entries.
-	fn active_campaigns(
-		&self,
-	) -> impl Future<Output = Result<Vec<CampaignEntry>, ControlError>> + Send;
+/// Production uses [`ControlSender`], keeping all resource arbitration and
+/// durable lifecycle transitions on the Agent's sole mutable owner.
+pub trait AutoresearchRegimes: Send + Sync {
+	/// Returns active and queued durable regime entries.
+	fn active_regimes(&self)
+	-> impl Future<Output = Result<Vec<RegimeRecord>, ControlError>> + Send;
 
-	/// Engages the built-in autoresearch regime without queueing.
-	fn engage_autoresearch(
-		&self,
-	) -> impl Future<Output = Result<EngageReceipt, ControlError>> + Send;
+	/// Starts the built-in autoresearch regime without queueing.
+	fn start_autoresearch(&self) -> impl Future<Output = Result<StartReceipt, ControlError>> + Send;
 
-	/// Disengages a live autoresearch campaign after its transaction settles.
-	fn disengage_autoresearch(
+	/// Stops a live autoresearch regime after its transaction settles.
+	fn stop_autoresearch(
 		&self,
-		engagement: Str,
+		activation: Str,
 	) -> impl Future<Output = Result<bool, ControlError>> + Send;
 
-	/// Cuts a killed autoresearch campaign without applying dwell.
-	fn cut_autoresearch(
+	/// Cuts a killed autoresearch regime without applying dwell.
+	fn cancel_autoresearch(
 		&self,
-		engagement: Str,
+		activation: Str,
 	) -> impl Future<Output = Result<bool, ControlError>> + Send;
 }
 
-impl AutoresearchCampaigns for ControlSender {
-	async fn active_campaigns(&self) -> Result<Vec<CampaignEntry>, ControlError> {
-		ControlSender::active_campaigns(self).await
+impl AutoresearchRegimes for ControlSender {
+	async fn active_regimes(&self) -> Result<Vec<RegimeRecord>, ControlError> {
+		ControlSender::active_regimes(self).await
 	}
 
-	async fn engage_autoresearch(&self) -> Result<EngageReceipt, ControlError> {
-		self.engage_regime("autoresearch", false).await
+	async fn start_autoresearch(&self) -> Result<StartReceipt, ControlError> {
+		self.start_core_regime("autoresearch", false).await
 	}
 
-	async fn disengage_autoresearch(&self, engagement: Str) -> Result<bool, ControlError> {
-		self.disengage_campaign(engagement).await
+	async fn stop_autoresearch(&self, activation: Str) -> Result<bool, ControlError> {
+		self.stop_regime(activation).await
 	}
 
-	async fn cut_autoresearch(&self, engagement: Str) -> Result<bool, ControlError> {
-		self.cut_campaign(engagement).await
+	async fn cancel_autoresearch(&self, activation: Str) -> Result<bool, ControlError> {
+		self.cancel_regime(activation).await
 	}
 }
 
@@ -197,9 +194,9 @@ pub enum EngineError<H: StdError + 'static, J: StdError + 'static> {
 	/// Isolation mutation or crash recovery failed.
 	#[error(transparent)]
 	Git(#[from] GitError<H>),
-	/// Campaign CONTROL or arbitration failed.
-	#[error("autoresearch campaign transition failed")]
-	Campaign(#[source] ControlError),
+	/// Regime CONTROL or arbitration failed.
+	#[error("autoresearch regime transition failed")]
+	Regime(#[source] ControlError),
 	/// A tool was called without an active, branch-matching session.
 	#[error("no active autoresearch session for the current branch")]
 	Inactive,
@@ -222,19 +219,19 @@ pub enum EngineError<H: StdError + 'static, J: StdError + 'static> {
 
 /// Journal-first autoresearch owner.
 pub struct Engine<'a, H, J, C = ControlSender> {
-	host:      &'a H,
-	journal:   &'a mut J,
-	storage:   &'a mut Storage,
-	mutation:  Option<&'a GitMutation>,
-	campaigns: &'a C,
-	runtime:   RuntimeState,
+	host:     &'a H,
+	journal:  &'a mut J,
+	storage:  &'a mut Storage,
+	mutation: Option<&'a GitMutation>,
+	regimes:  &'a C,
+	runtime:  RuntimeState,
 }
 
 impl<'a, H, J, C> Engine<'a, H, J, C>
 where
 	H: AutoresearchHost,
 	J: JournalAppender,
-	C: AutoresearchCampaigns,
+	C: AutoresearchRegimes,
 {
 	/// Creates one owner and reconstructs its query-backed runtime state.
 	pub fn new(
@@ -242,9 +239,9 @@ where
 		journal: &'a mut J,
 		storage: &'a mut Storage,
 		mutation: Option<&'a GitMutation>,
-		campaigns: &'a C,
+		regimes: &'a C,
 	) -> Self {
-		Self { host, journal, storage, mutation, campaigns, runtime: RuntimeState::default() }
+		Self { host, journal, storage, mutation, regimes, runtime: RuntimeState::default() }
 	}
 
 	/// Returns the reconstructed runtime state.
@@ -260,7 +257,7 @@ where
 		unisolated: bool,
 		cancel: &CancellationToken,
 	) -> Result<Str, EngineError<H::Error, J::Error>> {
-		let newly_engaged = self.ensure_campaign().await?;
+		let newly_started = self.ensure_regime().await?;
 		let isolation = match ensure_isolation(
 			Some(self.host),
 			self.mutation,
@@ -273,8 +270,8 @@ where
 		{
 			Ok(isolation) => isolation,
 			Err(error) => {
-				if newly_engaged {
-					let _ = self.release_campaign().await;
+				if newly_started {
+					let _ = self.release_regime().await;
 				}
 				return Err(error.into());
 			},
@@ -309,14 +306,14 @@ where
 		params: InitExperiment,
 		cancel: &CancellationToken,
 	) -> Result<i64, EngineError<H::Error, J::Error>> {
-		let newly_engaged = self.ensure_campaign().await?;
+		let newly_started = self.ensure_regime().await?;
 		if let Err(error) = self
 			.host
 			.validate_harness(params.primary_metric.as_str(), cancel)
 			.await
 		{
-			if newly_engaged {
-				let _ = self.release_campaign().await;
+			if newly_started {
+				let _ = self.release_regime().await;
 			}
 			return Err(EngineError::Host(error));
 		}
@@ -332,8 +329,8 @@ where
 		{
 			Ok(isolation) => isolation,
 			Err(error) => {
-				if newly_engaged {
-					let _ = self.release_campaign().await;
+				if newly_started {
+					let _ = self.release_regime().await;
 				}
 				return Err(error.into());
 			},
@@ -583,23 +580,23 @@ where
 		self.record(&JournalFact::NotesUpdated { id, notes, at_ms: self.host.now_ms() })
 	}
 
-	/// Disengages autoresearch while retaining experiment history.
+	/// Stops autoresearch while retaining experiment history.
 	pub async fn disable(&mut self) -> Result<(), EngineError<H::Error, J::Error>> {
-		self.release_campaign().await?;
+		self.release_regime().await?;
 		self.runtime.resume_armed = false;
 		Ok(())
 	}
 
 	/// Cuts a killed loop immediately while retaining experiment history.
 	pub async fn kill(&mut self) -> Result<(), EngineError<H::Error, J::Error>> {
-		if let Some(engagement) = self.runtime.engagement.clone() {
+		if let Some(activation) = self.runtime.activation.clone() {
 			self
-				.campaigns
-				.cut_autoresearch(engagement)
+				.regimes
+				.cancel_autoresearch(activation)
 				.await
-				.map_err(EngineError::Campaign)?;
+				.map_err(EngineError::Regime)?;
 		}
-		self.runtime.engagement = None;
+		self.runtime.activation = None;
 		self.runtime.resume_armed = false;
 		Ok(())
 	}
@@ -628,7 +625,7 @@ where
 				at_ms: self.host.now_ms(),
 			})?;
 		}
-		self.release_campaign().await?;
+		self.release_regime().await?;
 		self.runtime = RuntimeState::default();
 		Ok(())
 	}
@@ -644,8 +641,8 @@ where
 			.current_branch(cancel)
 			.await
 			.map_err(EngineError::Host)?;
-		self.restore_campaign().await?;
-		if self.runtime.engagement.is_none() {
+		self.restore_regime().await?;
+		if self.runtime.activation.is_none() {
 			return Ok(());
 		}
 		if let Some(intent) = self.storage.pending_disposition(branch.as_deref())? {
@@ -685,14 +682,14 @@ where
 			self.runtime.pending_run = self.storage.pending_run(session.id)?.map(|run| run.id);
 			self.runtime.goal = session.config.goal.clone();
 			self.runtime.session = Some(session.config);
-			self.runtime.resume_armed = self.runtime.engagement.is_some();
+			self.runtime.resume_armed = self.runtime.activation.is_some();
 		}
 		Ok(())
 	}
 
 	/// Hidden continuation prompt admitted only after the parent settles.
 	pub fn continuation_prompt(&mut self, parent_settled: bool) -> Option<Str> {
-		if !parent_settled || self.runtime.engagement.is_none() || !self.runtime.resume_armed {
+		if !parent_settled || self.runtime.activation.is_none() || !self.runtime.resume_armed {
 			return None;
 		}
 		self.runtime.resume_armed = false;
@@ -753,39 +750,39 @@ where
 		Ok(None)
 	}
 
-	async fn ensure_campaign(&mut self) -> Result<bool, EngineError<H::Error, J::Error>> {
-		if self.runtime.engagement.is_some() {
+	async fn ensure_regime(&mut self) -> Result<bool, EngineError<H::Error, J::Error>> {
+		if self.runtime.activation.is_some() {
 			return Ok(false);
 		}
-		let (engagement, newly_engaged) = acquire_campaign(self.campaigns)
+		let (activation, newly_started) = acquire_regime(self.regimes)
 			.await
-			.map_err(EngineError::Campaign)?;
-		self.runtime.engagement = Some(engagement);
-		Ok(newly_engaged)
+			.map_err(EngineError::Regime)?;
+		self.runtime.activation = Some(activation);
+		Ok(newly_started)
 	}
 
-	async fn restore_campaign(&mut self) -> Result<(), EngineError<H::Error, J::Error>> {
-		self.runtime.engagement = revived_engagement(
+	async fn restore_regime(&mut self) -> Result<(), EngineError<H::Error, J::Error>> {
+		self.runtime.activation = revived_activation(
 			self
-				.campaigns
-				.active_campaigns()
+				.regimes
+				.active_regimes()
 				.await
-				.map_err(EngineError::Campaign)?,
+				.map_err(EngineError::Regime)?,
 		);
-		self.runtime.resume_armed = self.runtime.engagement.is_some();
+		self.runtime.resume_armed = self.runtime.activation.is_some();
 		Ok(())
 	}
 
-	async fn release_campaign(&mut self) -> Result<(), EngineError<H::Error, J::Error>> {
-		let Some(engagement) = self.runtime.engagement.clone() else {
+	async fn release_regime(&mut self) -> Result<(), EngineError<H::Error, J::Error>> {
+		let Some(activation) = self.runtime.activation.clone() else {
 			return Ok(());
 		};
 		self
-			.campaigns
-			.disengage_autoresearch(engagement)
+			.regimes
+			.stop_autoresearch(activation)
 			.await
-			.map_err(EngineError::Campaign)?;
-		self.runtime.engagement = None;
+			.map_err(EngineError::Regime)?;
+		self.runtime.activation = None;
 		Ok(())
 	}
 
@@ -793,7 +790,7 @@ where
 		&self,
 		cancel: &CancellationToken,
 	) -> Result<ProjectedSession, EngineError<H::Error, J::Error>> {
-		if self.runtime.engagement.is_none() {
+		if self.runtime.activation.is_none() {
 			return Err(EngineError::Inactive);
 		}
 		let branch = self
@@ -813,28 +810,24 @@ where
 	}
 }
 
-async fn acquire_campaign(
-	campaigns: &impl AutoresearchCampaigns,
-) -> Result<(Str, bool), ControlError> {
-	if let Some(engagement) = revived_engagement(campaigns.active_campaigns().await?) {
-		return Ok((engagement, false));
+async fn acquire_regime(regimes: &impl AutoresearchRegimes) -> Result<(Str, bool), ControlError> {
+	if let Some(activation) = revived_activation(regimes.active_regimes().await?) {
+		return Ok((activation, false));
 	}
-	let receipt = campaigns.engage_autoresearch().await?;
+	let receipt = regimes.start_autoresearch().await?;
 	debug_assert_eq!(
 		receipt.outcome,
-		ClaimOutcome::Granted,
-		"non-queued engagement either grants or returns a typed claim error"
+		AcquireOutcome::Granted,
+		"non-queued activation either grants or returns a typed resource error"
 	);
-	Ok((receipt.engagement, true))
+	Ok((receipt.activation, true))
 }
 
-fn revived_engagement(entries: Vec<CampaignEntry>) -> Option<Str> {
+fn revived_activation(entries: Vec<RegimeRecord>) -> Option<Str> {
 	entries
 		.into_iter()
-		.find(|entry| {
-			entry.spec_id.as_str() == CAMPAIGN_ID && entry.status == CampaignEntryStatus::Engaged
-		})
-		.map(|entry| entry.engagement)
+		.find(|entry| entry.spec_id.as_str() == REGIME_ID && entry.status == RegimeStatus::Active)
+		.map(|entry| entry.activation)
 }
 
 fn dedupe(values: Vec<Str>) -> Vec<Str> {
@@ -855,77 +848,73 @@ mod tests {
 
 	use super::*;
 
-	struct CampaignHarness {
-		stack:  Mutex<omp_agent::CampaignStack>,
-		now_ms: u64,
+	struct RegimeHarness {
+		regimes: Mutex<omp_agent::RegimeSet>,
+		now_ms:  u64,
 	}
 
-	impl CampaignHarness {
+	impl RegimeHarness {
 		fn new(now_ms: u64) -> Self {
-			Self { stack: Mutex::new(omp_agent::CampaignStack::new()), now_ms }
+			Self { regimes: Mutex::new(omp_agent::RegimeSet::new()), now_ms }
 		}
 
-		fn engage(&self, spec_id: &str) -> Result<EngageReceipt, omp_agent::EngageError> {
-			let (spec, machine) = omp_agent::core_regime(spec_id).expect("core regime");
+		fn start(&self, spec_id: &str) -> Result<StartReceipt, omp_agent::StartError> {
+			let (spec, regime) = omp_agent::core_regime(spec_id).expect("core regime");
 			self
-				.stack
+				.regimes
 				.lock()
-				.engage(spec, machine, omp_agent::EngageOptions { now_ms: self.now_ms, queue: false })
+				.start(spec, regime, omp_agent::StartOptions { now_ms: self.now_ms, queue: false })
 		}
 	}
 
-	impl AutoresearchCampaigns for CampaignHarness {
-		async fn active_campaigns(&self) -> Result<Vec<CampaignEntry>, ControlError> {
-			Ok(self.stack.lock().entries())
+	impl AutoresearchRegimes for RegimeHarness {
+		async fn active_regimes(&self) -> Result<Vec<RegimeRecord>, ControlError> {
+			Ok(self.regimes.lock().records())
 		}
 
-		async fn engage_autoresearch(&self) -> Result<EngageReceipt, ControlError> {
-			self.engage(CAMPAIGN_ID).map_err(ControlError::from)
+		async fn start_autoresearch(&self) -> Result<StartReceipt, ControlError> {
+			self.start(REGIME_ID).map_err(ControlError::from)
 		}
 
-		async fn disengage_autoresearch(&self, engagement: Str) -> Result<bool, ControlError> {
+		async fn stop_autoresearch(&self, activation: Str) -> Result<bool, ControlError> {
 			self
-				.stack
+				.regimes
 				.lock()
-				.disengage(engagement.as_str(), self.now_ms)
+				.stop(activation.as_str(), self.now_ms)
 				.map_err(ControlError::from)
 		}
 
-		async fn cut_autoresearch(&self, engagement: Str) -> Result<bool, ControlError> {
-			Ok(self.stack.lock().cut(engagement.as_str()))
+		async fn cancel_autoresearch(&self, activation: Str) -> Result<bool, ControlError> {
+			Ok(self.regimes.lock().cancel(activation.as_str()))
 		}
 	}
 
 	#[tokio::test]
 	async fn autoresearch_denial_preserves_plan_holder_facts() {
-		let campaigns = CampaignHarness::new(41);
-		let plan = campaigns.engage("plan").expect("plan engagement");
+		let regimes = RegimeHarness::new(41);
+		let plan = regimes.start("plan").expect("plan activation");
 
-		let error = acquire_campaign(&campaigns)
+		let error = acquire_regime(&regimes)
 			.await
-			.expect_err("plan claims mode and worktree");
+			.expect_err("plan owns mode and worktree");
 
 		assert!(matches!(
 			error,
-			ControlError::CampaignEngage(omp_agent::EngageError::Claim {
-				outcome: ClaimOutcome::Denied { holder, since: 41 },
-				..
-			}) if holder == plan.engagement
+			ControlError::RegimeStart(omp_agent::StartError::Acquire {
+				resource: omp_agent::Resource::Mode,
+				outcome: AcquireOutcome::Denied { holder, since: 41 },
+			}) if holder == plan.activation
 		));
 	}
 
 	#[tokio::test]
-	async fn autoresearch_revival_reuses_durable_engagement() {
-		let campaigns = CampaignHarness::new(73);
-		let first = acquire_campaign(&campaigns)
-			.await
-			.expect("initial engagement");
+	async fn autoresearch_revival_reuses_durable_activation() {
+		let regimes = RegimeHarness::new(73);
+		let first = acquire_regime(&regimes).await.expect("initial activation");
 		assert!(first.1);
 
-		let revived = acquire_campaign(&campaigns)
-			.await
-			.expect("revived engagement");
+		let revived = acquire_regime(&regimes).await.expect("revived activation");
 		assert_eq!(revived, (first.0, false));
-		assert_eq!(campaigns.active_campaigns().await.expect("entries").len(), 1);
+		assert_eq!(regimes.active_regimes().await.expect("entries").len(), 1);
 	}
 }

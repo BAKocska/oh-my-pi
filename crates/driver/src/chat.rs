@@ -26,8 +26,9 @@ use omp_agent::{
 	ChildKind, CompletionError, CompletionRequest, Journal, MAX_YIELD_SCHEMA_RETRIES, PromptFacts,
 	RegistryStatus, SubagentDisposition, SubagentLifecycle, SubagentProgressSnapshot,
 	SubagentRunState, SubagentTerminalKind, SubagentTerminalStatus, TurnClient, TurnId, TurnInput,
-	TurnOptions, TurnSession as _, UnexpectedStopClassifier, WorkspaceRootInput, WorkspaceRootsInput, YieldPayloadValidator,
-	project_journal, resolve_completion, scheduler::BudgetReservation,
+	TurnOptions, TurnSession as _, UnexpectedStopClassifier, WorkspaceRootInput,
+	WorkspaceRootsInput, YieldPayloadValidator, project_journal, resolve_completion,
+	scheduler::BudgetReservation,
 };
 use omp_catalog::{AuthSpecKind, GrammarBits, model::ProvenanceKind, snapshot};
 use omp_core::{ExposeSecret as _, Str, sf};
@@ -92,7 +93,7 @@ use crate::{
 		ProviderControlResult, ProviderDeclarationDocument, ProviderModelCard, ProviderModelEvent,
 		ProviderPrice,
 	},
-	modes::{CampaignHandle, RegimeError},
+	modes::{RegimeError, RegimeHandle},
 	plan::{OverallPlanReference, PlanArtifactStore},
 	prompt_prep::PromptSnapshot,
 	rulebook,
@@ -380,9 +381,9 @@ pub enum ChatError {
 	/// Startup automation mode conflicts with the active execution state.
 	#[error(transparent)]
 	Mode(#[from] RegimeError),
-	/// Campaign recovery or durable lifecycle mutation failed.
+	/// Regime recovery or durable lifecycle mutation failed.
 	#[error(transparent)]
-	Campaign(#[from] omp_agent::AgentError),
+	Regime(#[from] omp_agent::AgentError),
 	/// The platform cannot enforce the Phase 3 owner-local environment contract.
 	#[error("interactive chat requires Unix owner-local project authorities")]
 	UnsupportedPlatform,
@@ -778,7 +779,7 @@ struct ChatParentContext {
 	definitions:   Arc<BTreeMap<Str, omp_agent::AgentDefinition>>,
 	tree:          Arc<AgentTree>,
 	task_settings: LiveTaskSettings,
-	campaigns:     Option<Arc<CampaignHandle>>,
+	regimes:       Option<Arc<RegimeHandle>>,
 }
 /// Core-backed facts consumed by the retained agent-hub presentation.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1056,7 +1057,7 @@ impl<C: TurnClient + Clone + Send + 'static> ChatParentHost<C> {
 					Arc::new(TaskSettings::default()),
 					Arc::clone(&tree),
 				),
-				campaigns: None,
+				regimes: None,
 				tree,
 			}),
 			advisor_children: Mutex::new(AdvisorChildren::default()),
@@ -1091,14 +1092,14 @@ impl<C: TurnClient + Clone + Send + 'static> ChatParentHost<C> {
 		self.context.lock().task_settings.apply(settings);
 	}
 
-	/// Binds campaign authority used by child composition.
-	pub fn bind_campaigns(&self, campaigns: Arc<CampaignHandle>) {
-		self.context.lock().campaigns = Some(campaigns);
+	/// Binds regime authority used by child composition.
+	pub fn bind_regimes(&self, regimes: Arc<RegimeHandle>) {
+		self.context.lock().regimes = Some(regimes);
 	}
 
 	fn approved_plan_reference(&self) -> Option<OverallPlanReference> {
 		let context = self.context.lock();
-		let state = context.campaigns.as_ref()?.plan()?;
+		let state = context.regimes.as_ref()?.plan()?;
 		if state.enabled {
 			return None;
 		}
@@ -3946,14 +3947,10 @@ where
 					input.as_str(),
 				)
 				.await
-				.map_err(|message| omp_tools::edit::observer::EditRepairError::Completion {
-					message,
-				})
+				.map_err(|message| omp_tools::edit::observer::EditRepairError::Completion { message })
 				.and_then(|answer| {
-					answer.ok_or_else(|| {
-						omp_tools::edit::observer::EditRepairError::Completion {
-							message: sf!("edit repair model returned no source"),
-						}
+					answer.ok_or_else(|| omp_tools::edit::observer::EditRepairError::Completion {
+						message: sf!("edit repair model returned no source"),
 					})
 				});
 			let _ = request.reply.send_async(result).await;
@@ -5112,63 +5109,76 @@ impl ProviderControlBackend for ChatProviderControlBackend {
 	}
 }
 
-/// One authoritative campaign engagement projected from the live agent owner.
+/// One authoritative regime activation projected from the live agent owner.
 #[derive(Clone, Debug)]
-pub struct CampaignControlEntry {
-	/// Stable engagement identity.
+pub struct RegimeControlEntry {
+	/// Stable activation identity.
 	pub id:        Str,
-	/// Frozen campaign declaration identity.
-	pub campaign:  Str,
+	/// Frozen regime declaration identity.
+	pub regime:    Str,
 	/// Extension owning the declaration.
 	pub extension: Str,
-	/// Opaque state payload decoded by Python's declared state codec.
-	pub state:     Option<Str>,
-	/// Whether this is a durable FIFO ticket.
-	pub queued:    bool,
+	/// Current activation status.
+	pub status:    RegimeControlStatus,
 }
 
-/// Extension campaign declaration and callback resolver.
+/// Public status of one regime activation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RegimeControlStatus {
+	/// The activation currently owns every declared resource.
+	Active,
+	/// The activation is waiting in a durable FIFO resource queue.
+	Queued,
+}
+
+impl RegimeControlStatus {
+	fn as_str(self) -> &'static str {
+		match self {
+			Self::Active => "active",
+			Self::Queued => "queued",
+		}
+	}
+}
+
+/// Extension regime declaration and callback resolver.
 ///
-/// The resolver constructs the real generation-fenced callback machine from the
-/// sealed declaration table; it never accepts a child-supplied machine.
-pub trait CampaignControlResolver: Send + Sync + 'static {
+/// The resolver constructs the generation-fenced callback handler from the
+/// sealed declaration table; it never accepts child-supplied executable code.
+pub trait RegimeControlResolver: Send + Sync + 'static {
 	/// Resolves a declaration owned by the authenticated extension.
 	fn resolve(
 		&self,
 		identity: &ControlConnectionIdentity,
-		campaign: &str,
+		regime: &str,
 		state: Option<&str>,
-	) -> Result<
-		(Arc<omp_agent::CampaignSpec>, Box<dyn omp_agent::CampaignMachine>),
-		ControlProtocolError,
-	>;
+	) -> Result<(Arc<omp_agent::RegimeSpec>, Box<dyn omp_agent::Regime>), ControlProtocolError>;
 
 	/// Returns the owning extension for a frozen declaration.
-	fn owner(&self, campaign: &str) -> Option<Str>;
+	fn owner(&self, regime: &str) -> Option<Str>;
 }
 
-/// Campaign backend delegating every mutation and projection to the sole live
+/// Regime backend delegating every mutation and projection to the sole live
 /// agent loop.
-pub struct AgentCampaignControlBackend {
+pub struct AgentRegimeControlBackend {
 	control:  omp_agent::ControlSender,
-	resolver: Arc<dyn CampaignControlResolver>,
+	resolver: Arc<dyn RegimeControlResolver>,
 }
 
-impl AgentCampaignControlBackend {
+impl AgentRegimeControlBackend {
 	/// Binds the live agent owner and sealed extension declaration resolver.
-	pub fn new(
-		control: omp_agent::ControlSender,
-		resolver: Arc<dyn CampaignControlResolver>,
-	) -> Self {
+	pub fn new(control: omp_agent::ControlSender, resolver: Arc<dyn RegimeControlResolver>) -> Self {
 		Self { control, resolver }
 	}
 
 	async fn entries(
 		&self,
 		extension: Option<&str>,
-	) -> Result<Vec<CampaignControlEntry>, ControlProtocolError> {
-		let entries = self.control.active_campaigns().await.map_err(|error| {
-			ControlProtocolError::new("CampaignOwnerError", Str::from(error.to_string()))
+	) -> Result<Vec<RegimeControlEntry>, ControlProtocolError> {
+		let entries = self.control.active_regimes().await.map_err(|_| {
+			ControlProtocolError::new(
+				"RegimeOwnerError",
+				"live agent owner rejected regime projection",
+			)
 		})?;
 		let mut projected = Vec::new();
 		for entry in entries {
@@ -5178,50 +5188,48 @@ impl AgentCampaignControlBackend {
 			if extension.is_some_and(|extension| extension != owner.as_str()) {
 				continue;
 			}
-			let state = if entry.state.is_empty() {
-				None
-			} else {
-				Some(entry.state.clone())
-			};
-			projected.push(CampaignControlEntry {
-				id: entry.engagement,
-				campaign: entry.spec_id,
+			projected.push(RegimeControlEntry {
+				id:        entry.activation,
+				regime:    entry.spec_id,
 				extension: owner,
-				state,
-				queued: matches!(entry.status, omp_agent::CampaignEntryStatus::Queued),
+				status:    if matches!(entry.status, omp_agent::RegimeStatus::Queued) {
+					RegimeControlStatus::Queued
+				} else {
+					RegimeControlStatus::Active
+				},
 			});
 		}
 		Ok(projected)
 	}
 }
 
-/// Factory for connection-scoped `omp.campaigns.*` ownership.
-pub struct CampaignControlAuthorityFactory {
-	backend: Arc<AgentCampaignControlBackend>,
+/// Factory for connection-scoped `omp.regimes.*` ownership.
+pub struct RegimeControlAuthorityFactory {
+	backend: Arc<AgentRegimeControlBackend>,
 }
 
-impl CampaignControlAuthorityFactory {
-	/// Creates a factory over the one live session campaign owner.
-	pub fn new(backend: Arc<AgentCampaignControlBackend>) -> Self {
+impl RegimeControlAuthorityFactory {
+	/// Creates a factory over the one live session regime owner.
+	pub fn new(backend: Arc<AgentRegimeControlBackend>) -> Self {
 		Self { backend }
 	}
 }
 
-struct CampaignControlAuthority {
+struct RegimeControlAuthority {
 	identity: Arc<ControlConnectionIdentity>,
-	backend:  Arc<AgentCampaignControlBackend>,
+	backend:  Arc<AgentRegimeControlBackend>,
 }
 
-impl ControlAuthorityFactory for CampaignControlAuthorityFactory {
+impl ControlAuthorityFactory for RegimeControlAuthorityFactory {
 	fn bind(
 		&self,
 		identity: Arc<ControlConnectionIdentity>,
 	) -> Result<Arc<dyn ControlAuthority>, ControlCompositionError> {
-		Ok(Arc::new(CampaignControlAuthority { identity, backend: Arc::clone(&self.backend) }))
+		Ok(Arc::new(RegimeControlAuthority { identity, backend: Arc::clone(&self.backend) }))
 	}
 }
 
-impl CampaignControlAuthority {
+impl RegimeControlAuthority {
 	fn validate(
 		&self,
 		context: &control::ControlRequestContext,
@@ -5231,29 +5239,25 @@ impl CampaignControlAuthority {
 		} else {
 			Err(ControlProtocolError::new(
 				"StaleGeneration",
-				"campaign CONTROL authority belongs to a replaced connection",
+				"regime CONTROL authority belongs to a replaced connection",
 			))
 		}
 	}
 
-	fn entry(entry: CampaignControlEntry) -> Value {
+	fn entry(entry: RegimeControlEntry) -> Value {
 		json!({
 			"id": entry.id.as_str(),
-			"campaign": entry.campaign.as_str(),
+			"regime": entry.regime.as_str(),
 			"extension": entry.extension.as_str(),
-			"state": entry.state,
-			"queued": entry.queued,
+			"status": entry.status.as_str(),
 		})
 	}
 }
 
 #[async_trait]
-impl ControlAuthority for CampaignControlAuthority {
+impl ControlAuthority for RegimeControlAuthority {
 	fn handles(&self, operation: &str) -> bool {
-		matches!(
-			operation,
-			"omp.campaigns.engage" | "omp.campaigns.active" | "omp.campaigns.disengage"
-		)
+		matches!(operation, "omp.regimes.start" | "omp.regimes.active" | "omp.regimes.stop")
 	}
 
 	fn authorize(
@@ -5270,15 +5274,15 @@ impl ControlAuthority for CampaignControlAuthority {
 		{
 			return Err(ControlProtocolError::new(
 				"PhaseError",
-				"campaign operations require an active extension lifecycle",
+				"regime operations require an active extension lifecycle",
 			));
 		}
-		if operation == "omp.campaigns.active" {
+		if operation == "omp.regimes.active" {
 			let target = arguments
 				.get("extension")
 				.and_then(Value::as_str)
 				.unwrap_or(self.identity.extension.as_str());
-			control::authorize_campaign_read(
+			control::authorize_regime_read(
 				self.identity.extension.as_str(),
 				target,
 				&self.identity.capabilities,
@@ -5286,7 +5290,7 @@ impl ControlAuthority for CampaignControlAuthority {
 			.map_err(|_| {
 				ControlProtocolError::new(
 					"CapabilityError",
-					"cross-extension campaign reads require campaigns.read",
+					"cross-extension regime reads require regimes.read",
 				)
 			})?;
 		}
@@ -5301,46 +5305,49 @@ impl ControlAuthority for CampaignControlAuthority {
 	) -> Result<Value, ControlProtocolError> {
 		self.validate(&context)?;
 		match operation.as_str() {
-			"omp.campaigns.engage" => {
-				let campaign = arguments
-					.get("campaign")
+			"omp.regimes.start" => {
+				let regime = arguments
+					.get("regime")
 					.and_then(Value::as_str)
-					.filter(|campaign| !campaign.is_empty())
+					.filter(|regime| !regime.is_empty())
 					.ok_or_else(|| {
-						ControlProtocolError::new("InvalidCampaign", "campaign identity is required")
+						ControlProtocolError::new("InvalidRegime", "regime identity is required")
 					})?;
 				let state = arguments.get("state").and_then(Value::as_str);
 				let queue = arguments
 					.get("queue")
 					.and_then(Value::as_bool)
 					.unwrap_or(false);
-				let (spec, machine) = self
+				let (spec, handler) = self
 					.backend
 					.resolver
-					.resolve(&self.identity, campaign, state)?;
+					.resolve(&self.identity, regime, state)?;
 				let receipt = self
 					.backend
 					.control
-					.engage_campaign(spec, machine, omp_agent::EngageOptions { now_ms: now_ms(), queue })
+					.start_regime(spec, handler, omp_agent::StartOptions { now_ms: now_ms(), queue })
 					.await
-					.map_err(|error| {
-						ControlProtocolError::new("CampaignEngageError", Str::from(error.to_string()))
+					.map_err(|_| {
+						ControlProtocolError::new(
+							"RegimeStartError",
+							"live agent owner rejected regime start",
+						)
 					})?;
 				let entry = self
 					.backend
 					.entries(Some(self.identity.extension.as_str()))
 					.await?
 					.into_iter()
-					.find(|entry| entry.id == receipt.engagement)
+					.find(|entry| entry.id == receipt.activation)
 					.ok_or_else(|| {
 						ControlProtocolError::new(
-							"CampaignOwnerError",
-							"accepted campaign is absent from the live agent owner",
+							"RegimeOwnerError",
+							"accepted regime is absent from the live agent owner",
 						)
 					})?;
 				Ok(Self::entry(entry))
 			},
-			"omp.campaigns.active" => {
+			"omp.regimes.active" => {
 				let extension = arguments
 					.get("extension")
 					.and_then(Value::as_str)
@@ -5355,43 +5362,43 @@ impl ControlAuthority for CampaignControlAuthority {
 						.collect(),
 				))
 			},
-			"omp.campaigns.disengage" => {
-				let engagement = arguments
-					.get("engagement")
+			"omp.regimes.stop" => {
+				let activation = arguments
+					.get("activation_id")
 					.and_then(Value::as_str)
-					.filter(|engagement| !engagement.is_empty())
+					.filter(|activation| !activation.is_empty())
 					.ok_or_else(|| {
-						ControlProtocolError::new("InvalidCampaign", "engagement identity is required")
+						ControlProtocolError::new("InvalidRegime", "activation identity is required")
 					})?;
 				let owned = self
 					.backend
 					.entries(Some(self.identity.extension.as_str()))
 					.await?
 					.into_iter()
-					.any(|entry| entry.id.as_str() == engagement);
+					.any(|entry| entry.id.as_str() == activation);
 				if !owned {
 					return Err(ControlProtocolError::new(
 						"AuthorizationError",
-						"engagement is not owned by the calling extension",
+						"activation is not owned by the calling extension",
 					));
 				}
 				Ok(Value::Bool(
 					self
 						.backend
 						.control
-						.disengage_campaign(Str::from(engagement))
+						.stop_regime(Str::from(activation))
 						.await
-						.map_err(|error| {
+						.map_err(|_| {
 							ControlProtocolError::new(
-								"CampaignDisengageError",
-								Str::from(error.to_string()),
+								"RegimeStopError",
+								"live agent owner rejected regime stop",
 							)
 						})?,
 				))
 			},
 			_ => Err(ControlProtocolError::new(
 				"UnknownOperation",
-				"campaign authority does not own this operation",
+				"regime authority does not own this operation",
 			)),
 		}
 	}
@@ -5404,7 +5411,7 @@ impl ControlAuthority for CampaignControlAuthority {
 		self.validate(&context)?;
 		Err(ControlProtocolError::new(
 			"UnsupportedEffect",
-			"campaign mutations are correlated CONTROL operations",
+			"regime mutations are correlated CONTROL operations",
 		))
 	}
 }
@@ -6297,10 +6304,9 @@ mod tests {
 		fs::{self, OpenOptions},
 		future,
 		io::Write as _,
-		mem,
 	};
 
-	use futures::{Stream, stream};
+	use futures::Stream;
 	use omp_agent::{InvokeFrame, TurnSession};
 	use omp_env::EnvClient;
 	use omp_proto::thread::v1::{Item, Message, Part};

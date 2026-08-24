@@ -33,17 +33,17 @@ pub enum CommandSource {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SlashCommand {
 	/// Name without `/`.
-	pub name:        Str,
+	pub name:          Str,
 	/// Display description.
-	pub description: Str,
+	pub description:   Str,
 	/// Parsed argument hint from file frontmatter.
 	pub argument_hint: Option<Str>,
 	/// Prompt template.
-	pub content:     Str,
+	pub content:       Str,
 	/// Canonical source path for file declarations.
-	pub path:        Option<PathBuf>,
+	pub path:          Option<PathBuf>,
 	/// Winning source kind.
-	pub source:      CommandSource,
+	pub source:        CommandSource,
 }
 
 /// Markdown command parse failure.
@@ -62,7 +62,7 @@ pub enum SlashCommandError {
 
 #[derive(Default, Deserialize)]
 struct Frontmatter {
-	description: Option<Str>,
+	description:   Option<Str>,
 	#[serde(alias = "argumentHint", alias = "argument-hint")]
 	argument_hint: Option<Str>,
 }
@@ -85,10 +85,8 @@ pub fn parse_markdown(
 	} else {
 		(None, markdown)
 	};
-	let (frontmatter_description, frontmatter_argument_hint) = frontmatter.map_or(
-		(None, None),
-		|frontmatter| (frontmatter.description, frontmatter.argument_hint),
-	);
+	let (frontmatter_description, frontmatter_argument_hint) = frontmatter
+		.map_or((None, None), |frontmatter| (frontmatter.description, frontmatter.argument_hint));
 	let description = frontmatter_description
 		.or_else(|| {
 			body

@@ -897,11 +897,7 @@ async fn run_checker_streaming<R: CheckerRunner>(
 	diagnostics: Option<flume::Sender<Vec<Diagnostic>>>,
 ) -> Result<CheckResult, R::Error> {
 	let (partial_tx, partial_rx) = flume::unbounded();
-	let process = runner.run_checker(
-		checker,
-		cancel,
-		diagnostics.as_ref().map(|_| partial_tx),
-	);
+	let process = runner.run_checker(checker, cancel, diagnostics.as_ref().map(|_| partial_tx));
 	tokio::pin!(process);
 	let mut emitted = HashSet::new();
 	let mut partials_open = diagnostics.is_some();
@@ -947,8 +943,12 @@ pub fn diagnostic_key(diagnostic: &Diagnostic) -> Str {
 	Str::from(format!(
 		"{}\0{}\0{}\0{}\0{}",
 		diagnostic.file.as_deref().unwrap_or_default(),
-		diagnostic.line.map_or_else(String::new, |value| value.to_string()),
-		diagnostic.column.map_or_else(String::new, |value| value.to_string()),
+		diagnostic
+			.line
+			.map_or_else(String::new, |value| value.to_string()),
+		diagnostic
+			.column
+			.map_or_else(String::new, |value| value.to_string()),
 		diagnostic.code.as_deref().unwrap_or_default(),
 		diagnostic.message,
 	))
@@ -973,15 +973,15 @@ fn normalize_result(project_root: &Path, checker: &Checker, process: ProcessOutp
 			.nth(12_000)
 			.map_or(output, |(cut, _)| &output[..cut]);
 		diagnostics.push(Diagnostic {
-			checker: checker.id.clone(),
-			file: None,
-			line: None,
-			column: None,
-			end_line: None,
+			checker:    checker.id.clone(),
+			file:       None,
+			line:       None,
+			column:     None,
+			end_line:   None,
 			end_column: None,
-			code: Some(sf!("checker-failed")),
-			severity: Severity::Error,
-			message: Str::from(format!(
+			code:       Some(sf!("checker-failed")),
+			severity:   Severity::Error,
+			message:    Str::from(format!(
 				"Checker exited with status {}{}{}",
 				process.exit_code.unwrap_or_default(),
 				if output.trim().is_empty() { "" } else { ": " },

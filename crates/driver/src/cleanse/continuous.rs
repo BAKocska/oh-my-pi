@@ -24,7 +24,7 @@ pub(super) struct ContinuousRun {
 
 #[derive(Clone)]
 struct Owner {
-	worker: usize,
+	worker:    usize,
 	followups: flume::Sender<Vec<Diagnostic>>,
 }
 
@@ -43,13 +43,8 @@ pub(super) async fn dispatch<H: CleanseHost>(
 	cancel: &CancellationToken,
 ) -> Result<ContinuousRun, <H as CheckerRunner>::Error> {
 	let (diagnostic_tx, diagnostic_rx) = flume::unbounded();
-	let collection = run_suite_streaming(
-		host.project_root(),
-		suite,
-		host,
-		cancel,
-		Some(diagnostic_tx),
-	);
+	let collection =
+		run_suite_streaming(host.project_root(), suite, host, cancel, Some(diagnostic_tx));
 	tokio::pin!(collection);
 
 	let mut collection_result = None;
@@ -82,15 +77,7 @@ pub(super) async fn dispatch<H: CleanseHost>(
 				owned.insert(group.file.clone(), Owner { worker, followups: followup_tx.clone() });
 			}
 			active.insert(worker, assignment.clone());
-			workers.push(worker_future(
-				host,
-				assignment,
-				worker,
-				peers,
-				model,
-				followup_rx,
-				cancel,
-			));
+			workers.push(worker_future(host, assignment, worker, peers, model, followup_rx, cancel));
 		}
 
 		let collection_done = collection_result.is_some();
@@ -154,8 +141,8 @@ pub(super) async fn dispatch<H: CleanseHost>(
 	}
 	if cancelled {
 		return Ok(ContinuousRun {
-			report: collection_result.and_then(Result::ok).unwrap_or_default(),
-			workers: worker_count,
+			report:    collection_result.and_then(Result::ok).unwrap_or_default(),
+			workers:   worker_count,
 			cancelled: true,
 		});
 	}
@@ -175,14 +162,7 @@ fn worker_future<'a, H: CleanseHost>(
 	followups: flume::Receiver<Vec<Diagnostic>>,
 	cancel: &'a CancellationToken,
 ) -> impl Future<Output = WorkerFinished<<H as CheckerRunner>::Error>> + Send + 'a {
-	let outcome = host.repair_worker(
-		assignment.clone(),
-		worker,
-		peers,
-		model,
-		followups,
-		cancel,
-	);
+	let outcome = host.repair_worker(assignment.clone(), worker, peers, model, followups, cancel);
 	async move { WorkerFinished { worker, assignment, outcome: outcome.await } }
 }
 
@@ -246,8 +226,7 @@ mod tests {
 
 	use super::*;
 	use crate::cleanse::{
-		BinaryResolver, Checker, CheckerEffect, ProcessOutput, TargetChoice,
-		parsers::ParserKind,
+		BinaryResolver, Checker, CheckerEffect, ProcessOutput, TargetChoice, parsers::ParserKind,
 	};
 
 	#[derive(Debug, thiserror::Error)]
@@ -255,26 +234,26 @@ mod tests {
 	struct TestError;
 
 	type CheckerFn = dyn Fn(
-		Checker,
-		Option<flume::Sender<ProcessOutput>>,
-		CancellationToken,
-	) -> BoxFuture<'static, Result<ProcessOutput, TestError>>
+			Checker,
+			Option<flume::Sender<ProcessOutput>>,
+			CancellationToken,
+		) -> BoxFuture<'static, Result<ProcessOutput, TestError>>
 		+ Send
 		+ Sync;
 	type WorkerFn = dyn Fn(
-		Assignment,
-		usize,
-		Vec<Assignment>,
-		flume::Receiver<Vec<Diagnostic>>,
-		CancellationToken,
-	) -> BoxFuture<'static, Result<RepairOutcome, TestError>>
+			Assignment,
+			usize,
+			Vec<Assignment>,
+			flume::Receiver<Vec<Diagnostic>>,
+			CancellationToken,
+		) -> BoxFuture<'static, Result<RepairOutcome, TestError>>
 		+ Send
 		+ Sync;
 
 	struct TestHost {
-		root: PathBuf,
+		root:    PathBuf,
 		checker: Arc<CheckerFn>,
-		worker: Arc<WorkerFn>,
+		worker:  Arc<WorkerFn>,
 	}
 
 	impl BinaryResolver for TestHost {
@@ -348,15 +327,15 @@ mod tests {
 
 	fn checker(id: &str) -> Checker {
 		Checker {
-			id: sf!("{id}"),
-			label: sf!("{id}"),
+			id:       sf!("{id}"),
+			label:    sf!("{id}"),
 			language: sf!("test"),
-			cwd: PathBuf::from("."),
-			binary: PathBuf::from(id),
-			args: Vec::new(),
-			parser: ParserKind::Generic,
-			effect: CheckerEffect::ReadOnly,
-			test: false,
+			cwd:      PathBuf::from("."),
+			binary:   PathBuf::from(id),
+			args:     Vec::new(),
+			parser:   ParserKind::Generic,
+			effect:   CheckerEffect::ReadOnly,
+			test:     false,
 		}
 	}
 
@@ -369,7 +348,11 @@ mod tests {
 	}
 
 	fn success(worker: usize) -> RepairOutcome {
-		RepairOutcome { name: Str::from(format!("CleanseA{worker}")), success: true, output: sf!("") }
+		RepairOutcome {
+			name:    Str::from(format!("CleanseA{worker}")),
+			success: true,
+			output:  sf!(""),
+		}
 	}
 
 	#[tokio::test]
@@ -378,7 +361,7 @@ mod tests {
 		let worker_started = Arc::new(Notify::new());
 		let starts = Arc::new(Mutex::new(Vec::new()));
 		let host = TestHost {
-			root: PathBuf::from("."),
+			root:    PathBuf::from("."),
 			checker: {
 				let first_emitted = Arc::clone(&first_emitted);
 				let worker_started = Arc::clone(&worker_started);
@@ -387,23 +370,33 @@ mod tests {
 					let worker_started = Arc::clone(&worker_started);
 					Box::pin(async move {
 						if checker.id == "a" {
-							partials.as_ref().unwrap().send(output("a.rs:1:1: error: a\n")).unwrap();
+							partials
+								.as_ref()
+								.unwrap()
+								.send(output("a.rs:1:1: error: a\n"))
+								.unwrap();
 							first_emitted.notify_one();
 							worker_started.notified().await;
 							Ok(output("a.rs:1:1: error: a\n"))
 						} else {
 							first_emitted.notified().await;
-							partials.as_ref().unwrap().send(output("b.rs:1:1: error: b\n")).unwrap();
+							partials
+								.as_ref()
+								.unwrap()
+								.send(output("b.rs:1:1: error: b\n"))
+								.unwrap();
 							Ok(output("b.rs:1:1: error: b\n"))
 						}
 					})
 				})
 			},
-			worker: {
+			worker:  {
 				let starts = Arc::clone(&starts);
 				let worker_started = Arc::clone(&worker_started);
 				Arc::new(move |assignment, worker, _, _, _| {
-					starts.lock().push(assignment.groups[0].file.clone().unwrap());
+					starts
+						.lock()
+						.push(assignment.groups[0].file.clone().unwrap());
 					worker_started.notify_one();
 					Box::pin(async move { Ok(success(worker)) })
 				})
@@ -421,7 +414,7 @@ mod tests {
 		let worker_started = Arc::new(Notify::new());
 		let steered = Arc::new(Mutex::new(Vec::new()));
 		let host = TestHost {
-			root: PathBuf::from("."),
+			root:    PathBuf::from("."),
 			checker: {
 				let worker_started = Arc::clone(&worker_started);
 				Arc::new(move |_, partials, _| {
@@ -430,19 +423,22 @@ mod tests {
 						let partials = partials.unwrap();
 						partials.send(output("a.rs:1:1: error: first\n")).unwrap();
 						worker_started.notified().await;
-						partials.send(output("a.rs:1:1: error: first\na.rs:2:1: error: late\n")).unwrap();
+						partials
+							.send(output("a.rs:1:1: error: first\na.rs:2:1: error: late\n"))
+							.unwrap();
 						Ok(output("a.rs:1:1: error: first\na.rs:2:1: error: late\n"))
 					})
 				})
 			},
-			worker: {
+			worker:  {
 				let worker_started = Arc::clone(&worker_started);
 				let steered = Arc::clone(&steered);
 				Arc::new(move |_, worker, _, followups, _| {
 					let steered = Arc::clone(&steered);
 					worker_started.notify_one();
 					Box::pin(async move {
-						steered.lock().extend(followups.recv_async().await.unwrap());
+						let diagnostics = followups.recv_async().await.unwrap();
+						steered.lock().extend(diagnostics);
 						Ok(success(worker))
 					})
 				})
@@ -464,15 +460,19 @@ mod tests {
 		let overlap = Arc::new(AtomicBool::new(false));
 		let live_files = Arc::new(Mutex::new(HashSet::new()));
 		let host = TestHost {
-			root: PathBuf::from("."),
-			checker: Arc::new(|_, partials, _| Box::pin(async move {
-				let partials = partials.unwrap();
-				for file in ["a.rs", "b.rs", "c.rs"] {
-					partials.send(output(&format!("{file}:1:1: error: bad\n"))).unwrap();
-				}
-				Ok(output("a.rs:1:1: error: bad\nb.rs:1:1: error: bad\nc.rs:1:1: error: bad\n"))
-			})),
-			worker: {
+			root:    PathBuf::from("."),
+			checker: Arc::new(|_, partials, _| {
+				Box::pin(async move {
+					let partials = partials.unwrap();
+					for file in ["a.rs", "b.rs", "c.rs"] {
+						partials
+							.send(output(&format!("{file}:1:1: error: bad\n")))
+							.unwrap();
+					}
+					Ok(output("a.rs:1:1: error: bad\nb.rs:1:1: error: bad\nc.rs:1:1: error: bad\n"))
+				})
+			}),
+			worker:  {
 				let barrier = Arc::clone(&barrier);
 				let active = Arc::clone(&active);
 				let peak = Arc::clone(&peak);
@@ -487,20 +487,30 @@ mod tests {
 					let overlap = Arc::clone(&overlap);
 					let live_files = Arc::clone(&live_files);
 					Box::pin(async move {
-						let files = assignment.groups.iter().filter_map(|group| group.file.clone()).collect::<Vec<_>>();
+						let files = assignment
+							.groups
+							.iter()
+							.filter_map(|group| group.file.clone())
+							.collect::<Vec<_>>();
 						{
 							let mut live = live_files.lock();
 							for file in &files {
-								if !live.insert(file.clone()) { overlap.store(true, Ordering::SeqCst); }
+								if !live.insert(file.clone()) {
+									overlap.store(true, Ordering::SeqCst);
+								}
 							}
 						}
 						assigned.lock().extend(files.iter().cloned());
 						let now = active.fetch_add(1, Ordering::SeqCst) + 1;
 						peak.fetch_max(now, Ordering::SeqCst);
-						if worker <= 2 { barrier.wait().await; }
+						if worker <= 2 {
+							barrier.wait().await;
+						}
 						active.fetch_sub(1, Ordering::SeqCst);
 						let mut live = live_files.lock();
-						for file in files { live.remove(&file); }
+						for file in files {
+							live.remove(&file);
+						}
 						Ok(success(worker))
 					})
 				})
@@ -523,7 +533,7 @@ mod tests {
 		let released = Arc::new(Notify::new());
 		let starts = Arc::new(AtomicUsize::new(0));
 		let host = TestHost {
-			root: PathBuf::from("."),
+			root:    PathBuf::from("."),
 			checker: {
 				let released = Arc::clone(&released);
 				Arc::new(move |_, partials, _| {
@@ -532,12 +542,14 @@ mod tests {
 						let partials = partials.unwrap();
 						partials.send(output("a.rs:1:1: error: first\n")).unwrap();
 						released.notified().await;
-						partials.send(output("a.rs:1:1: error: first\na.rs:2:1: error: late\n")).unwrap();
+						partials
+							.send(output("a.rs:1:1: error: first\na.rs:2:1: error: late\n"))
+							.unwrap();
 						Ok(output("a.rs:1:1: error: first\na.rs:2:1: error: late\n"))
 					})
 				})
 			},
-			worker: {
+			worker:  {
 				let released = Arc::clone(&released);
 				let starts = Arc::clone(&starts);
 				Arc::new(move |_, worker, _, followups, _| {
@@ -560,13 +572,22 @@ mod tests {
 		let cancel = CancellationToken::new();
 		let worker_started = Arc::new(Notify::new());
 		let host = TestHost {
-			root: PathBuf::from("."),
-			checker: Arc::new(|_, partials, cancel| Box::pin(async move {
-				partials.unwrap().send(output("a.rs:1:1: error: bad\n")).unwrap();
-				cancel.cancelled().await;
-				Ok(ProcessOutput { exit_code: None, stdout: sf!(""), stderr: sf!("cancelled") })
-			})),
-			worker: {
+			root:    PathBuf::from("."),
+			checker: Arc::new(|_, partials, cancel| {
+				Box::pin(async move {
+					partials
+						.unwrap()
+						.send(output("a.rs:1:1: error: bad\n"))
+						.unwrap();
+					cancel.cancelled().await;
+					Ok(ProcessOutput {
+						exit_code: None,
+						stdout:    sf!(""),
+						stderr:    sf!("cancelled"),
+					})
+				})
+			}),
+			worker:  {
 				let worker_started = Arc::clone(&worker_started);
 				Arc::new(move |_, worker, _, _, cancel| {
 					worker_started.notify_one();
@@ -580,9 +601,14 @@ mod tests {
 		let trigger = {
 			let cancel = cancel.clone();
 			let worker_started = Arc::clone(&worker_started);
-			tokio::spawn(async move { worker_started.notified().await; cancel.cancel(); })
+			tokio::spawn(async move {
+				worker_started.notified().await;
+				cancel.cancel();
+			})
 		};
-		let result = dispatch(&host, &suite(&["one"]), "@smol", 4, &cancel).await.unwrap();
+		let result = dispatch(&host, &suite(&["one"]), "@smol", 4, &cancel)
+			.await
+			.unwrap();
 		trigger.await.unwrap();
 		assert!(result.cancelled);
 		assert_eq!(result.workers, 1);
@@ -593,38 +619,47 @@ mod tests {
 		let calls = Arc::new(AtomicUsize::new(0));
 		let assigned = Arc::new(Mutex::new(Vec::new()));
 		let host = TestHost {
-			root: PathBuf::from("."),
+			root:    PathBuf::from("."),
 			checker: {
 				let calls = Arc::clone(&calls);
 				Arc::new(move |_, _, _| {
 					let call = calls.fetch_add(1, Ordering::SeqCst);
 					Box::pin(async move {
-						if call == 0 { Ok(output("opaque checker crash")) }
-						else { Ok(ProcessOutput { exit_code: Some(0), stdout: sf!(""), stderr: sf!("") }) }
+						if call == 0 {
+							Ok(output("opaque checker crash"))
+						} else {
+							Ok(ProcessOutput {
+								exit_code: Some(0),
+								stdout:    sf!(""),
+								stderr:    sf!(""),
+							})
+						}
 					})
 				})
 			},
-			worker: {
+			worker:  {
 				let assigned = Arc::clone(&assigned);
 				Arc::new(move |assignment, worker, _, _, _| {
-					assigned.lock().extend(assignment.groups.into_iter().flat_map(|group| group.diagnostics));
+					assigned.lock().extend(
+						assignment
+							.groups
+							.into_iter()
+							.flat_map(|group| group.diagnostics),
+					);
 					Box::pin(async move { Ok(success(worker)) })
 				})
 			},
 		};
 		let suite = suite(&["one"]);
-		let first = dispatch(&host, &suite, "@smol", 2, &CancellationToken::new()).await.unwrap();
+		let first = dispatch(&host, &suite, "@smol", 2, &CancellationToken::new())
+			.await
+			.unwrap();
 		assert_eq!(first.workers, 1);
 		assert_eq!(assigned.lock()[0].code.as_deref(), Some("checker-failed"));
-		let verified = super::run_suite_streaming(
-			Path::new("."),
-			&suite,
-			&host,
-			&CancellationToken::new(),
-			None,
-		)
-		.await
-		.unwrap();
+		let verified =
+			super::run_suite_streaming(Path::new("."), &suite, &host, &CancellationToken::new(), None)
+				.await
+				.unwrap();
 		assert!(verified.diagnostics.is_empty());
 	}
 }

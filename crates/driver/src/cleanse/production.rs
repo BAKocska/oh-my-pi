@@ -11,7 +11,6 @@ use std::{
 	time::Duration,
 };
 
-use tokio::io::{AsyncRead, AsyncReadExt as _};
 use omp_agent::{
 	AgentRunSummary, EntryKindDecl, Journal, JournalAuthor, JournalOperation, JournalRequest,
 	JournalRequestStamp, PendingCustomEntry, TurnId,
@@ -21,7 +20,10 @@ use omp_proto::thread::v1::{Item, Message, Part, Role, item, part};
 use omp_storage::index::{self, SessionIndex, SessionKind};
 use parking_lot::Mutex;
 use serde_json::value::to_raw_value;
-use tokio::process::Command;
+use tokio::{
+	io::{AsyncRead, AsyncReadExt as _},
+	process::Command,
+};
 use tokio_util::sync::CancellationToken;
 
 use super::{
@@ -172,7 +174,7 @@ impl ProductionCleanseHost {
 			project:               self.root.clone(),
 			additional_roots:      Box::new([]),
 			model:                 Str::new(model),
-			initial_campaign:      None,
+			initial_regime:        None,
 			initial_prompt_slot:   None,
 			plan_handoff:          None,
 			resume:                None,
@@ -233,7 +235,7 @@ impl ProductionCleanseHost {
 			project:               self.root.clone(),
 			additional_roots:      Box::new([]),
 			model:                 Str::new(model),
-			initial_campaign:      None,
+			initial_regime:        None,
 			initial_prompt_slot:   None,
 			plan_handoff:          None,
 			resume:                None,
@@ -256,7 +258,8 @@ impl ProductionCleanseHost {
 		let mut items = vec![
 			message(
 				Role::System,
-				"You are a bounded cleanse worker. Obey the assignment exactly and return only the required JSON.",
+				"You are a bounded cleanse worker. Obey the assignment exactly and return only the \
+				 required JSON.",
 			),
 			message(Role::User, prompt.as_str()),
 		];
@@ -293,10 +296,8 @@ async fn submit_repair_turn(
 	cancel: &CancellationToken,
 ) -> Result<Option<(AgentRunSummary, Vec<super::Diagnostic>)>, ProductionError> {
 	let interrupt = session.interrupt_handle();
-	let submitted = session.submit(
-		items,
-		TurnId::new(format!("cleanse-{}", omp_core::Ulid::generate())),
-	);
+	let submitted =
+		session.submit(items, TurnId::new(format!("cleanse-{}", omp_core::Ulid::generate())));
 	tokio::pin!(submitted);
 	let mut pending = Vec::new();
 	let mut receiver_open = true;
@@ -413,12 +414,16 @@ async fn run_checker_process(
 	let _ = stdout_task.await;
 	let _ = stderr_task.await;
 	if cancel.is_cancelled() {
-		return Ok(ProcessOutput { exit_code: None, stdout: sf!(""), stderr: sf!("cancelled") });
+		return Ok(ProcessOutput {
+			exit_code: None,
+			stdout:    sf!(""),
+			stderr:    sf!("cancelled"),
+		});
 	}
 	Ok(ProcessOutput {
 		exit_code: status.flatten(),
-		stdout: Str::from(String::from_utf8_lossy(&stdout).as_ref()),
-		stderr: Str::from(String::from_utf8_lossy(&stderr).as_ref()),
+		stdout:    Str::from(String::from_utf8_lossy(&stdout).as_ref()),
+		stderr:    Str::from(String::from_utf8_lossy(&stderr).as_ref()),
 	})
 }
 

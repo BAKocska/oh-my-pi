@@ -7,9 +7,8 @@ use std::{
 };
 
 use omp_agent::{
-	CampaignMachine, CampaignScope, CampaignSpec, CampaignStateError, CampaignStepResult,
-	ControlError, ControlSender, EngageOptions, ExhaustPolicy, Ladder, LadderStep, PointCx,
-	Reaction, Verdict,
+	ControlError, ControlSender, Next, Regime, RegimeContext, RegimeError, RegimeLifetime,
+	RegimeSpec, RegimeStateError, StartOptions,
 	advisor::{AdviceDelivery, AdviceSeverity, DeliveryContext, RoutedAdvice},
 	broker_now_ms,
 };
@@ -97,20 +96,20 @@ pub enum AdvisorResilienceError {
 	#[error("advisor retry budget must be positive")]
 	ZeroRetryBudget,
 }
-/// Typed terminal reason retained after an advisor campaign is muted.
+/// Typed terminal reason retained after an advisor regime is muted.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AdvisorMuteReason {
-	/// Repeated unsafe advisor turns exhausted the quarantine ladder.
+	/// Repeated unsafe advisor turns exhausted the quarantine bound.
 	QuarantineExhausted {
 		/// Classification attached to the final quarantined turn.
 		reason: Str,
 	},
 }
 
-/// Result of offering one guarded note to the advisor campaign.
+/// Result of offering one guarded note to the advisor regime.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum AdvisorCampaignSubmission {
+pub enum AdvisorRegimeSubmission {
 	/// The note was accepted for delivery at the named loop boundary.
 	Accepted(AdviceDelivery),
 	/// The advisor was already muted and cannot enqueue more notes.
@@ -131,7 +130,7 @@ impl From<RoutedAdvice> for PendingAdvice {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
-struct AdvisorCampaignState {
+struct AdvisorRegimeState {
 	context_or_idle:  VecDeque<PendingAdvice>,
 	turn_end:         VecDeque<PendingAdvice>,
 	idle:             VecDeque<PendingAdvice>,
@@ -140,22 +139,19 @@ struct AdvisorCampaignState {
 	muted:            Option<AdvisorMuteReason>,
 }
 
-/// App-owned handle feeding one active advisor's delivery campaign.
+/// App-owned handle feeding one active advisor's delivery regime.
 #[derive(Clone)]
-pub struct AdvisorCampaignHandle {
-	state: Arc<Mutex<AdvisorCampaignState>>,
+pub struct AdvisorRegimeHandle {
+	state:            Arc<Mutex<AdvisorRegimeState>>,
+	quarantine_bound: u32,
 }
 
-impl AdvisorCampaignHandle {
+impl AdvisorRegimeHandle {
 	/// Maps and queues one delivery decision for a later arbiter fold.
-	pub fn submit(
-		&self,
-		advice: RoutedAdvice,
-		context: DeliveryContext,
-	) -> AdvisorCampaignSubmission {
+	pub fn submit(&self, advice: RoutedAdvice, context: DeliveryContext) -> AdvisorRegimeSubmission {
 		let mut state = self.state.lock();
 		if let Some(reason) = state.muted.clone() {
-			return AdvisorCampaignSubmission::Muted(reason);
+			return AdvisorRegimeSubmission::Muted(reason);
 		}
 		let delivery = advisor_delivery(advice.severity, context);
 		let pending = PendingAdvice::from(advice);
@@ -164,40 +160,39 @@ impl AdvisorCampaignHandle {
 			AdviceDelivery::Steer => state.turn_end.push_back(pending),
 			AdviceDelivery::Preserve => state.idle.push_back(pending),
 		}
-		AdvisorCampaignSubmission::Accepted(delivery)
+		AdvisorRegimeSubmission::Accepted(delivery)
 	}
 
-	/// Advances the campaign's durable quarantine ladder and returns a typed
+	/// Advances the regime's durable quarantine bound and returns a typed
 	/// mute reason when its finite bound exhausts.
 	pub async fn record_quarantine(
 		&self,
 		control: &ControlSender,
-		engagement: &str,
+		activation: &str,
 		reason: impl Into<Str>,
 	) -> Result<Option<AdvisorMuteReason>, ControlError> {
-		if let Some(reason) = self.state.lock().muted.clone() {
+		let mut next_state = self.state.lock().clone();
+		if let Some(reason) = next_state.muted.clone() {
 			return Ok(Some(reason));
 		}
-		let reason = reason.into();
-		let stepped = control
-			.step_campaign(Str::new(engagement), reason.clone())
+		next_state.quarantines = next_state.quarantines.saturating_add(1);
+		let muted = if next_state.quarantines >= self.quarantine_bound {
+			let muted = AdvisorMuteReason::QuarantineExhausted { reason: reason.into() };
+			next_state.muted = Some(muted.clone());
+			next_state.context_or_idle.clear();
+			next_state.turn_end.clear();
+			next_state.idle.clear();
+			Some(muted)
+		} else {
+			None
+		};
+		let payload = serde_json::to_vec(&next_state)
+			.expect("advisor regime state has infallible JSON serialization");
+		control
+			.update_regime_state(Str::new(activation), payload.into())
 			.await?;
-		let mut state = self.state.lock();
-		match stepped {
-			CampaignStepResult::Missing => Ok(state.muted.clone()),
-			CampaignStepResult::Advanced { .. } => {
-				state.quarantines = state.quarantines.saturating_add(1);
-				Ok(None)
-			},
-			CampaignStepResult::Terminal { .. } => {
-				let muted = AdvisorMuteReason::QuarantineExhausted { reason };
-				state.muted = Some(muted.clone());
-				state.context_or_idle.clear();
-				state.turn_end.clear();
-				state.idle.clear();
-				Ok(Some(muted))
-			},
-		}
+		*self.state.lock() = next_state;
+		Ok(muted)
 	}
 
 	/// Returns the terminal mute reason, when this advisor exhausted policy.
@@ -206,122 +201,106 @@ impl AdvisorCampaignHandle {
 	}
 }
 
-/// One campaign machine converting advisor notes into fixed-point Inject
-/// verdicts.
-pub struct AdvisorDeliveryCampaign {
-	state:       Arc<Mutex<AdvisorCampaignState>>,
+/// One regime handler staging advisor notes as ordered context effects.
+pub struct AdvisorDeliveryRegime {
+	state:       Arc<Mutex<AdvisorRegimeState>>,
 	immunity_ms: u64,
 }
 
-/// Lifecycle owner for one active advisor's engaged delivery campaign.
-pub struct ActiveAdvisorCampaign {
+/// Lifecycle owner for one active advisor delivery regime.
+pub struct ActiveAdvisorRegime {
 	control:    ControlSender,
-	engagement: Str,
-	handle:     AdvisorCampaignHandle,
+	activation: Str,
+	handle:     AdvisorRegimeHandle,
 }
 
-impl ActiveAdvisorCampaign {
-	/// Engages exactly one delivery campaign when an advisor child starts.
-	pub async fn engage(
+impl ActiveAdvisorRegime {
+	/// Starts exactly one delivery regime when an advisor child starts.
+	pub async fn start(
 		control: ControlSender,
 		advisor_id: &str,
 		immunity: Duration,
 		quarantine_bound: u32,
 	) -> Result<Self, ControlError> {
-		let (spec, machine, handle) =
-			AdvisorDeliveryCampaign::new(advisor_id, immunity, quarantine_bound);
+		let (spec, regime, handle) =
+			AdvisorDeliveryRegime::new(advisor_id, immunity, quarantine_bound);
 		let receipt = control
-			.engage_campaign(spec, Box::new(machine), EngageOptions {
+			.start_regime(spec, Box::new(regime), StartOptions {
 				now_ms: broker_now_ms(),
 				queue:  false,
 			})
 			.await?;
-		Ok(Self { control, engagement: receipt.engagement, handle })
+		Ok(Self { control, activation: receipt.activation, handle })
 	}
 
 	/// Returns the feeding handle for guarded advisor notes.
-	pub const fn handle(&self) -> &AdvisorCampaignHandle {
+	pub const fn handle(&self) -> &AdvisorRegimeHandle {
 		&self.handle
 	}
 
-	/// Advances this advisor's durable quarantine ladder.
+	/// Advances this advisor's durable quarantine bound.
 	pub async fn record_quarantine(
 		&self,
 		reason: impl Into<Str>,
 	) -> Result<Option<AdvisorMuteReason>, ControlError> {
 		self
 			.handle
-			.record_quarantine(&self.control, self.engagement.as_str(), reason)
+			.record_quarantine(&self.control, self.activation.as_str(), reason)
 			.await
 	}
 
-	/// Disengages the campaign when the advisor child stops.
-	pub async fn disengage(&self) -> Result<bool, ControlError> {
-		self
-			.control
-			.disengage_campaign(self.engagement.clone())
-			.await
+	/// Stops the regime when the advisor child stops.
+	pub async fn stop(&self) -> Result<bool, ControlError> {
+		self.control.stop_regime(self.activation.clone()).await
 	}
 
-	/// Returns the durable engagement identity.
-	pub fn engagement(&self) -> &str {
-		self.engagement.as_str()
+	/// Returns the durable activation identity.
+	pub fn activation(&self) -> &str {
+		self.activation.as_str()
 	}
 }
 
-impl AdvisorDeliveryCampaign {
-	/// Builds the session-scoped declaration, machine, and feeding handle for
+impl AdvisorDeliveryRegime {
+	/// Builds the session-scoped declaration, handler, and feeding handle for
 	/// one active advisor.
 	pub fn new(
 		advisor_id: &str,
 		immunity: Duration,
 		quarantine_bound: u32,
-	) -> (Arc<CampaignSpec>, Self, AdvisorCampaignHandle) {
+	) -> (Arc<RegimeSpec>, Self, AdvisorRegimeHandle) {
 		let immunity_ms = u64::try_from(immunity.as_millis()).unwrap_or(u64::MAX);
 		let quarantine_bound = quarantine_bound.max(2);
-		let state = Arc::new(Mutex::new(AdvisorCampaignState::default()));
-		let steps = (0..quarantine_bound.saturating_sub(1))
-			.map(|index| LadderStep {
-				label:   Str::from(format!("quarantine-{}", index.saturating_add(1))),
-				verdict: Verdict::Pass,
-			})
-			.collect::<Vec<_>>();
-		let spec = Arc::new(CampaignSpec {
-			id:         Str::from(format!("advisor-delivery/{advisor_id}")),
-			points:     PointSet::EMPTY
+		let state = Arc::new(Mutex::new(AdvisorRegimeState::default()));
+		let spec = Arc::new(RegimeSpec {
+			id: Str::from(format!("advisor-delivery/{advisor_id}")),
+			events: PointSet::EMPTY
 				.with(Point::Context)
 				.with(Point::TurnEnd)
 				.with(Point::Idle),
 			precedence: 40,
-			ladder:     Some(
-				Ladder::new(Arc::<[LadderStep]>::from(steps)).with_min_interval(immunity_ms),
-			),
-			exhaust:    ExhaustPolicy::Fault {
-				detail: Str::new_static("advisor muted after quarantine exhaustion"),
-			},
-			scope:      CampaignScope::Session,
+			max_steps: None,
+			committed_step_interval_ms: None,
+			on_limit: false,
+			lifetime: RegimeLifetime::Session,
 			family_rev: Str::new_static("dev.omp.app.advisor-delivery@1"),
-			when:       None,
-			members:    Arc::from([]),
-			claims:     Arc::from([]),
-			binds:      Arc::from([]),
-			dwell_ms:   Some(immunity_ms),
+			when: None,
+			owns: Arc::from([]),
+			sets: Arc::from([]),
+			minimum_duration_ms: Some(immunity_ms),
 		});
-		let machine = Self { state: Arc::clone(&state), immunity_ms };
-		let handle = AdvisorCampaignHandle { state };
-		(spec, machine, handle)
+		let regime = Self { state: Arc::clone(&state), immunity_ms };
+		let handle = AdvisorRegimeHandle { state, quarantine_bound };
+		(spec, regime, handle)
 	}
-}
 
-impl CampaignMachine for AdvisorDeliveryCampaign {
-	fn react(&mut self, point: Point, cx: &PointCx<'_>) -> Reaction {
+	fn drain(&self, point: Point, now_ms: u64) -> Vec<Item> {
 		let mut state = self.state.lock();
 		if state.muted.is_some()
 			|| state
 				.last_delivery_ms
-				.is_some_and(|last| cx.now_ms < last.saturating_add(self.immunity_ms))
+				.is_some_and(|last| now_ms < last.saturating_add(self.immunity_ms))
 		{
-			return Reaction::one(Verdict::Pass);
+			return Vec::new();
 		}
 		let mut pending = Vec::new();
 		match point {
@@ -331,23 +310,32 @@ impl CampaignMachine for AdvisorDeliveryCampaign {
 				pending.extend(state.context_or_idle.drain(..));
 				pending.extend(state.idle.drain(..));
 			},
-			_ => return Reaction::one(Verdict::Pass),
+			_ => return Vec::new(),
 		}
 		let items = pending.into_iter().map(advisor_item).collect::<Vec<_>>();
-		if items.is_empty() {
-			return Reaction::one(Verdict::Pass);
+		if !items.is_empty() {
+			state.last_delivery_ms = Some(now_ms);
 		}
-		state.last_delivery_ms = Some(cx.now_ms);
-		Reaction::one(Verdict::Inject(items))
+		items
+	}
+}
+
+impl Regime for AdvisorDeliveryRegime {
+	fn apply(&mut self, ctx: &mut RegimeContext<'_>, _next: Next<'_>) -> Result<(), RegimeError> {
+		let items = self.drain(ctx.point(), ctx.facts().now_ms);
+		if !items.is_empty() {
+			ctx.append_context(items);
+			ctx.replace_state(self.state());
+		}
+		Ok(())
 	}
 
 	fn state(&self) -> Str {
 		serde_json::to_string(&*self.state.lock()).map_or_else(|_| Str::new_static("{}"), Str::from)
 	}
 
-	fn restore(&mut self, payload: &str) -> Result<(), CampaignStateError> {
-		let restored =
-			serde_json::from_str(payload).map_err(|_| CampaignStateError::InvalidPayload)?;
+	fn restore(&mut self, payload: &str) -> Result<(), RegimeStateError> {
+		let restored = serde_json::from_str(payload).map_err(|_| RegimeStateError::InvalidPayload)?;
 		*self.state.lock() = restored;
 		Ok(())
 	}
@@ -563,32 +551,21 @@ mod tests {
 
 	#[test]
 	fn immunity_window_blocks_delivery_until_elapsed() {
-		let (spec, mut campaign, handle) =
-			AdvisorDeliveryCampaign::new("watchdog", Duration::from_millis(25), 2);
-		assert_eq!(spec.dwell_ms, Some(25));
-		assert_eq!(spec.ladder.as_ref().and_then(Ladder::min_interval), Some(25));
+		let (spec, regime, handle) =
+			AdvisorDeliveryRegime::new("watchdog", Duration::from_millis(25), 2);
+		assert_eq!(spec.minimum_duration_ms, Some(25));
+		assert_eq!(spec.committed_step_interval_ms, None);
 		assert_eq!(
 			handle.submit(advice("first"), DeliveryContext::default()),
-			AdvisorCampaignSubmission::Accepted(AdviceDelivery::Aside)
+			AdvisorRegimeSubmission::Accepted(AdviceDelivery::Aside)
 		);
-		assert!(matches!(
-			campaign.react(Point::Context, &PointCx { now_ms: 100, ..PointCx::default() }).verdicts.as_slice(),
-			[Verdict::Inject(items)] if items.len() == 1
-		));
+		assert_eq!(regime.drain(Point::Context, 100).len(), 1);
 		assert_eq!(
 			handle.submit(advice("second"), DeliveryContext::default()),
-			AdvisorCampaignSubmission::Accepted(AdviceDelivery::Aside)
+			AdvisorRegimeSubmission::Accepted(AdviceDelivery::Aside)
 		);
-		assert_eq!(
-			campaign
-				.react(Point::Idle, &PointCx { now_ms: 124, ..PointCx::default() })
-				.verdicts,
-			[Verdict::Pass]
-		);
-		assert!(matches!(
-			campaign.react(Point::Idle, &PointCx { now_ms: 125, ..PointCx::default() }).verdicts.as_slice(),
-			[Verdict::Inject(items)] if items.len() == 1
-		));
+		assert!(regime.drain(Point::Idle, 124).is_empty());
+		assert_eq!(regime.drain(Point::Idle, 125).len(), 1);
 	}
 	#[test]
 	fn advisor_retry_reaches_chain_owned_by_last_fallback() {

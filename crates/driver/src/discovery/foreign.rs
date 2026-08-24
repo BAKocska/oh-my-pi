@@ -230,7 +230,11 @@ fn load_commands(root: &Path, relative: &str, family: &str) -> Vec<DiscoveredCap
 		.unwrap_or_default()
 		.into_iter()
 		.map(|entry| entry.absolute_path(&directory))
-		.filter(|file| file.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("md")))
+		.filter(|file| {
+			file
+				.extension()
+				.is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
+		})
 		.collect::<Vec<_>>();
 	files.sort();
 	files
@@ -257,18 +261,12 @@ fn load_commands(root: &Path, relative: &str, family: &str) -> Vec<DiscoveredCap
 				name.push_str(&component);
 			}
 			let payload =
-				slash_commands::parse_markdown(Str::from(name.clone()), canonical.clone(), &content).ok()?;
-			let mut source = SourceProvenance::native(
-				format!("foreign-{family}"),
-				canonical,
-				SourceScope::Project,
-			);
+				slash_commands::parse_markdown(Str::from(name.clone()), canonical.clone(), &content)
+					.ok()?;
+			let mut source =
+				SourceProvenance::native(format!("foreign-{family}"), canonical, SourceScope::Project);
 			source.read_only = true;
-			Some(DiscoveredCapability::keyed(
-				name,
-				CapabilityPayload::SlashCommands(payload),
-				source,
-			))
+			Some(DiscoveredCapability::keyed(name, CapabilityPayload::SlashCommands(payload), source))
 		})
 		.collect()
 }

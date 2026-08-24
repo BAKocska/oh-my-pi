@@ -566,17 +566,17 @@ impl ExtensionPayload {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CommandPayload {
 	/// Name without the leading slash.
-	pub name:        Str,
+	pub name:          Str,
 	/// Canonical source path.
-	pub path:        PathBuf,
+	pub path:          PathBuf,
 	/// Frontmatter description or first non-empty body line.
 	#[serde(default)]
-	pub description: Str,
+	pub description:   Str,
 	/// Parsed `argumentHint` / `argument-hint` frontmatter.
 	#[serde(default)]
 	pub argument_hint: Option<Str>,
 	/// Markdown template body with frontmatter removed.
-	pub content:     Str,
+	pub content:       Str,
 }
 
 /// Static custom-tool execution declaration.

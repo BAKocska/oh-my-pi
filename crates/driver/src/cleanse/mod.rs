@@ -136,19 +136,12 @@ pub async fn run<H: CleanseHost>(
 			omitted_files: 0,
 		});
 	}
-	let dispatched = match continuous::dispatch(
-		host,
-		&suite,
-		args.model.as_str(),
-		args.agents,
-		cancel,
-	)
-	.await
-	{
-		Ok(result) => result,
-		Err(_) if cancel.is_cancelled() => return Ok(cancelled()),
-		Err(error) => return Err(Error::Host(error)),
-	};
+	let dispatched =
+		match continuous::dispatch(host, &suite, args.model.as_str(), args.agents, cancel).await {
+			Ok(result) => result,
+			Err(_) if cancel.is_cancelled() => return Ok(cancelled()),
+			Err(error) => return Err(Error::Host(error)),
+		};
 	if dispatched.cancelled || cancel.is_cancelled() {
 		return Ok(cancelled_with(dispatched.report));
 	}
@@ -218,11 +211,7 @@ fn cancelled_with(report: Report) -> CleanseExit {
 }
 
 /// Assignment brief installed in one continuously scheduled repair child.
-pub fn assignment_prompt(
-	assignment: &Assignment,
-	worker: usize,
-	peers: &[Assignment],
-) -> Str {
+pub fn assignment_prompt(assignment: &Assignment, worker: usize, peers: &[Assignment]) -> Str {
 	let mut text = format!(
 		"Repair worker {worker}. Further diagnostics for your files may arrive as follow-up user \
 		 messages while you work; fix those too before finishing. Fix only the assigned whole-file \

@@ -205,7 +205,7 @@ impl CompressHost for ProductionCompressHost {
 					project:               self.root.clone(),
 					additional_roots:      Box::new([]),
 					model:                 model?,
-					initial_campaign:      None,
+					initial_regime:        None,
 					initial_prompt_slot:   None,
 					plan_handoff:          None,
 					resume:                None,

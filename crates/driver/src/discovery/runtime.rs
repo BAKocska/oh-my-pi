@@ -30,7 +30,7 @@ use tokio_util::sync::CancellationToken;
 use tonic::{Code, Status, transport::Channel};
 
 use crate::{
-	chat::{CampaignControlResolver, ChatProviderControlBackend},
+	chat::{ChatProviderControlBackend, RegimeControlResolver},
 	model_controls::{
 		ProductionProviderApplicationOwner, ProviderCatalogCursor, ProviderControlAuthorityFactory,
 		ProviderControlBackend, ProviderControlError, ProviderControlRequest, ProviderControlResult,
@@ -39,36 +39,35 @@ use crate::{
 	},
 };
 
-type CampaignMachineConstructor = dyn Fn(Option<&str>) -> Result<Box<dyn omp_agent::CampaignMachine>, ControlProtocolError>
-	+ Send
-	+ Sync;
+type RegimeConstructor =
+	dyn Fn(Option<&str>) -> Result<Box<dyn omp_agent::Regime>, ControlProtocolError> + Send + Sync;
 
 /// One callback constructor bound to a declaration accepted at FREEZE.
 #[derive(Clone)]
-pub struct SealedCampaignDeclaration {
+pub struct SealedRegimeDeclaration {
 	/// Authenticated extension which owns this declaration.
 	pub extension:          Str,
 	/// Child generation whose frozen table supplied the declaration.
 	pub host_generation:    u64,
-	/// Session generation whose agent owner may engage it.
+	/// Session generation whose agent owner may start it.
 	pub session_generation: u64,
-	/// Immutable Core campaign policy lowered from the sealed manifest.
-	pub spec:               Arc<omp_agent::CampaignSpec>,
-	constructor:            Arc<CampaignMachineConstructor>,
+	/// Immutable Core regime policy lowered from the sealed manifest.
+	pub spec:               Arc<omp_agent::RegimeSpec>,
+	constructor:            Arc<RegimeConstructor>,
 }
 
-impl SealedCampaignDeclaration {
-	/// Binds a verified declaration to its generation-fenced machine
+impl SealedRegimeDeclaration {
+	/// Binds a verified declaration to its generation-fenced regime
 	/// constructor.
 	pub fn new<F>(
 		extension: impl Into<Str>,
 		host_generation: u64,
 		session_generation: u64,
-		spec: Arc<omp_agent::CampaignSpec>,
+		spec: Arc<omp_agent::RegimeSpec>,
 		constructor: F,
 	) -> Self
 	where
-		F: Fn(Option<&str>) -> Result<Box<dyn omp_agent::CampaignMachine>, ControlProtocolError>
+		F: Fn(Option<&str>) -> Result<Box<dyn omp_agent::Regime>, ControlProtocolError>
 			+ Send
 			+ Sync
 			+ 'static,
@@ -83,19 +82,19 @@ impl SealedCampaignDeclaration {
 	}
 }
 
-/// Resolver over the exact campaign declaration generation retained at FREEZE.
+/// Resolver over the exact regime declaration generation retained at FREEZE.
 ///
-/// Machine constructors are admitted together with their immutable specs; a
+/// Regime constructors are admitted together with their immutable specs; a
 /// child request can select only by declaration id and can never supply an
-/// executable campaign machine.
-pub struct SealedCampaignControlResolver {
-	declarations: BTreeMap<Str, SealedCampaignDeclaration>,
+/// executable regime handler.
+pub struct SealedRegimeControlResolver {
+	declarations: BTreeMap<Str, SealedRegimeDeclaration>,
 }
 
-impl SealedCampaignControlResolver {
+impl SealedRegimeControlResolver {
 	/// Seals one deterministic declaration table.
 	pub fn new(
-		declarations: impl IntoIterator<Item = SealedCampaignDeclaration>,
+		declarations: impl IntoIterator<Item = SealedRegimeDeclaration>,
 	) -> Result<Self, ControlProtocolError> {
 		let mut table = BTreeMap::new();
 		for declaration in declarations {
@@ -107,8 +106,8 @@ impl SealedCampaignControlResolver {
 					.is_some()
 			{
 				return Err(ControlProtocolError::new(
-					"InvalidCampaignDeclaration",
-					"sealed campaign declarations contain an invalid or duplicate identity",
+					"InvalidRegimeDeclaration",
+					"sealed regime declarations contain an invalid or duplicate identity",
 				));
 			}
 		}
@@ -116,26 +115,23 @@ impl SealedCampaignControlResolver {
 	}
 }
 
-impl CampaignControlResolver for SealedCampaignControlResolver {
+impl RegimeControlResolver for SealedRegimeControlResolver {
 	fn resolve(
 		&self,
 		identity: &ControlConnectionIdentity,
-		campaign: &str,
+		regime: &str,
 		state: Option<&str>,
-	) -> Result<
-		(Arc<omp_agent::CampaignSpec>, Box<dyn omp_agent::CampaignMachine>),
-		ControlProtocolError,
-	> {
-		let declaration = self.declarations.get(campaign).ok_or_else(|| {
+	) -> Result<(Arc<omp_agent::RegimeSpec>, Box<dyn omp_agent::Regime>), ControlProtocolError> {
+		let declaration = self.declarations.get(regime).ok_or_else(|| {
 			ControlProtocolError::new(
 				"TargetNotFound",
-				"campaign is absent from the sealed declaration table",
+				"regime is absent from the sealed declaration table",
 			)
 		})?;
 		if declaration.extension != identity.extension {
 			return Err(ControlProtocolError::new(
 				"AuthorizationError",
-				"campaign declaration belongs to another extension",
+				"regime declaration belongs to another extension",
 			));
 		}
 		if declaration.host_generation != identity.host_generation
@@ -143,17 +139,17 @@ impl CampaignControlResolver for SealedCampaignControlResolver {
 		{
 			return Err(ControlProtocolError::new(
 				"StaleGeneration",
-				"campaign declaration belongs to a replaced host or session generation",
+				"regime declaration belongs to a replaced host or session generation",
 			));
 		}
-		let machine = (declaration.constructor)(state)?;
-		Ok((Arc::clone(&declaration.spec), machine))
+		let regime = (declaration.constructor)(state)?;
+		Ok((Arc::clone(&declaration.spec), regime))
 	}
 
-	fn owner(&self, campaign: &str) -> Option<Str> {
+	fn owner(&self, regime: &str) -> Option<Str> {
 		self
 			.declarations
-			.get(campaign)
+			.get(regime)
 			.map(|declaration| declaration.extension.clone())
 	}
 }
@@ -1264,6 +1260,7 @@ mod tests {
 		})
 	}
 
+	#[test]
 	fn explicit_disable_is_authoritative_but_failure_is_not() {
 		let directory = tempfile::tempdir().expect("directory");
 		let disabled = ProviderId::from("disabled");
