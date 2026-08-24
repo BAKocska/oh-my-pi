@@ -171,6 +171,11 @@ async function connectScriptedExtension(port: number, tabs: TabSnapshot[]): Prom
 		if (msg.t !== "rpc") return;
 		const { id, t: _t, ...rpc } = msg;
 		rpcs.push(rpc);
+		// Mirror Chrome: chrome.debugger.detach() would fire onDetach, which the
+		// real extension forwards as `detached` before the RPC settles.
+		if (rpc.op === "detach") {
+			ws.send(JSON.stringify({ t: "detached", tabId: rpc.tabId, reason: "target_closed" } satisfies ExtToRelayMessage));
+		}
 		ws.send(JSON.stringify({ t: "rpcResult", id, ok: true, result: {} } satisfies ExtToRelayMessage));
 	});
 	await opened.promise;
@@ -282,5 +287,21 @@ describe("browser relay session detach", () => {
 		// Marker attach on tab 2 through the surviving holder flushes the ext socket.
 		await b.send("Target.attachToTarget", { targetId: "PAGE2", flatten: true });
 		expect(rpcs.filter(rpc => rpc.op === "detach" && rpc.tabId === 1)).toHaveLength(0);
+	});
+
+	it("re-attaches a tab after the extension echoes the relay-initiated detach", async () => {
+		const { port } = await startReadyRelay();
+		const client = await openClient(port);
+		const attached = await client.send("Target.attachToTarget", { targetId: "PAGE1", flatten: true });
+
+		await client.send("Target.detachFromTarget", { sessionId: attached.result?.sessionId });
+		// Marker attach on tab 2 is FIFO-ordered after the tab-1 detach and its
+		// `detached` echo, so once it resolves the echo has been processed.
+		await client.send("Target.attachToTarget", { targetId: "PAGE2", flatten: true });
+
+		// The echo must not have banned the tab: re-attach still succeeds.
+		const reattached = await client.send("Target.attachToTarget", { targetId: "PAGE1", flatten: true });
+		expect(reattached.error).toBeUndefined();
+		expect(typeof reattached.result?.sessionId).toBe("string");
 	});
 });

@@ -656,6 +656,18 @@ export class RelayBridge {
 	#onTabDetached(tabId: number, reason: string): void {
 		const tab = this.#tabs.get(tabId);
 		if (!tab) return;
+		// A detach we initiated (#releaseSession/cdpClosed dropping the debugger
+		// once no holder remains) clears tab.attached *before* sending the RPC.
+		// If the extension echoes chrome.debugger.onDetach back as `detached`,
+		// it arrives here for a tab we no longer consider attached: that is a
+		// clean release, not the user dismissing the infobar or DevTools
+		// stealing the session. Banning + retracting it would destroy a still-
+		// live target for the connected discovery client and block re-attach
+		// for the rest of the epoch, so treat it as a no-op.
+		if (!tab.attached) {
+			tab.attaching = null;
+			return;
+		}
 		this.#log("tab detached", { tabId, reason });
 		tab.attached = false;
 		tab.attaching = null;
