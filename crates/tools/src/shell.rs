@@ -397,6 +397,8 @@ pub struct ShellPromptSnapshot {
 	pub minimizer_enabled:   bool,
 	/// Whether embedded shell builtins are enabled.
 	pub embedded_builtins:   bool,
+	/// Whether the `xd` dynamic-device builtin is installed.
+	pub devices:             bool,
 	/// Whether shell-intent interception is enabled.
 	pub interceptor_enabled: bool,
 	/// Ordered configured interception rules.
@@ -460,6 +462,10 @@ impl ShellPromptSnapshot {
 				"disabled"
 			},
 		);
+		if self.devices {
+			description
+				.push_str(" Dynamic devices: `xd` builtin (list `xd`; docs `xd <device> --help`).");
+		}
 		Str::from(description)
 	}
 }
@@ -1178,5 +1184,38 @@ mod cow_bytes {
 		deserializer: D,
 	) -> Result<CowBytes<'static>, D::Error> {
 		Vec::<u8>::deserialize(deserializer).map(CowBytes::from)
+	}
+}
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn prompt_snapshot(devices: bool) -> ShellPromptSnapshot {
+		ShellPromptSnapshot {
+			sibling_tools: Arc::default(),
+			platform: Str::new("linux"),
+			profile: Str::new("brush"),
+			command_prefix: false,
+			minimizer_enabled: false,
+			embedded_builtins: true,
+			devices,
+			interceptor_enabled: false,
+			interceptor_rules: Arc::default(),
+			acp_routing: false,
+		}
+	}
+
+	#[test]
+	fn shell_description_mentions_xd_only_when_devices_are_installed() {
+		let enabled = prompt_snapshot(true).description();
+		assert!(
+			enabled
+				.ends_with(" Dynamic devices: `xd` builtin (list `xd`; docs `xd <device> --help`).")
+		);
+		assert!(!enabled.contains("`dyn`"));
+
+		let disabled = prompt_snapshot(false).description();
+		assert!(!disabled.contains("`xd`"));
+		assert!(!disabled.contains("`dyn`"));
 	}
 }

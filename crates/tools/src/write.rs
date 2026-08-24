@@ -759,6 +759,13 @@ impl<D: WriteDocuments> Tool for WriteTool<D> {
 								}));
 								return;
 							}
+							if conflict_request.is_none()
+								&& retired_device_syntax(&path)
+								&& let Some(fault) = reject_uri_like_target(&path)
+							{
+								yield done(Err(fault));
+								return;
+							}
 		let resource_request = match route_resource_mutation(&path, stripped.text.clone()) {
 								Ok(request) => request,
 								Err(error) => {
@@ -1177,6 +1184,21 @@ fn read_selector_list_misfire(target: &str) -> Option<usize> {
 	(count >= 2).then_some(count)
 }
 
+fn retired_device_syntax(target: &str) -> bool {
+	let trimmed = target.trim();
+	if trimmed
+		.get(..3)
+		.is_some_and(|prefix| prefix.eq_ignore_ascii_case("xd/"))
+	{
+		return true;
+	}
+	let Some((scheme, suffix)) = trimmed.split_once(':') else {
+		return false;
+	};
+	matches!(scheme.to_ascii_lowercase().as_str(), "xd" | "dx" | "xdd" | "xdt" | "device")
+		&& suffix.starts_with('/')
+}
+
 fn reject_uri_like_target(target: &str) -> Option<Fault> {
 	let trimmed = target.trim();
 	if windows_absolute(trimmed) {
@@ -1236,11 +1258,11 @@ fn reject_uri_like_target(target: &str) -> Option<Fault> {
 fn device_guidance(tool_path: Option<&str>) -> String {
 	match tool_path.filter(|path| !path.is_empty()) {
 		Some(path) => format!(
-			" Tool devices use dyn: discovery via {{\"do_\":\"search\"}}/docs/<path> (docs/{path}) \
-			 and dispatch via {{\"do_\":\"invoke/{path}\",...}}."
+			" `xd` runs in the shell tool: `xd` lists devices, `xd {path} --help` shows usage, `xd \
+			 {path} [args…]` invokes."
 		),
-		None => " Tool devices use dyn: discovery via {{\"do_\":\"search\"}}/docs/<path> and \
-		         dispatch via {{\"do_\":\"invoke/<path>\",...}}."
+		None => " `xd` runs in the shell tool: `xd` lists devices, `xd <device> --help` shows \
+		         usage, `xd <device> [args…]` invokes."
 			.to_owned(),
 	}
 }
@@ -1539,33 +1561,37 @@ mod tests {
 		assert!(reject_uri_like_target("C:\\tmp\\x").is_none());
 
 		let guidance_cases = [
-			("xd/report_issue", "docs/report_issue", "invoke/report_issue"),
-			("xd://report_issue", "docs/report_issue", "invoke/report_issue"),
-			("xd:/report_issue", "docs/report_issue", "invoke/report_issue"),
-			("dx:/report_issue", "docs/report_issue", "invoke/report_issue"),
-			("device:/custom", "docs/custom", "invoke/custom"),
+			("xd/report_issue", "report_issue"),
+			("xd://report_issue", "report_issue"),
+			("xd:/report_issue", "report_issue"),
+			("dx:/report_issue", "report_issue"),
+			("device:/custom", "custom"),
 		];
-		for (target, expected_docs, expected_invoke) in guidance_cases {
+		for (target, device) in guidance_cases {
 			let fault = reject_uri_like_target(target).expect("fault rejected");
 			let message = fault.to_string();
-			assert!(message.contains(r#"{"do_":"search"}"#), "missing search: {message}");
-			assert!(message.contains("docs/<path>"), "missing docs/<path>: {message}");
-			assert!(message.contains(expected_docs), "missing expected docs: {message}");
+			assert!(message.contains("`xd` runs in the shell tool"), "missing shell hint: {message}");
+			assert!(message.contains("`xd` lists devices"), "missing catalog hint: {message}");
 			assert!(
-				message.contains(&format!(r#"{{"do_":"{expected_invoke}",...}}"#)),
-				"missing expected invoke: {message}"
+				message.contains(&format!("`xd {device} --help` shows usage")),
+				"missing device help hint: {message}"
 			);
-			// Ensure no retired device URL scheme or xd spelling appears
-			assert!(!message.contains("xd:"), "found retired scheme: {message}");
-			assert!(!message.contains("xd/"), "found retired scheme: {message}");
+			assert!(
+				message.contains(&format!("`xd {device} [args…]` invokes")),
+				"missing device invocation hint: {message}"
+			);
+			assert!(!message.contains("dyn"), "found retired tool: {message}");
+			assert!(!message.contains("do_"), "found retired envelope: {message}");
+			assert!(!message.contains("xd://"), "found invocation URL: {message}");
 		}
 		let generic_fault = reject_uri_like_target("xd/")
 			.expect("fault rejected")
 			.to_string();
-		assert!(generic_fault.contains(r#"{"do_":"search"}"#));
-		assert!(generic_fault.contains("docs/<path>"));
-		assert!(generic_fault.contains(r#"{"do_":"invoke/<path>",...}"#));
-		assert!(!generic_fault.contains("xd:"));
-		assert!(!generic_fault.contains("xd/"));
+		assert!(generic_fault.contains("`xd` lists devices"));
+		assert!(generic_fault.contains("`xd <device> --help` shows usage"));
+		assert!(generic_fault.contains("`xd <device> [args…]` invokes"));
+		assert!(!generic_fault.contains("dyn"));
+		assert!(!generic_fault.contains("do_"));
+		assert!(!generic_fault.contains("xd://"));
 	}
 }

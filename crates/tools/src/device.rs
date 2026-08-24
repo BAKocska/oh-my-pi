@@ -1,32 +1,23 @@
-//! The fixed `dyn` device-transport grammar and catalog rendering.
-//!
-//! This module intentionally owns the envelope vocabulary. A device never
-//! interprets `do_`: after finalization [`renest_args`] produces the exact
-//! device argument object passed to its resolved route.
+//! Device catalog rendering and the `xd` CLI transport support.
 
 use std::{
 	collections::BTreeMap,
+	future::Future,
+	pin::Pin,
 	str,
-	sync::{
-		Arc, OnceLock, Weak,
-		atomic::{AtomicU64, Ordering},
-	},
+	sync::{Arc, OnceLock, Weak},
 };
 
-use async_stream::stream;
 use bytes::Bytes;
-use futures::{Stream, StreamExt as _};
-use omp_core::{Hash32, Str, sf};
-use omp_slopjson::{Object, Value};
+use omp_core::{Duration, Str};
 use omp_tool::{
-	Abort, ArgIssue, ArgIssueKind, ArgPath, Constraint, DeviceIssue, DevicePath, DeviceTarget,
-	ErasedEv, ErasedOutcome, IncomingParams, MountedDevice, ParamError, Part, PromptCaps, Registry,
-	Rev, Tool, ToolIdentity, ToolRoute, ToolSpec, ToolTerminal, ToolsPolicy, Verdict,
+	DevicePath, ErasedStream, MountedDevice, Registry, ToolRoute, ToolsPolicy, WorkerSiteKind,
 };
-use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use serde_json::Value as SchemaValue;
 use smallvec::SmallVec;
+
+use crate::device_ctl::levenshtein;
+
 /// Aggregate character budget for documentation inlined into a prompt.
 pub const DOCS_TOTAL_BUDGET: usize = 48_000;
 /// Per-device character cap for documentation inlined into a prompt.
@@ -35,20 +26,21 @@ pub const PER_DEVICE_DOCS_CAP: usize = 10_000;
 pub const EXTERNAL_SUMMARY_CAP: usize = 200;
 
 /// Stable model-facing guidance for the live dynamic-device transport.
-pub const PROMPT_GUIDANCE: &str = "\
-`dyn` exposes only the live device catalog. Use `search` to discover, `docs/<path>` for the exact \
-                                   schema and guidance, and `invoke/<path>` with that schema to \
-                                   call a device. Retry an empty or narrow search with different \
-                                   terms; absent devices are unavailable and MUST NOT be \
-                                   advertised or guessed.";
+pub const PROMPT_GUIDANCE: &str =
+	"\
+Dynamic devices are invoked through the `xd` builtin inside the shell tool. Run `xd` to list the \
+	 live device catalog (`xd --q <text>` searches it), `xd <device> --help` for exact usage and \
+	 schema, and `xd <device> [args…]` to invoke one (`xd <device> --json '<payload>'` passes raw \
+	 JSON arguments). Retry an empty or narrow search with different terms; absent devices are \
+	 unavailable and MUST NOT be advertised or guessed.";
 
 /// Conditional model-facing guidance for the mounted AutoQA recorder.
-pub const AUTO_QA_PROMPT_GUIDANCE: &str = "\
-Automated QA reporting is available through the live `report_issue` device. When a device result \
-                                           contradicts its documented behavior for the supplied \
-                                           parameters, read `docs/report_issue`, then invoke \
-                                           `report_issue` with a concise evidence-backed verdict. \
-                                           False positives are acceptable.";
+pub const AUTO_QA_PROMPT_GUIDANCE: &str =
+	"\
+Automated QA reporting is available through the live `report_issue` device. When a tool or device \
+	 result contradicts its documented behavior for the supplied parameters, run `xd report_issue \
+	 \"<session-id>\" \"<device>\" --rev \"<revision>\" --verdict '<JSON verdict>'` in the shell. \
+	 False positives are acceptable.";
 
 /// How much dynamic-device documentation is inlined into a prompt.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -81,17 +73,6 @@ pub struct CatalogQuery {
 	pub depth:      Option<usize>,
 }
 
-/// The three operations accepted by the stable `dyn` schema.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum Operation {
-	/// Render the device catalog, optionally below a subtree.
-	Search(Option<Str>),
-	/// Render the documentation for one resolved device path.
-	Docs(Str),
-	/// Resolve and invoke one device path.
-	Invoke(Str),
-}
-
 /// A deterministic `tool_only` flattening collision.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FlattenCollision {
@@ -117,25 +98,16 @@ pub fn flatten_slots(
 	Ok(slots)
 }
 
-/// Whether the stable `dyn` slot is present under `policy`.
-pub const fn dyn_enabled(policy: ToolsPolicy) -> bool {
+/// Whether the `xd` builtin is present under `policy`.
+pub const fn xd_enabled(policy: ToolsPolicy) -> bool {
 	!matches!(policy, ToolsPolicy::ToolOnly)
 }
 
-/// Returns a parameter forbidden by the stable flat `dyn` envelope, if any.
-pub fn reserved_parameter(schema: &SchemaValue) -> Option<Str> {
-	let properties = schema.get("properties")?.as_object()?;
-	properties
-		.keys()
-		.find(|name| name.as_str() == "do_" || name.ends_with('_'))
-		.map(|name| Str::new(name.as_str()))
-}
-
-/// Late-bound immutable registry access for the self-referential `dyn` slot.
+/// Late-bound immutable registry access for the envd-owned `xd` host.
 ///
-/// The registry must first register `dyn`, then be frozen in an [`Arc`] and
-/// installed exactly once. The catalog retains only a weak reference, so
-/// registry assembly does not create an ownership cycle.
+/// The registry is frozen in an [`Arc`] and installed exactly once. The catalog
+/// retains only a weak reference, so registry assembly creates no ownership
+/// cycle.
 #[derive(Clone, Default)]
 pub struct DeviceCatalog(Arc<OnceLock<Weak<Registry>>>);
 
@@ -145,7 +117,8 @@ impl DeviceCatalog {
 		self.0.set(Arc::downgrade(&registry))
 	}
 
-	fn registry(&self) -> Option<Arc<Registry>> {
+	/// Upgrades the installed registry while its owning environment is live.
+	pub fn registry(&self) -> Option<Arc<Registry>> {
 		self.0.get()?.upgrade()
 	}
 }
@@ -161,135 +134,47 @@ pub struct DeviceInvokeRequest {
 	/// Owning extension when worker-routed.
 	pub owner:         Option<Str>,
 	/// Placed worker site when worker-routed.
-	pub site:          Option<omp_tool::WorkerSiteKind>,
+	pub site:          Option<WorkerSiteKind>,
 	/// Placed worker name when worker-routed.
 	pub worker:        Option<Str>,
 	/// Environment invocation identity.
 	pub invocation_id: Str,
 	/// Execution deadline.
-	pub deadline:      omp_core::Duration,
-	/// Final re-nested device arguments.
+	pub deadline:      Duration,
+	/// Final nested device arguments.
 	pub args_json:     Bytes,
 }
 
 /// Environment-owned dispatch bridge for a resolved device route.
 ///
 /// Both native and worker routes yield the registry's existing erased stream;
-/// the router only supplies final re-nested arguments and never observes
+/// the router only supplies final nested arguments and never observes
 /// speculative fragments.
 pub trait DeviceInvoker: Send + Sync {
-	/// Dispatches one resolved device with its final, re-nested JSON bytes.
+	/// Dispatches one resolved device with its final, nested JSON bytes.
 	fn invoke(
 		&self,
 		request: DeviceInvokeRequest,
-	) -> impl Future<Output = omp_tool::ErasedStream<'static>> + Send;
+	) -> impl Future<Output = ErasedStream<'static>> + Send;
+}
+/// Object-safe device-invoker handle for host components that cannot be
+/// generic.
+pub trait ErasedDeviceInvoker: Send + Sync {
+	/// Dispatches one resolved worker-routed device.
+	fn invoke(
+		&self,
+		request: DeviceInvokeRequest,
+	) -> Pin<Box<dyn Future<Output = ErasedStream<'static>> + Send + 'static>>;
 }
 
-/// A malformed `do_` envelope before a target can be resolved.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum OperationError {
-	/// The envelope did not contain an operation.
-	Empty,
-	/// A path-taking operation was missing its path.
-	MissingPath {
-		/// Operation spelling.
-		op: Str,
-	},
-	/// The envelope named an operation outside the stable vocabulary.
-	Unknown {
-		/// Received operation spelling.
-		op: Str,
-	},
-}
-
-impl OperationError {
-	/// The fixed valid-op listing used by the structured fault projection.
-	pub const fn valid_ops() -> &'static [&'static str] {
-		&["search", "docs", "invoke"]
+impl<I: DeviceInvoker + Clone + 'static> ErasedDeviceInvoker for I {
+	fn invoke(
+		&self,
+		request: DeviceInvokeRequest,
+	) -> Pin<Box<dyn Future<Output = ErasedStream<'static>> + Send + 'static>> {
+		let invoker = self.clone();
+		Box::pin(async move { DeviceInvoker::invoke(&invoker, request).await })
 	}
-}
-
-/// Parses the path-bearing `do_` grammar without normalizing
-/// publisher-qualified paths.
-///
-/// An empty path and a trailing slash are distinct malformed envelopes; they
-/// never fall through to registry lookup and therefore cannot be mistaken for
-/// an unknown device.
-pub fn parse_operation(value: &str) -> Result<Operation, OperationError> {
-	let Some((op, path)) = value.split_once('/') else {
-		return match value {
-			"" => Err(OperationError::Empty),
-			"search" => Ok(Operation::Search(None)),
-			"docs" | "invoke" => Err(OperationError::MissingPath { op: Str::new(value) }),
-			_ => Err(OperationError::Unknown { op: Str::new(value) }),
-		};
-	};
-	match op {
-		"search" => {
-			if path.is_empty() {
-				Err(OperationError::MissingPath { op: Str::new(op) })
-			} else {
-				Ok(Operation::Search(Some(Str::new(path))))
-			}
-		},
-		"docs" | "invoke" if path.is_empty() || path.ends_with('/') => {
-			Err(OperationError::MissingPath { op: Str::new(op) })
-		},
-		"docs" => Ok(Operation::Docs(Str::new(path))),
-		"invoke" => Ok(Operation::Invoke(Str::new(path))),
-		_ => Err(OperationError::Unknown { op: Str::new(op) }),
-	}
-}
-
-/// Converts a malformed `do_` envelope to the schema-echoing structured issue.
-pub fn operation_issue(error: OperationError) -> DeviceIssue {
-	let expected = match &error {
-		OperationError::Empty => "one of search, docs/<path>, invoke/<path>",
-		OperationError::MissingPath { .. } => "a non-empty device path",
-		OperationError::Unknown { .. } => "one of search, docs, invoke",
-	};
-	ArgIssue {
-		path:     vec![ArgPath::Key(sf!("do_"))],
-		expected: Str::new(expected),
-		kind:     ArgIssueKind::Malformed,
-		example:  Some(sf!(r#"{{"do_":"search"}}"#)),
-		found:    None,
-	}
-}
-
-/// Resolves a path-taking operation through the registry's sole device lookup.
-///
-/// Callers map the returned [`DeviceIssue`] into `Verdict::Device`, retaining
-/// the path and resolved revision for schema-echo projection.
-pub fn resolve_operation<'a>(
-	registry: &'a Registry,
-	operation: &Operation,
-) -> Result<(DevicePath, DeviceTarget<'a>), DeviceIssue> {
-	let raw = match operation {
-		Operation::Docs(path) | Operation::Invoke(path) => path,
-		Operation::Search(_) => {
-			return Err(operation_issue(OperationError::MissingPath { op: sf!("search") }));
-		},
-	};
-	let path = DevicePath::parse(raw.as_str())
-		.map_err(|_| operation_issue(OperationError::MissingPath { op: sf!("path") }))?;
-	let target = registry.resolve_device(&path)?;
-	Ok((path, target))
-}
-
-/// Re-nests finalized flat `dyn` arguments into one device argument document.
-///
-/// `do_` is always transport metadata. The habitual core-tool intent field
-/// `i` is retained only when the resolved device schema explicitly declares it.
-pub fn renest_args(flat: &Object, declares_intent: bool) -> Result<Bytes, serde_json::Error> {
-	let mut args = Object::with_capacity(flat.len());
-	for (key, value) in flat {
-		if key == "do_" || (key == "i" && !declares_intent) {
-			continue;
-		}
-		args.insert(key.clone(), value.clone());
-	}
-	Ok(Bytes::from(args.to_string()))
 }
 
 /// Renders the deterministic live catalog used for discovery.
@@ -424,7 +309,8 @@ fn append_catalog_row(rendered: &mut String, device: &MountedDevice<'_>) {
 	rendered.push('\n');
 }
 
-fn render_device_docs(device: &MountedDevice<'_>, path: &str) -> String {
+/// Renders one mounted device's documentation and exact parameter schema.
+pub fn render_device_docs(device: &MountedDevice<'_>, path: &str) -> String {
 	let mut output = String::new();
 	output.push_str(path);
 	output.push_str(" @ ");
@@ -644,509 +530,16 @@ const fn glob_matches(pattern: &str, value: &str) -> bool {
 	pattern_at == pattern.len()
 }
 
-#[derive(Clone)]
-struct CatalogCache {
-	hash:     Hash32,
-	rendered: Str,
-}
-
-/// One opaque update forwarded from an invoked device.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct DynUpdate {
-	/// Exact serialized target update frame.
-	pub json: Bytes,
-}
-
-/// Durable `dyn` result retaining either catalog text or a target verdict.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub enum DynPayload {
-	/// Rendered catalog or documentation text.
-	Text {
-		/// Rendered text.
-		text: Str,
-	},
-	/// A terminal result forwarded from a resolved device.
-	Invocation {
-		/// Resolved target identity used for deterministic projection.
-		identity: ToolIdentity,
-		/// Exact serialized target verdict.
-		verdict:  Bytes,
-	},
-}
-
-struct DynTool<I> {
-	invoker:            I,
-	catalog:            DeviceCatalog,
-	catalog_cache:      Mutex<Option<CatalogCache>>,
-	next_invocation_id: AtomicU64,
-	spec:               ToolSpec,
-}
-
-/// Constructs the stable `dyn` dynamic-device transport.
-///
-/// `catalog` is installed after registry assembly with
-/// [`DeviceCatalog::install_registry`].
-pub fn dyn_tool<I: DeviceInvoker + 'static>(
-	invoker: I,
-	catalog: DeviceCatalog,
-	_policy: ToolsPolicy,
-) -> impl Tool<Params = Value, Update = DynUpdate, Payload = DynPayload, Fault = Verdict> {
-	DynTool {
-		invoker,
-		catalog,
-		catalog_cache: Mutex::new(None),
-		next_invocation_id: AtomicU64::new(0),
-		spec: ToolSpec {
-			name:            sf!("dyn"),
-			rev:             Rev { family: Str::default(), n: 1 },
-			description:     sf!(
-				"Discover documented devices and invoke one through the stable dynamic transport.",
-			),
-			schema:          Bytes::from_static(
-				br#"{"type":"object","properties":{"do_":{"type":"string","description":"search, docs/<path>, or invoke/<path>"}},"required":["do_"],"additionalProperties":true}"#,
-			),
-			constraint:      Constraint::Schema {
-				priority:       100,
-				on_unsupported: omp_tool::Fallback::Unspecified,
-			},
-			effects:         Default::default(),
-			projection_code: omp_tool::native_projection_code(
-				env!("CARGO_PKG_NAME"),
-				env!("CARGO_PKG_VERSION"),
-				include_bytes!("device.rs"),
-			)
-			.into(),
-		},
-	}
-}
-
-impl<I: DeviceInvoker + 'static> DynTool<I> {
-	fn catalog(&self, registry: &Registry, subtree: Option<&Str>, flat: &Object) -> Str {
-		let query = catalog_query(flat);
-		let bare = subtree.is_none() && query == CatalogQuery::default();
-		if !bare {
-			return render_catalog_query(
-				registry.devices(),
-				&query,
-				subtree.map(|value| value.as_str()),
-			);
-		}
-		let hash = registry.device_hash();
-		let mut cache = self.catalog_cache.lock();
-		if let Some(cached) = cache.as_ref()
-			&& cached.hash == hash
-		{
-			return cached.rendered.clone();
-		}
-		let rendered = render_catalog(registry.devices());
-		*cache = Some(CatalogCache { hash, rendered: rendered.clone() });
-		rendered
-	}
-
-	const fn fault(&self, path: DevicePath, rev: Rev, issue: DeviceIssue) -> Verdict {
-		Verdict::Device { path, rev, issue }
-	}
-
-	fn dyn_path() -> DevicePath {
-		DevicePath::parse("dyn").expect("the fixed dyn path is valid")
-	}
-
-	fn unknown_path_fault(&self, raw: &str, registry: &Registry) -> Verdict {
-		let path = DevicePath::parse(raw).unwrap_or_else(|_| Self::dyn_path());
-		let issue = ArgIssue {
-			path:     vec![ArgPath::Key(sf!("do_"))],
-			expected: render_near_miss(raw, registry.devices()),
-			kind:     ArgIssueKind::Malformed,
-			example:  Some(sf!(r#"{{"do_":"search"}}"#)),
-			found:    None,
-		};
-		self.fault(path, self.spec.rev.clone(), issue)
-	}
-
-	fn docs(&self, registry: &Registry, path: &DevicePath, flat: &Object) -> Str {
-		let rendered = registry
-			.devices()
-			.find(|device| device.name.as_str() == path.root().as_str())
-			.map_or_else(
-				|| sf!("The resolved device is no longer mounted."),
-				|device| Str::new(render_device_docs(&device, path.to_string().as_str())),
-			);
-		slice_rendered(&rendered, flat_offset(flat), flat_limit(flat))
-	}
-
-	fn schema_echo(&self) -> Str {
-		let mut output = String::from(
-			"dyn\n\nDiscover documented devices and invoke one through the stable dynamic \
-			 transport.\n\nOperations: search, docs/<path>, invoke/<path>\nSearch parameters: q, \
-			 tags, provenance, offset, limit, depth.\n\nSchema:\n",
-		);
-		output.push_str(str::from_utf8(&self.spec.schema).unwrap_or("{}"));
-		Str::new(output)
-	}
-
-	fn next_invocation_id(&self) -> Str {
-		let sequence = self.next_invocation_id.fetch_add(1, Ordering::Relaxed);
-		sf!("dyn-{sequence}")
-	}
-}
-
-impl<I: DeviceInvoker + 'static> Tool for DynTool<I> {
-	type Fault = Verdict;
-	type Params = Value;
-	type Payload = DynPayload;
-	type Update = DynUpdate;
-
-	fn spec(&self) -> &ToolSpec {
-		&self.spec
-	}
-
-	fn call<'c>(
-		&'c self,
-		mut params: IncomingParams<'c>,
-	) -> impl Stream<Item = omp_tool::Ev<Self::Update, Self::Payload, Self::Fault>> + Send + 'c {
-		stream! {
-			let finalized = match params.finalize().await {
-				Ok(finalized) => finalized,
-				Err(error) => {
-					yield param_event(error);
-					return;
-				},
-			};
-			let Some(flat) = finalized.effective().as_object() else {
-				yield omp_tool::Ev::Args(ArgIssue {
-					path: vec![], expected: sf!("an argument object"), kind: ArgIssueKind::Malformed,
-					example: None, found: None,
-				});
-				return;
-			};
-			let operation = match flat.get("do_").and_then(Value::as_str) {
-				Some(value) if is_help_token(value) => {
-					yield done(Ok(DynPayload::Text { text: self.schema_echo() }));
-					return;
-				},
-				Some(value) => match parse_operation(value) {
-					Ok(operation) => operation,
-					Err(error) => {
-						yield done(Err(self.fault(Self::dyn_path(), self.spec.rev.clone(), operation_issue(error))));
-						return;
-					},
-				},
-				None if is_device_help(flat) => {
-					yield done(Ok(DynPayload::Text { text: self.schema_echo() }));
-					return;
-				},
-				None => {
-					yield done(Err(self.fault(Self::dyn_path(), self.spec.rev.clone(), operation_issue(OperationError::Empty))));
-					return;
-				},
-			};
-			let Some(registry) = self.catalog.registry() else {
-				yield done(Err(self.fault(Self::dyn_path(), self.spec.rev.clone(), operation_issue(OperationError::Unknown { op: sf!("catalog") }))));
-				return;
-			};
-			match operation {
-				Operation::Search(subtree) => {
-					yield done(Ok(DynPayload::Text { text: self.catalog(&registry, subtree.as_ref(), flat) }));
-				},
-				Operation::Docs(raw) => {
-					let (path, _target) = if let Ok(resolved) = resolve_operation(&registry, &Operation::Docs(raw.clone())) { resolved } else {
-								  yield done(Err(self.unknown_path_fault(raw.as_str(), &registry)));
-								  return;
-							  };
-					yield done(Ok(DynPayload::Text { text: self.docs(&registry, &path, flat) }));
-				},
-				Operation::Invoke(raw) => {
-					let (path, target) = if let Ok(resolved) = resolve_operation(&registry, &Operation::Invoke(raw.clone())) { resolved } else {
-								  yield done(Err(self.unknown_path_fault(raw.as_str(), &registry)));
-								  return;
-							  };
-					if is_device_help(flat) {
-						yield done(Ok(DynPayload::Text { text: self.docs(&registry, &path, flat) }));
-						return;
-					}
-					let declares_intent = registry
-						.live_spec(target.name.as_str())
-						.ok()
-						.and_then(|spec| serde_json::from_slice::<SchemaValue>(&spec.schema).ok())
-						.and_then(|schema| schema.get("properties").and_then(SchemaValue::as_object).cloned())
-						.is_some_and(|properties| properties.contains_key("i"));
-					let args_json = if let Ok(args) = renest_args(flat, declares_intent) { args } else {
-								  yield done(Err(self.fault(path, target.rev.clone(), operation_issue(OperationError::MissingPath { op: sf!("arguments") }))));
-								  return;
-							  };
-					let identity = target.identity();
-					let mut events = match target.route {
-						ToolRoute::Native => {
-							let (feed, nested) = IncomingParams::channel();
-							let raw = Str::new(str::from_utf8(&args_json).expect("serialized JSON is UTF-8"));
-							if feed.args_committed(raw).is_err() {
-								yield done(Err(self.unknown_path_fault(path.to_string().as_str(), &registry)));
-								return;
-							}
-							if let Ok(events) = registry.invoke_device(&path, nested) { events } else {
-											 yield done(Err(self.unknown_path_fault(path.to_string().as_str(), &registry)));
-											 return;
-										 }
-						},
-						ToolRoute::Worker { site, name } => self.invoker.invoke(DeviceInvokeRequest {
-							path: path.clone(),
-							name: target.name.clone(),
-							rev: Str::new(target.rev.to_string()),
-							owner: Some(target.claimant.clone()),
-							site: Some(*site),
-							worker: Some(name.clone()),
-							invocation_id: self.next_invocation_id(),
-							deadline: omp_core::Duration::new(5, omp_core::DurationUnit::Minutes),
-							args_json,
-						}).await,
-					};
-					while let Some(event) = events.next().await {
-						match event {
-							Ok(ErasedEv::Update(json)) => yield omp_tool::Ev::Update(DynUpdate { json }),
-							Ok(ErasedEv::Done(ErasedOutcome::Done { verdict, useless })) => {
-								yield omp_tool::Ev::Done(ToolTerminal::Done {
-									result: Ok(DynPayload::Invocation { identity, verdict }), useless,
-								});
-								return;
-							},
-							Ok(ErasedEv::Done(ErasedOutcome::Detached(job))) => {
-								yield omp_tool::Ev::Done(ToolTerminal::Detached(job));
-								return;
-							},
-							Err(_) => {
-								yield done(Err(self.unknown_path_fault(path.to_string().as_str(), &registry)));
-								return;
-							},
-						}
-					}
-					yield omp_tool::Ev::Aborted(Abort::MissingOutcome);
-				},
-			}
-		}
-	}
-
-	fn prompt(&self, view: Result<&Self::Payload, &Self::Fault>, caps: &PromptCaps) -> Vec<Part> {
-		match view {
-			Ok(DynPayload::Text { text }) => vec![Part::Text {
-				text: slice_rendered(text, 0, Some(caps.maximum_text_bytes as usize)),
-			}],
-			Ok(DynPayload::Invocation { identity, verdict }) => self
-				.catalog
-				.registry()
-				.and_then(|registry| registry.prompt(identity, verdict, caps).ok().flatten())
-				.map_or_else(
-					|| vec![Part::Text { text: sf!("Device result unavailable.") }],
-					|parts| parts.to_vec(),
-				),
-			Err(Verdict::Device { issue, .. }) => vec![Part::Text { text: issue.expected.clone() }],
-		}
-	}
-}
-
-const fn done(result: Result<DynPayload, Verdict>) -> omp_tool::Ev<DynUpdate, DynPayload, Verdict> {
-	omp_tool::Ev::Done(ToolTerminal::Done { result, useless: false })
-}
-
-fn param_event(error: ParamError) -> omp_tool::Ev<DynUpdate, DynPayload, Verdict> {
-	match error {
-		ParamError::Args(issue) => omp_tool::Ev::Args(*issue),
-		ParamError::Interrupted(interrupt) => {
-			omp_tool::Ev::Aborted(Abort::Interrupted { reason: interrupt.reason })
-		},
-		ParamError::Protocol(reason) => omp_tool::Ev::Args(ArgIssue {
-			path:     vec![],
-			expected: reason,
-			kind:     ArgIssueKind::Malformed,
-			example:  None,
-			found:    None,
-		}),
-	}
-}
-
-fn is_help_token(value: &str) -> bool {
-	matches!(value.trim().to_ascii_lowercase().as_str(), "" | "?" | "help")
-}
-
-fn is_device_help(flat: &Object) -> bool {
-	let mut payload = flat.iter().filter(|(key, _)| key.as_str() != "do_");
-	match (payload.next(), payload.next()) {
-		(None, None) => true,
-		(Some((_, value)), None) => value.as_str().is_some_and(is_help_token),
-		_ => false,
-	}
-}
-
-fn catalog_query(flat: &Object) -> CatalogQuery {
-	let text = flat
-		.get("q")
-		.and_then(Value::as_str)
-		.map(str::trim)
-		.filter(|value| !value.is_empty())
-		.map(Str::new);
-	let provenance = ["provenance", "owner", "source"]
-		.into_iter()
-		.find_map(|key| flat.get(key).and_then(Value::as_str))
-		.map(str::trim)
-		.filter(|value| !value.is_empty())
-		.map(Str::new);
-	let mut tags = SmallVec::new();
-	if let Some(value) = flat.get("tags") {
-		if let Some(authored) = value.as_str() {
-			tags.extend(
-				authored
-					.split([',', ' '])
-					.map(str::trim)
-					.filter(|tag| !tag.is_empty())
-					.map(Str::new),
-			);
-		} else if let Some(authored) = value.as_array() {
-			tags.extend(
-				authored
-					.iter()
-					.filter_map(Value::as_str)
-					.map(str::trim)
-					.filter(|tag| !tag.is_empty())
-					.map(Str::new),
-			);
-		}
-	}
-	CatalogQuery {
-		text,
-		tags,
-		provenance,
-		offset: flat_offset(flat),
-		limit: flat_limit(flat),
-		depth: flat
-			.get("depth")
-			.and_then(Value::as_u64)
-			.and_then(|depth| usize::try_from(depth).ok()),
-	}
-}
-
-fn flat_offset(flat: &Object) -> usize {
-	flat
-		.get("offset")
-		.and_then(Value::as_u64)
-		.and_then(|offset| usize::try_from(offset).ok())
-		.unwrap_or(0)
-}
-
-fn flat_limit(flat: &Object) -> Option<usize> {
-	flat
-		.get("limit")
-		.and_then(Value::as_u64)
-		.and_then(|limit| usize::try_from(limit).ok())
-}
-
-fn slice_rendered(text: &str, offset: usize, limit: Option<usize>) -> Str {
-	let mut start = offset.min(text.len());
-	while start != 0 && !text.is_char_boundary(start) {
-		start -= 1;
-	}
-	let mut end = limit.map_or(text.len(), |limit| start.saturating_add(limit).min(text.len()));
-	while end != start && !text.is_char_boundary(end) {
-		end -= 1;
-	}
-	Str::new(&text[start..end])
-}
-
-fn levenshtein(left: &str, right: &str) -> usize {
-	let mut row: Vec<usize> = (0..=right.chars().count()).collect();
-	for (left_index, left_char) in left.chars().enumerate() {
-		let mut diagonal = row[0];
-		row[0] = left_index + 1;
-		for (right_index, right_char) in right.chars().enumerate() {
-			let above = row[right_index + 1];
-			row[right_index + 1] = (row[right_index + 1] + 1)
-				.min(row[right_index] + 1)
-				.min(diagonal + usize::from(left_char != right_char));
-			diagonal = above;
-		}
-	}
-	row[right.chars().count()]
-}
-
 #[cfg(test)]
 mod tests {
-	use std::sync::Arc;
-
-	use async_stream::stream;
-	use bytes::Bytes;
-	use futures::StreamExt as _;
 	use omp_core::{Str, sf};
-	use omp_slopjson::Value;
-	use omp_tool::{
-		Claims, Constraint, Effects, ErasedEv, ErasedOutcome, Ev, IncomingParams, MountedDevice,
-		Precedence, Presentation, Registry, Rev, Tool, ToolRoute, ToolSpec, ToolTerminal,
-		ToolsPolicy, Verdict,
-	};
-	use parking_lot::Mutex;
-	use serde_json::json;
+	use omp_tool::{Effects, MountedDevice, Rev, ToolRoute, ToolsPolicy};
 
 	use super::{
-		AUTO_QA_PROMPT_GUIDANCE, CatalogQuery, DOCS_TOTAL_BUDGET, DeviceCatalog, DeviceInvokeRequest,
-		DeviceInvoker, DocsMode, DynPayload, DynUpdate, EXTERNAL_SUMMARY_CAP, Operation,
-		OperationError, PER_DEVICE_DOCS_CAP, PROMPT_GUIDANCE, dyn_enabled, dyn_tool, flatten_slots,
-		parse_operation, render_catalog, render_catalog_query, render_prompt_docs, renest_args,
-		reserved_parameter,
+		AUTO_QA_PROMPT_GUIDANCE, CatalogQuery, DOCS_TOTAL_BUDGET, DocsMode, EXTERNAL_SUMMARY_CAP,
+		PER_DEVICE_DOCS_CAP, PROMPT_GUIDANCE, flatten_slots, render_catalog, render_catalog_query,
+		render_near_miss, render_prompt_docs, xd_enabled,
 	};
-
-	#[derive(Clone, Default)]
-	struct StubInvoker(Arc<Mutex<Vec<DeviceInvokeRequest>>>);
-
-	impl DeviceInvoker for StubInvoker {
-		async fn invoke(&self, request: DeviceInvokeRequest) -> omp_tool::ErasedStream<'static> {
-			self.0.lock().push(request);
-			Box::pin(stream! {
-				yield Ok(ErasedEv::Done(ErasedOutcome::Done {
-					verdict: Bytes::from_static(br#"{"kind":"ok","value":{}}"#),
-					useless: false,
-				}));
-			})
-		}
-	}
-
-	fn catalog() -> (DeviceCatalog, Arc<Registry>) {
-		let catalog = DeviceCatalog::default();
-		let mut registry = Registry::default();
-		registry
-			.register_worker(
-				ToolSpec {
-					name:            sf!("fixture"),
-					rev:             Rev { family: Str::default(), n: 1 },
-					description:     sf!("Fixture device."),
-					schema:          Bytes::from_static(
-						br#"{"type":"object","properties":{"title":{"type":"string"}},"additionalProperties":false}"#,
-					),
-					constraint:      Constraint::None,
-					effects:         Default::default(),
-					projection_code: [0; 32],
-				},
-				Presentation::Device,
-				Claims {
-					precedence: Precedence::DEFAULT,
-					claimant:   sf!("test/fixture"),
-					replaces:   None,
-				},
-			)
-			.expect("fixture registers");
-		let registry = Arc::new(registry);
-		catalog
-			.install_registry(Arc::clone(&registry))
-			.expect("catalog installs");
-		(catalog, registry)
-	}
-
-	async fn invoke<T>(tool: &T, args: &str) -> Vec<Ev<DynUpdate, DynPayload, omp_tool::Verdict>>
-	where
-		T: Tool<Params = Value, Update = DynUpdate, Payload = DynPayload, Fault = Verdict>,
-	{
-		let (feed, params) = IncomingParams::channel();
-		feed
-			.args_committed(Str::new(args))
-			.expect("arguments commit");
-		tool.call(params).collect().await
-	}
 
 	fn mounted<'a>(
 		name: &'a Str,
@@ -1168,122 +561,16 @@ mod tests {
 			route,
 		}
 	}
+
 	#[test]
-	fn prompt_guidance_uses_only_live_dyn_operations_and_never_xd_urls() {
-		for operation in ["search", "docs/<path>", "invoke/<path>"] {
-			assert!(PROMPT_GUIDANCE.contains(operation));
-		}
+	fn prompt_guidance_names_xd_help_without_inventing_urls() {
+		assert!(PROMPT_GUIDANCE.contains("`xd`"));
+		assert!(PROMPT_GUIDANCE.contains("--help"));
 		assert!(AUTO_QA_PROMPT_GUIDANCE.contains("report_issue"));
-		assert!(!PROMPT_GUIDANCE.contains("xd://"));
-		assert!(!AUTO_QA_PROMPT_GUIDANCE.contains("xd://"));
-	}
-
-	#[test]
-	fn do_grammar_refuses_empty_and_trailing_paths() {
-		assert_eq!(parse_operation(""), Err(OperationError::Empty));
-		assert!(matches!(parse_operation("docs/"), Err(OperationError::MissingPath { .. })));
-		assert!(matches!(parse_operation("invoke/jira/"), Err(OperationError::MissingPath { .. })));
-	}
-
-	#[test]
-	fn do_grammar_preserves_claimant_qualified_path() {
-		assert_eq!(
-			parse_operation("docs/jira/create@acme/tools"),
-			Ok(Operation::Docs("jira/create@acme/tools".into()))
-		);
-		assert!(matches!(parse_operation("list"), Err(OperationError::Unknown { .. })));
-	}
-	#[tokio::test]
-	async fn dyn_search_renders_the_bound_catalog() {
-		let (catalog, _registry) = catalog();
-		let tool = dyn_tool(StubInvoker::default(), catalog, ToolsPolicy::Auto);
-		let events = invoke(&tool, r#"{"do_":"search"}"#).await;
-		match events.last().expect("terminal event") {
-			Ev::Done(ToolTerminal::Done { result: Ok(DynPayload::Text { text }), .. }) => {
-				assert!(text.contains("fixture"));
-			},
-			event => panic!("unexpected event: {event:?}"),
+		for guidance in [PROMPT_GUIDANCE, AUTO_QA_PROMPT_GUIDANCE] {
+			assert!(!guidance.contains("xd://"));
+			assert!(!guidance.contains("xd:"));
 		}
-	}
-
-	#[tokio::test]
-	async fn dyn_docs_honors_flat_pagination() {
-		let (catalog, _registry) = catalog();
-		let tool = dyn_tool(StubInvoker::default(), catalog, ToolsPolicy::Auto);
-		let events = invoke(&tool, r#"{"do_":"docs/fixture","offset":0,"limit":7}"#).await;
-		match events.last().expect("terminal event") {
-			Ev::Done(ToolTerminal::Done { result: Ok(DynPayload::Text { text }), .. }) => {
-				assert_eq!(text, "fixture");
-			},
-			event => panic!("unexpected event: {event:?}"),
-		}
-	}
-
-	#[tokio::test]
-	async fn dyn_invocation_renests_final_arguments_for_worker() {
-		let invoker = StubInvoker::default();
-		let (catalog, _registry) = catalog();
-		let tool = dyn_tool(invoker.clone(), catalog, ToolsPolicy::Auto);
-		let events =
-			invoke(&tool, r#"{"do_":"invoke/fixture","i":"Calling fixture","title":"Fix"}"#).await;
-		assert!(matches!(
-			events.last(),
-			Some(Ev::Done(ToolTerminal::Done { result: Ok(DynPayload::Invocation { .. }), .. }))
-		));
-		let calls = invoker.0.lock();
-		assert_eq!(calls.len(), 1);
-		assert_eq!(calls[0].args_json.as_ref(), br#"{"title":"Fix"}"#);
-	}
-
-	#[tokio::test]
-	async fn dyn_help_echoes_schema_without_dispatch() {
-		for args in [r"{}", r#"{"content":"?"}"#, r#"{"do_":" ? "}"#, r#"{"do_":"HELP"}"#] {
-			let (catalog, _registry) = catalog();
-			let invoker = StubInvoker::default();
-			let tool = dyn_tool(invoker.clone(), catalog, ToolsPolicy::Auto);
-			let events = invoke(&tool, args).await;
-			match events.last().expect("terminal event") {
-				Ev::Done(ToolTerminal::Done { result: Ok(DynPayload::Text { text }), .. }) => {
-					assert!(text.contains(r#""do_""#));
-					assert!(text.contains("docs/<path>"));
-				},
-				event => panic!("unexpected event: {event:?}"),
-			}
-			assert!(invoker.0.lock().is_empty());
-		}
-	}
-
-	#[tokio::test]
-	async fn invoke_help_returns_target_schema_without_dispatch() {
-		let invoker = StubInvoker::default();
-		let (catalog, _registry) = catalog();
-		let tool = dyn_tool(invoker.clone(), catalog, ToolsPolicy::Auto);
-		let events = invoke(&tool, r#"{"do_":"invoke/fixture/resolve","content":" help "}"#).await;
-		match events.last().expect("terminal event") {
-			Ev::Done(ToolTerminal::Done { result: Ok(DynPayload::Text { text }), .. }) => {
-				assert!(text.contains("Fixture device."));
-				assert!(text.contains("fixture/resolve @ test/fixture"));
-				assert!(text.contains(r#""title""#));
-			},
-			event => panic!("unexpected event: {event:?}"),
-		}
-		assert!(invoker.0.lock().is_empty());
-	}
-
-	#[tokio::test]
-	async fn staged_action_subtool_path_is_preserved_for_device_owner() {
-		let invoker = StubInvoker::default();
-		let (catalog, _registry) = catalog();
-		let tool = dyn_tool(invoker.clone(), catalog, ToolsPolicy::Auto);
-		let events =
-			invoke(&tool, r#"{"do_":"invoke/fixture/resolve","reason":"Apply proposal"}"#).await;
-		assert!(matches!(
-			events.last(),
-			Some(Ev::Done(ToolTerminal::Done { result: Ok(DynPayload::Invocation { .. }), .. }))
-		));
-		let calls = invoker.0.lock();
-		assert_eq!(calls[0].path.to_string(), "fixture/resolve");
-		assert_eq!(calls[0].args_json.as_ref(), br#"{"reason":"Apply proposal"}"#);
 	}
 
 	#[test]
@@ -1386,61 +673,42 @@ mod tests {
 		assert!(summary.ends_with("..."));
 	}
 
-	#[tokio::test]
-	async fn dyn_unknown_operation_returns_a_device_fault() {
-		let (catalog, _registry) = catalog();
-		let tool = dyn_tool(StubInvoker::default(), catalog, ToolsPolicy::Auto);
-		let events = invoke(&tool, r#"{"do_":"list"}"#).await;
-		match events.last().expect("terminal event") {
-			Ev::Done(ToolTerminal::Done {
-				result: Err(omp_tool::Verdict::Device { issue, .. }),
-				..
-			}) => {
-				assert_eq!(issue.expected, "one of search, docs, invoke")
-			},
-			event => panic!("unexpected event: {event:?}"),
-		}
-	}
-
 	#[test]
-	fn near_miss_distance_prefers_the_leaf_typo() {
+	fn near_miss_prefers_the_closest_leaf() {
+		let close_name = sf!("house_lint");
+		let far_name = sf!("jira");
+		let claimant = sf!("acme/tools");
+		let summary = sf!("Fixture.");
+		let rev = Rev { family: Str::default(), n: 1 };
+		let effects = Effects::default();
+		let route = ToolRoute::Native;
+		let rendered = render_near_miss(
+			"hose_lint",
+			[
+				mounted(&far_name, &claimant, &summary, None, &rev, &effects, &route),
+				mounted(&close_name, &claimant, &summary, None, &rev, &effects, &route),
+			]
+			.into_iter(),
+		);
 		assert!(
-			super::levenshtein("hose_lint", "house_lint") < super::levenshtein("hose_lint", "jira")
-		);
-	}
-	#[test]
-	fn renesting_removes_transport_fields() {
-		let flat =
-			omp_slopjson::parse(r#"{"do_":"invoke/jira/create","i":"Creating issue","title":"Fix"}"#)
-				.expect("flat arguments parse");
-		let flat = flat.as_object().expect("flat arguments are an object");
-		assert_eq!(renest_args(flat, false).unwrap().as_ref(), br#"{"title":"Fix"}"#);
-		assert_eq!(
-			renest_args(flat, true).unwrap().as_ref(),
-			br#"{"i":"Creating issue","title":"Fix"}"#
+			rendered
+				.lines()
+				.nth(1)
+				.is_some_and(|line| line.contains("house_lint"))
 		);
 	}
 
 	#[test]
-	fn tool_only_flattening_refuses_collisions() {
+	fn tool_only_flattening_refuses_collisions_and_xd() {
 		let collision = flatten_slots([
 			("jira/create".into(), "acme/jira".into()),
 			("jira_create".into(), "other/tools".into()),
 		])
-		.unwrap_err();
+		.expect_err("flattening must reject ambiguous slots");
 		assert_eq!(collision.slot, "jira_create");
 		assert_eq!(collision.existing_owner, "acme/jira");
 		assert_eq!(collision.conflicting_owner, "other/tools");
-		assert!(!dyn_enabled(ToolsPolicy::ToolOnly));
-	}
-
-	#[test]
-	fn reserved_envelope_parameters_are_refused() {
-		assert_eq!(reserved_parameter(&json!({"properties": {"do_": {}}})), Some("do_".into()));
-		assert_eq!(
-			reserved_parameter(&json!({"properties": {"future_": {}}})),
-			Some("future_".into())
-		);
-		assert_eq!(reserved_parameter(&json!({"properties": {"title": {}}})), None);
+		assert!(xd_enabled(ToolsPolicy::Auto));
+		assert!(!xd_enabled(ToolsPolicy::ToolOnly));
 	}
 }

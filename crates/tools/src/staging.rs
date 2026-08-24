@@ -18,16 +18,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Stable notice appended when a tool leaves a proposal uncommitted.
-pub const PROPOSAL_PENDING_NOTICE: &str = "A staged proposal is pending. Finalize it with dyn \
-                                           using do_ `invoke/resolve` or `invoke/reject` and a \
-                                           one-sentence `reason` before using another tool.";
-
-/// Exact dynamic-device operation applying the pending proposal (`dyn
-/// {"do_":"invoke/resolve",...}`).
-pub const RESOLVE_OPERATION: &str = "invoke/resolve";
-/// Exact dynamic-device operation discarding the pending proposal (`dyn
-/// {"do_":"invoke/reject",...}`).
-pub const REJECT_OPERATION: &str = "invoke/reject";
+pub const PROPOSAL_PENDING_NOTICE: &str =
+	"A staged proposal is pending. Finalize it by running `xd resolve \"<one-sentence reason>\"` \
+	 or `xd reject \"<one-sentence reason>\"` in the shell before using another tool.";
 /// Why a staged proposal was rejected.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -71,12 +64,6 @@ pub enum ProposalError {
 	/// No live proposal has this identity.
 	#[error("staged proposal is no longer pending")]
 	Unknown,
-	/// The resolution invocation omitted its required reason.
-	#[error("staged proposal resolution requires a one-sentence reason")]
-	MissingReason,
-	/// The invocation targeted a device that is not `resolve` or `reject`.
-	#[error("device path is not a staged-proposal resolution device")]
-	NotResolution,
 	/// The staged action refused or could not finalize.
 	#[error("staged proposal finalization failed")]
 	Action(#[from] ProposalActionError),
@@ -147,7 +134,8 @@ pub type ActivationObserver =
 	Arc<dyn Fn(StagedProposal) -> ActivationObserverFuture + Send + Sync + 'static>;
 
 struct Entry {
-	action: Box<dyn StagedProposalAction>,
+	sequence: u64,
+	action:   Box<dyn StagedProposalAction>,
 }
 
 struct Inner {
@@ -203,7 +191,7 @@ impl StagedProposalRegistry {
 			.0
 			.entries
 			.lock()
-			.insert(id.clone(), Entry { action: Box::new(action) });
+			.insert(id.clone(), Entry { sequence, action: Box::new(action) });
 		let registry = self.clone();
 		let invoke_id = id.clone();
 		let resolver: ProposalResolver =
@@ -226,6 +214,17 @@ impl StagedProposalRegistry {
 		self.0.entries.lock().contains_key(id)
 	}
 
+	/// Returns the most recently staged unresolved proposal.
+	pub fn latest_pending(&self) -> Option<Str> {
+		self
+			.0
+			.entries
+			.lock()
+			.iter()
+			.max_by_key(|(_, entry)| entry.sequence)
+			.map(|(id, _)| id.clone())
+	}
+
 	/// Finalizes one exact proposal, removing it only after successful
 	/// settlement.
 	pub fn finalize(
@@ -238,33 +237,6 @@ impl StagedProposalRegistry {
 		let payload = entry.action.finalize(&decision)?;
 		entries.remove(id);
 		Ok(ProposalOutcome { id: Str::new(id), decision, payload })
-	}
-}
-
-/// Parses the exact `dyn` resolution invocation accepted by a staged proposal.
-///
-/// # Errors
-///
-/// [`ProposalError::NotResolution`] unless `do_` is exactly `invoke/resolve` or
-/// `invoke/reject`; [`ProposalError::MissingReason`] when `reason` is absent,
-/// non-string, or blank.
-pub fn parse_resolution_invoke(input: &Value) -> Result<ProposalDecision, ProposalError> {
-	let object = input.as_object().ok_or(ProposalError::NotResolution)?;
-	let operation = object
-		.get("do_")
-		.and_then(Value::as_str)
-		.unwrap_or_default();
-	let reason = object
-		.get("reason")
-		.and_then(Value::as_str)
-		.map(str::trim)
-		.filter(|reason| !reason.is_empty())
-		.map(Str::new)
-		.ok_or(ProposalError::MissingReason)?;
-	match operation {
-		RESOLVE_OPERATION => Ok(ProposalDecision::Resolve { reason }),
-		REJECT_OPERATION => Ok(ProposalDecision::Reject(ProposalRejection::Requested { reason })),
-		_ => Err(ProposalError::NotResolution),
 	}
 }
 
@@ -301,16 +273,41 @@ mod tests {
 			.await
 			.expect("proposal staged");
 		assert!(registry.is_pending(pending.id.as_str()));
-		let decision = parse_resolution_invoke(&json!({
-			"do_": "invoke/resolve",
-			"reason": "Apply the reviewed rewrite."
-		}))
-		.expect("valid resolution");
+		let decision = ProposalDecision::Resolve { reason: sf!("Apply the reviewed rewrite.") };
 		let outcome = (captured.lock().take().expect("observer called").resolver)(decision.clone())
 			.expect("proposal resolved");
 		assert_eq!(outcome.decision, decision);
 		assert_eq!(seen.lock().as_slice(), &[decision]);
 		assert!(!registry.is_pending(pending.id.as_str()));
+	}
+
+	#[tokio::test]
+	async fn latest_pending_uses_stage_sequence_not_lexicographic_id_order() {
+		let registry = StagedProposalRegistry::new();
+		registry.install_activation_observer(Arc::new(|_| Box::pin(async { Ok(()) })));
+		let decisions = Arc::new(Mutex::new(Vec::new()));
+		let mut staged = Vec::new();
+		for _ in 0..12 {
+			let pending = registry
+				.stage(
+					sf!("ast_edit"),
+					sf!("one file changed"),
+					RecordingAction(Arc::clone(&decisions)),
+				)
+				.await
+				.expect("proposal staged");
+			staged.push(pending.id);
+		}
+		assert_eq!(registry.latest_pending().as_ref(), staged.last());
+
+		let latest = staged.pop().expect("latest proposal");
+		registry
+			.finalize(
+				latest.as_str(),
+				ProposalDecision::Reject(ProposalRejection::Requested { reason: sf!("Superseded.") }),
+			)
+			.expect("latest proposal rejects");
+		assert_eq!(registry.latest_pending().as_ref(), staged.last());
 	}
 
 	#[tokio::test]
@@ -329,30 +326,6 @@ mod tests {
 			.err()
 			.expect("observer rejects");
 		assert_eq!(error, ProposalActivationError::Rejected);
-	}
-	#[test]
-	fn resolution_invoke_parses_paths_and_requires_reason() {
-		assert!(matches!(
-			parse_resolution_invoke(&json!({
-				"do_": "invoke/reject",
-				"reason": "Wrong file."
-			})),
-			Ok(ProposalDecision::Reject(ProposalRejection::Requested { .. }))
-		));
-		assert!(matches!(
-			parse_resolution_invoke(&json!({
-				"do_": "invoke/resolve",
-				"reason": "  "
-			})),
-			Err(ProposalError::MissingReason)
-		));
-		assert!(matches!(
-			parse_resolution_invoke(&json!({
-				"do_": "invoke/format",
-				"reason": "Apply."
-			})),
-			Err(ProposalError::NotResolution)
-		));
 	}
 	#[test]
 	fn regime_limit_rejection_has_stable_wire_name() {

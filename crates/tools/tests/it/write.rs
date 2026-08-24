@@ -396,7 +396,7 @@ fn unsupported_uri_is_rejected_before_any_document_probe() {
 }
 
 #[test]
-fn retired_device_write_targets_are_rejected_with_dyn_guidance_and_no_xd_scheme() {
+fn retired_device_write_targets_are_rejected_with_xd_builtin_guidance() {
 	let cases = [
 		("xd/report_issue", Some("report_issue"), true),
 		("xd://report_issue", Some("report_issue"), true),
@@ -432,43 +432,45 @@ fn retired_device_write_targets_are_rejected_with_dyn_guidance_and_no_xd_scheme(
 				text.starts_with("Unknown retired device target."),
 				"expected retired target prefix for '{target}', got: '{text}'"
 			);
-			assert!(
-				!text.contains("xd:") && !text.contains("xd/"),
-				"diagnostic for '{target}' echoes or suggests retired scheme: '{text}'"
-			);
 		} else {
 			assert!(
 				text.starts_with(&format!("Unknown URI-like write target '{target}'.")),
 				"expected URI-like target prefix for '{target}', got: '{text}'"
 			);
-			assert!(
-				!text.contains("xd:"),
-				"diagnostic for '{target}' suggests retired scheme: '{text}'"
-			);
 		}
 		assert!(
-			text.contains(r#"{"do_":"search"}"#),
-			"missing search discovery guidance in '{text}' for '{target}'"
+			text.contains("`xd` runs in the shell tool"),
+			"missing shell builtin guidance in '{text}' for '{target}'"
 		);
 		assert!(
-			text.contains("docs/<path>"),
-			"missing docs/<path> guidance in '{text}' for '{target}'"
+			text.contains("`xd` lists devices"),
+			"missing catalog guidance in '{text}' for '{target}'"
 		);
 		if let Some(name) = tool_name {
 			assert!(
-				text.contains(&format!("docs/{name}")),
-				"missing specific docs/{name} in '{text}' for '{target}'"
+				text.contains(&format!("`xd {name} --help` shows usage")),
+				"missing specific help command in '{text}' for '{target}'"
 			);
 			assert!(
-				text.contains(&format!(r#"{{"do_":"invoke/{name}",...}}"#)),
-				"missing specific invoke/{name} dispatch in '{text}' for '{target}'"
+				text.contains(&format!("`xd {name} [args…]` invokes")),
+				"missing specific invocation command in '{text}' for '{target}'"
 			);
 		} else {
 			assert!(
-				text.contains(r#"{"do_":"invoke/<path>",...}"#),
-				"missing generic invoke/<path> dispatch in '{text}' for '{target}'"
+				text.contains("`xd <device> --help` shows usage"),
+				"missing generic help command in '{text}' for '{target}'"
+			);
+			assert!(
+				text.contains("`xd <device> [args…]` invokes"),
+				"missing generic invocation command in '{text}' for '{target}'"
 			);
 		}
+		assert!(
+			!text.contains("xd://"),
+			"diagnostic for '{target}' suggests an xd invocation URL: '{text}'"
+		);
+		assert!(!text.contains("dyn"), "retired dyn guidance in '{text}' for '{target}'");
+		assert!(!text.contains("do_"), "retired do_ guidance in '{text}' for '{target}'");
 	}
 }
 

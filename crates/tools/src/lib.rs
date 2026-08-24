@@ -41,7 +41,6 @@ const BUILTIN_TOOL_IDENTITIES: &[BuiltinToolIdentity] = &[
 	BuiltinToolIdentity { name: "think", hidden: true },
 	BuiltinToolIdentity { name: "goal", hidden: true },
 	BuiltinToolIdentity { name: "yield", hidden: true },
-	BuiltinToolIdentity { name: "dyn", hidden: true },
 	BuiltinToolIdentity { name: "image_gen", hidden: false },
 	BuiltinToolIdentity { name: "tts", hidden: false },
 	BuiltinToolIdentity { name: "report_issue", hidden: true },
@@ -91,6 +90,8 @@ pub mod debug;
 pub mod debug_render;
 /// Stable dynamic device transport and catalog rendering.
 pub mod device;
+/// Schema-derived command-line mappings for dynamic devices.
+pub mod device_ctl;
 /// Hashline document transactions with speculative previews.
 pub mod edit;
 /// Persistent Python evaluation.
