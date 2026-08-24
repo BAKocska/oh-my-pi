@@ -2724,3 +2724,21 @@ Changes this file made in response to the external review, by review point:
 - **Dispatch surface.** This file contains no device-dispatch mentions; the Rev 2.1
   `dyn` core tool ruling (`docs/py/01-devices.md`) required no changes here, and every
   `@omp.device` example remains valid.
+
+**Revision 2.2** — the `xd` shell-builtin transport ruling: the dedicated `dyn` core tool and its `do_` envelope are deleted. Devices are
+discovered, documented, and dispatched through the `xd` builtin of the embedded shell,
+inside the core `shell` tool: `xd` lists the catalog (`xd --q <text>` searches),
+`xd <device> --help` returns docs plus schema-derived CLI usage, and
+`xd <device> [args…]` (or `xd <device> --json '<payload>'`) invokes — arguments arrive
+as one nested JSON document mapped from the CLI
+([01-devices.md](01-devices.md) owns the schema→CLI grammar). Staged-proposal
+resolution is `xd resolve "<reason>"` / `xd reject "<reason>"`. The
+`do_`/trailing-underscore reserved-parameter rule is deleted with the envelope. The
+one-gate rule transfers intact: an `xd` device dispatch fires one `tool_call` with the
+RESOLVED `target=DeviceCall(...)`; catalog and docs reads fire
+`target=CoreTool("shell")` — the builtin is transport, never the policy subject. The
+model's tool array shrinks by the `dyn` slot; a device still has no schema in the
+request.
+
+- **Dispatch surface.** This file required no live transport edits for Revision 2.2;
+  its placement claims and examples remain unchanged.

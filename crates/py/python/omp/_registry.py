@@ -2352,24 +2352,15 @@ def _worker_handler(
 
 
 def _extract_arg_specs(body: object, schema: object | None) -> tuple[ArgSpec, ...]:
-    from . import Coerce, Field, SchemaError
+    from . import Coerce, Field
 
     annotations: list[tuple[str, object]] = []
-    schema_parameter_names: set[str] = set()
     if isinstance(schema, type):
         try:
             schema_hints = get_type_hints(schema, include_extras=True)
         except (NameError, TypeError):
             schema_hints = inspect.get_annotations(schema, eval_str=False)
         annotations.extend(schema_hints.items())
-        schema_parameter_names.update(schema_hints)
-    elif isinstance(schema, Mapping):
-        properties = schema.get("properties", {})
-        if isinstance(properties, Mapping):
-            schema_parameter_names.update(
-                name for name in properties if isinstance(name, str)
-            )
-
     try:
         body_hints = get_type_hints(body, include_extras=True)
     except (NameError, TypeError):
@@ -2381,16 +2372,6 @@ def _extract_arg_specs(body: object, schema: object | None) -> tuple[ArgSpec, ..
     annotations.extend(
         (name, body_hints[name]) for name in parameters if name in body_hints
     )
-
-    parameter_names = schema_parameter_names
-    parameter_names.update(name for name, _annotation in annotations)
-    parameter_names.update(parameters)
-    for name in sorted(parameter_names):
-        if name == "do_" or name.endswith("_"):
-            raise SchemaError(
-                f"parameter {name!r} violates the reserved-name rule: "
-                "no parameter named do_, none ending _"
-            )
 
     specs: list[ArgSpec] = []
     seen_paths: set[str] = set()

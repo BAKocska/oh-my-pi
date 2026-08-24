@@ -1348,22 +1348,6 @@ async def arg_metadata_device(
     return count
 
 
-def register_reserved_do_parameter():
-    @omp.device("reserved_do_parameter")
-    async def reserved_do_parameter(do_):
-        return do_
-
-
-def register_reserved_suffix_parameter():
-    @omp.device("reserved_suffix_parameter")
-    async def reserved_suffix_parameter(value_):
-        return value_
-
-
-expect_raises(omp.SchemaError, register_reserved_do_parameter)
-expect_raises(omp.SchemaError, register_reserved_suffix_parameter)
-
-
 # Discovery and trust: typed declarations and phase-free model projection.
 assert all(
     getattr(omp, name) is getattr(provider_module, name)

@@ -7,7 +7,7 @@
 > protocol.
 > Siblings: [`00-overview.md`](00-overview.md) (host, sockets, manifest, trust tiers,
 > `omp.Context`, activation order, cancellation),
-> [`01-devices.md`](01-devices.md) (`@omp.device`, `@omp.tool`, the `dyn` core tool, `omp.devices`),
+> [`01-devices.md`](01-devices.md) (`@omp.device`, `@omp.tool`, the `xd` shell builtin, `omp.devices`),
 > [`02-verdicts.md`](02-verdicts.md) (`omp.Payload`, `omp.Fault`, `prompt()`, `lift()`,
 > `family@rev`, spill budget),
 > [`03-params.md`](03-params.md) (`IncomingParams`, `omp.InvocationPhase` — the seven-state
@@ -304,7 +304,8 @@ dead extension's subscriptions cannot keep them fail-closed.
 Hook subscription is the sibling of device registration, and the distinction Main settled applies
 to both: **extensions register with the HOST, never with the MODEL.** `RegisterTools` / `ToolDecl`
 (`crates/proto/proto/omp/toolhost/v1/toolhost.proto:54-64`) exists because the host must know a
-device's name, schema, rev and constraints in order to answer the `dyn` catalog (`{"do_": "docs/<name>"}`) at all; `Subscribe`
+device's name, schema, rev and constraints in order to render `xd <name> --help` from the device
+catalog at all; `Subscribe`
 exists because the core must know which events are worth constructing. Neither is meant to add a
 schema slot to a request.
 
@@ -617,7 +618,7 @@ wave through a mechanism it was not written for.
 ```python
 class TargetKind(enum.StrEnum):
 	CORE = "core"      # a core harness tool the model sees in every request
-	DEVICE = "device"  # an extension or MCP-mounted device, dispatched via the dyn core tool
+	DEVICE = "device"  # an extension or MCP-mounted device, dispatched via the xd shell builtin
 	MCP = "mcp"        # an MCP endpoint reached through a mounted server
 
 @dataclass(frozen=True, slots=True)
@@ -650,26 +651,26 @@ type CallTarget = CoreTool | DeviceCall | McpCall
 | `TargetKind.CORE` | `read`, `write`, `edit`, `bash`, `glob`, `grep` and the rest of the harness skeleton. `rev` is the dialect-qualified revision (`"hl.3"` for hashline `edit`), so `When(rev="hl.*")` is meaningful |
 | `TargetKind.DEVICE` | Everything extensions and MCP mounts expose. `family` and `rev` together are the `family@rev` identity from [`02-verdicts.md`](02-verdicts.md); `f"{name}@{family}.{rev}"` is the display form |
 | `TargetKind.MCP` | An endpoint on a mounted MCP server addressed as `(server, tool)`. There is no meaningful flat `name`, which is exactly why the union has no top-level `name` field |
-| `.args` | Present on all three variants with the same name, and **always decoded**. A `dyn` envelope or raw `do_` path never reaches a policy hook |
+| `.args` | Present on all three variants with the same name, and **always decoded**. The `xd` CLI transport and its raw `--json` payload never reach a policy hook |
 
 Two rules make this safe, both binding.
 
-**One gate per action.** A `dyn` invoke — `{"do_": "invoke/<name>", …}` on the `dyn` core tool
-([`01-devices.md`](01-devices.md)) — fires exactly one `tool_call`, with the RESOLVED
-`target=DeviceCall(...)` carrying decoded arguments. It does **not** fire a gate on `dyn` followed
-by a device gate: `dyn` is transport, never the policy subject, so a guard on the resolved device
-cannot be bypassed by the envelope. The catalog reads — `{"do_": "search"}` and
-`{"do_": "docs/<path>"}` — fire `tool_call` with `target=CoreTool("dyn")`, because there the
-catalog itself is the thing being touched. Double-gating would prompt the user twice for one
-action and, worse, would let an author gate the transport while believing they had gated the
-capability. (Rev 2 wrote this rule for the retired write-URL dispatch; the Rev 2.1 ruling
-deleted that scheme and the rule transfers to `dyn` intact — the gate binds the resolved
-target either way.)
+**One gate per action.** An `xd <name> [args…]` invocation through the `xd` builtin of the
+embedded shell ([`01-devices.md`](01-devices.md)) fires exactly one `tool_call`, with the RESOLVED
+`target=DeviceCall(...)` carrying decoded nested arguments. It does **not** first fire a gate on
+`CoreTool("shell")`: the builtin is transport, never the policy subject for a device dispatch, so
+a guard on the resolved device cannot be bypassed by CLI spelling. Catalog and docs reads — `xd`,
+`xd --q <text>`, and `xd <path> --help` — instead fire `tool_call` with
+`target=CoreTool("shell")`, because there the shell-hosted catalog itself is the thing being
+touched. Double-gating would prompt the user twice for one action and, worse, would let an author
+gate the transport while believing they had gated the capability. The one-gate rule therefore
+binds the resolved target regardless of transport.
 
 **One event, one procedure.** There is no separate `device_call` event. Policy extensions must
 gate core tools, devices and MCP endpoints with identical phase ordering, deny short-circuit and
 failure semantics. Two event names would mean every policy author subscribes twice, and the one
-who forgets ships a guard that blocks `bash` and waves through the `dyn` invoke of `shell_exec`.
+who forgets ships a guard that blocks `bash` and waves through the `xd shell_exec …` device
+dispatch.
 That is a privilege escalation, and splitting the event would be designing it in on purpose.
 
 The correct handling of an unrecognized variant is `Defer()`:
@@ -1586,9 +1587,10 @@ happened to the world. Nothing here can write `prompt`, `text`, `content` or `pa
 
 `device_list` replaces pi's whole family of tool-visibility hacks — `setActiveTools`,
 `restoreIdleTools`, `hidden`, `loadMode` — with one `INTERSECT`-composed allowlist over what
-the `dyn` catalog (`{"do_": "search"}`) reports. In the target design, because extensions register with the host and not with
-the model, narrowing the list appends one system-notification thread item naming the delta and leaves
-the request's tool array byte-identical, so the prompt prefix cache survives
+the device catalog exposed through `xd` reports. In the target design, because extensions
+register with the host and not with the model, narrowing the list appends one system-notification
+thread item naming the delta and leaves the request's tool array byte-identical, so the prompt
+prefix cache survives
 ([`01-devices.md`](01-devices.md)) and `pi-cache-optimizer` has no counterpart here.
 
 That property does not hold in the shipped code yet, for two verified reasons.
@@ -2992,3 +2994,7 @@ recorded in prose at the site of the change, per the verify-then-retract standar
   extension)`, pooling as opt-in fate-sharing, durable approval tickets) instead of
   flagging the "warm pool of one" change. Both Rev 2 flags are kept in prose as
   historical records.
+
+**Revision 2.2** — the `xd` shell-builtin transport ruling: the dedicated `dyn` core tool and its `do_` envelope are deleted. Devices are discovered, documented, and dispatched through the `xd` builtin of the embedded shell, inside the core `shell` tool: `xd` lists the catalog (`xd --q <text>` searches), `xd <device> --help` returns docs plus schema-derived CLI usage, and `xd <device> [args…]` (or `xd <device> --json '<payload>'`) invokes — arguments arrive as one nested JSON document mapped from the CLI ([01-devices.md](01-devices.md) owns the schema→CLI grammar). Staged-proposal resolution is `xd resolve "<reason>"` / `xd reject "<reason>"`. The `do_`/trailing-underscore reserved-parameter rule is deleted with the envelope. The one-gate rule transfers intact: an `xd` device dispatch fires one `tool_call` with the RESOLVED `target=DeviceCall(...)`; catalog and docs reads fire `target=CoreTool("shell")` — the builtin is transport, never the policy subject. The model's tool array shrinks by the `dyn` slot; a device still has no schema in the request.
+
+In this file, the live hook ABI and one-gate examples now name the `xd` shell builtin, keep device arguments decoded and transport-independent, and assign catalog/docs reads to `CoreTool("shell")`.

@@ -3,8 +3,8 @@
 Two decorators produce every extension capability in omp, and both land in one
 catalog. `@omp.tool` is the ergonomic default: "agent, build me a tool"
 produces one of these, and by default it ships as a **soft** device — a
-catalog entry in the `dyn` tree, a tool-tree path, and zero model schema
-slots. `@omp.device` is the advanced, device-aware export: the path-aware
+catalog entry behind the `xd` shell builtin, a tool-tree path, and zero model
+schema slots. `@omp.device` is the advanced, device-aware export: the path-aware
 form that owns its address and its tree placement — its `ToolPath`,
 sub-tool subtrees, `family=`/`rev=`, `place=`, the full declaration surface.
 Everything either decorator produces is a **device** in the sense this
@@ -26,35 +26,30 @@ not-in-v1 status.
 An extension registers with the **host**, never with the **model**. The
 distinction is the whole design. The host must know a device's name, schema,
 revision, docs, and constraint requests — otherwise it could not serve
-`dyn {"do_": "docs/<name>"}` at all, and `RegisterTools` in
+`xd <name> --help` at all, and `RegisterTools` in
 `crates/proto/proto/omp/toolhost/v1/toolhost.proto:61-64` is exactly that
 host-facing declaration. What the *model* sees — under the default dynamic
 tool policy, `auto` (the `tools.policy` setting owned in the reference
-below) — is a tool array containing exactly the core harness tools,
-including `dyn`, the fixed transport tool, plus any **hard** tools this
-session has granted, and nothing else: no per-extension schema by default,
-no MCP endpoint, no dynamically discovered integration. Everything an
-extension exposes to the model is a **device**, addressed by a path in one
-tool tree, and every device is reached through one core tool the model
-always has:
+below) — is a tool array containing exactly the core harness tools plus any
+**hard** tools this session has granted, and nothing else: no dedicated
+transport slot, no per-extension schema by default, no MCP endpoint, no
+dynamically discovered integration. Everything an extension exposes to the
+model is a **device**, addressed by a path in one catalog and reached through
+the `xd` builtin inside the core `shell` tool:
 
 | Model action | Meaning |
 |---|---|
-| `dyn {"do_": "search"}` | the tool tree: paths, one-line summaries, tier/effects badges, provenance; flat params `q`, `tags`, `limit`, `depth`; no `q` is the full listing |
-| `dyn {"do_": "docs/<path>"}` | full docs plus JSON args schema, worked examples, and effects envelope for one device |
-| `dyn {"do_": "invoke/<path>", ...}` | dispatch; the device's arguments ride flattened at top level beside `do_` |
+| `xd` or `xd --q <text>` | list the device catalog or search it; catalog filters also include `--tag`, `--provenance`, `--offset`, `--limit`, `--depth`, and `--under` |
+| `xd <path> --help` | full docs plus JSON args schema, worked examples, effects envelope, and schema-derived CLI usage |
+| `xd <path> [args…]` | dispatch; the CLI is mapped to one nested JSON argument document (`--json '<payload>'` supplies that object directly) |
 
-Revision 2 routed all three of those actions through a device URL scheme
-riding the core `read` and `write` tools — dispatch was a write of JSON
-`content` against a device URL, discovery and docs were reads of it — and
-said the URL-vs-dedicated-tool choice was "committed to measurement rather
-than taste". Both halves are superseded by the Rev 2.1 rulings, and the
-reversal is recorded here: the dedicated-tool decision has been made by user
-fiat, the tool is `dyn` with the `do_` op grammar above, and the retired
-device URL scheme is deleted from the design entirely — dispatch, docs, and
-discovery alike. There is no read-URL alternative surface: journal, UI, and
-provenance references to a device carry an [`omp.ToolPath`](#omptoolpath)
-plus provenance chrome, never a URL.
+Revision 2 routed all three actions through a device URL scheme riding the
+core `read` and `write` tools. Revision 2.1 replaced that scheme with a
+dedicated transport tool. Revision 2.2 supersedes both: the ruling is now the
+`xd` shell builtin, with no dedicated model tool and no transport envelope.
+There is no read-URL alternative surface: journal, UI, and provenance
+references to a device carry an [`omp.ToolPath`](#omptoolpath) plus provenance
+chrome, never a URL.
 
 This deletes the failure that made pi's tool slot the wrong unit of
 extensibility. In pi, 111 of 194 catalogued extensions call `registerTool`
@@ -83,7 +78,8 @@ the record.
 Say it precisely, because the imprecise version invites the wrong design:
 **registration is host-facing and always happens; advertisement is
 model-facing and is decided by the dynamic tool policy — under the default
-`auto`, it happens only for core tools, `dyn`, and granted hard tools.**
+`auto`, it happens only for core tools and granted hard tools; devices ride
+the `xd` builtin inside `shell`.**
 Revision 2 ended that sentence "never happens for a device"; the hard-tool
 exception and the `tools.policy` modes are why the ending changed, and under
 `auto` a soft device is still never advertised.
@@ -147,45 +143,45 @@ There are four kinds of tool in an agent loop, and they are not equal.
 ```mermaid
 flowchart LR
     Q{"who defines and runs it?"}
-    Q -- "harness ships it" --> C["core<br/>read · write · edit · shell<br/>grep · glob · eval · dyn<br/>OCCUPIES A SCHEMA SLOT"]
+    Q -- "harness ships it" --> C["core<br/>read · write · edit · shell<br/>grep · glob · eval<br/>OCCUPIES A SCHEMA SLOT"]
     Q -- "vendor, server-side" --> S["server<br/>forwarded, never run here"]
     Q -- "external process" --> M["mcp<br/>db.query · jira.create"]
     Q -- "extension" --> X["extension<br/>custom lint · approval gate"]
-    M --> D["device<br/>dyn tree — NO SCHEMA SLOT"]
+    M --> D["device<br/>catalog behind xd — NO SCHEMA SLOT"]
     X --> D
 ```
 
 Core tools are the harness skeleton: `read`, `edit`, `shell`, `grep`, `glob`,
-`write`, `eval` (`crates/app/src/envd/tools.rs:40-56`), plus `dyn`, the
-device transport itself. They are registered with the model, versioned with
-the harness, and the loop was designed around them. Extensions cannot add to
-that set and cannot remove from it — a hard tool claims a slot *beside* the
-core set, never a place in it, and it stays a device underneath: core names
-remain prohibited to it, and it remains `dyn`-invocable. Everything else
-becomes a device.
+`write`, and `eval` (`crates/app/src/envd/tools.rs:40-56`). They are registered
+with the model, versioned with the harness, and the loop was designed around
+them. `xd` is a builtin of the embedded `shell`, not another registered tool
+slot. Extensions cannot add to or remove from the core set — a hard tool
+claims a slot *beside* it, never a place in it, and stays a device underneath:
+core names remain prohibited to it, and it remains invocable through `xd`.
+Everything else becomes a device.
 
-### The three ops, end to end
+### The `xd` path, end to end
 
 ```mermaid
 sequenceDiagram
     participant M as Model
-    participant L as Agent loop
+    participant S as Embedded shell
     participant R as device router (env)
     participant H as Extension host (Python)
 
-    Note over M: turn opens; tool array = core tools + dyn (+ granted hard tools)
-    M->>L: dyn { do_: "search", q: "grep" }
-    L->>R: catalog read (target=CoreTool("dyn"))
-    R-->>M: tool tree fragment (paths, badges, one line per device)
-    M->>L: dyn { do_: "docs/fff_grep" }
-    L->>R: docs read (target=CoreTool("dyn"))
-    R-->>M: docs + JSON schema + examples
-    M->>L: dyn { do_: "invoke/fff_grep", pattern: "…" }
-    L->>R: InvokeTool (OPEN — raw fragments relayed)
+    Note over M: turn opens; tool array = core tools (+ granted hard tools)
+    M->>S: xd --q grep
+    S->>R: catalog read (target=CoreTool("shell"))
+    R-->>M: catalog fragment (paths, badges, one line per device)
+    M->>S: xd fff_grep --help
+    S->>R: docs read (target=CoreTool("shell"))
+    R-->>M: docs + JSON schema + schema-derived CLI usage
+    M->>S: xd fff_grep --pattern "…"
+    S->>R: InvokeTool (OPEN — nested JSON args relayed)
     R->>R: ARGS_FINALIZED — canonical requested args fixed
-    R->>L: admission query — one tool_call, target=device
-    Note over L: ADMISSION → ADMITTED (hook phases; Core answers)
-    L->>R: ArgsCommitted (ASSISTANT_ITEM_COMMITTED)
+    R->>S: admission query — one tool_call, target=device
+    Note over S: ADMISSION → ADMITTED (hook phases; Core answers)
+    S->>R: ArgsCommitted (ASSISTANT_ITEM_COMMITTED)
     R->>R: EFFECTS_AUTHORIZED — scoped effect token issued
     R->>H: toolhost/v1 InvokeTool (final effective args only)
     H-->>R: Update* → Done(outcome)
@@ -194,19 +190,19 @@ sequenceDiagram
 
 Four properties of that diagram are load-bearing:
 
-1. **The catalog and the docs are catalog reads, not schema.** `search` and
-   `docs` results are model-visible *content*, never request schema: they
+1. **The catalog and the docs are catalog reads, not schema.** `xd` listing,
+   search, and help results are model-visible *content*, never request schema: they
    cost nothing when unused and are not part of the request prefix, so a
    device appearing or disappearing does not invalidate the prompt cache.
 2. **Dispatch is one gate, and the gate binds the resolved target.**
-   `dyn {"do_": "invoke/<path>", ...}` produces exactly one `tool_call` with
+   `xd <path> [args…]` produces exactly one `tool_call` with
    `target=DeviceCall(path, family, rev, decoded_args)` — the *resolved*
-   device, carrying *decoded* arguments — never a `dyn` gate followed by a
+   device, carrying *decoded* arguments — never a `shell` gate followed by a
    device gate. Double-gating would double-prompt the user for one action,
-   and gating the envelope instead of the target would let a policy author
+   and gating the builtin instead of the target would let a policy author
    gate the transport while believing they had gated the capability; a guard
-   on the resolved device cannot be bypassed by the envelope, because the
-   envelope is never the policy subject.
+   on the resolved device cannot be bypassed by the builtin, because the
+   builtin is never the dispatch policy subject.
 
    The gate is the environment's per-invocation admission query, emitted
    between `InvokeTool` and `ArgsCommitted` — that wire mechanism is
@@ -372,8 +368,8 @@ every availability change, because devices were never in it. A device becoming
 available, unavailable, or shadowed appends exactly one system thread item
 naming the delta, built on the same mechanism that already delivers job
 settlements (`crates/agent/src/jobs.rs:341-350`,
-`crates/agent/src/mailbox.rs:64-71`). The model reads the notice, and calls
-`dyn {"do_": "search"}` if it wants the new catalog.
+`crates/agent/src/mailbox.rs:64-71`). The model reads the notice, and runs
+`xd` if it wants the new catalog.
 
 This is the ratified redesign in the port tree:
 `.plan/feature-map/ROADMAP.md:901` — "background connects with dynamic
@@ -395,8 +391,7 @@ CORE (1000) → INTEGRATION (700) → ENHANCEMENT (500) → DEFAULT (0) → FALL
 ```
 
 - The highest-precedence *device* claimant of a name is **live**.
-  `dyn {"do_": "search"}` lists it; `dyn {"do_": "invoke/<name>", ...}`
-  dispatches to it.
+  `xd` lists it; `xd <name> [args…]` dispatches to it.
 - Lower claimants are **shadowed**, not discarded. A shadowed device stays
   reachable at its claimant-qualified path — `grep@ff-labs/fff`, the
   `(publisher, extension)` identity of
@@ -419,8 +414,8 @@ CORE (1000) → INTEGRATION (700) → ENHANCEMENT (500) → DEFAULT (0) → FALL
   that permits it: the claim is a `DeviceNameError` at load. Revision 1
   allowed exactly this — "claiming a core tool name requires `replaces=`
   naming it explicitly and a precedence above `Precedence.CORE`, which the
-  manifest must grant" — and that was wrong twice over. A device rides the
-  `dyn` tree and occupies no schema slot, so it *cannot* replace the
+  manifest must grant" — and that was wrong twice over. A device lives in the
+  catalog behind `xd` and occupies no schema slot, so it *cannot* replace the
   model-facing core tool; a grant that pretends otherwise grants an
   incoherence. And the intent behind such a claim is almost always
   pi-pretty's: a nicer presentation wearing total name capture as its
@@ -430,7 +425,7 @@ CORE (1000) → INTEGRATION (700) → ENHANCEMENT (500) → DEFAULT (0) → FALL
   core-tool adapter — a harness-owned, reviewed extension point on the core
   tool itself — for behaviour. What `replaces=` naming a core tool *does*
   mean is a sub-CORE transport claim: core tools hold their names at
-  `Precedence.CORE` but are never dispatched through `dyn` — they have
+  `Precedence.CORE` but are never dispatched through `xd` — they have
   slots — so the highest device claimant below CORE is what the device path
   `grep` addresses, while the   model-facing `grep` remains exactly the core
   tool.
@@ -515,7 +510,7 @@ error; a session never runs with a half-registered device set.
   meaning of each value, worker lifecycle, and the boundary rules belong to
   [docs/py/04-placement.md](04-placement.md); this document only guarantees
   that a device's `place` does not change how the model reaches it.
-- `summary` — the one-line catalog entry shown by the `search` op. Defaults to the
+- `summary` — the one-line catalog entry shown by `xd`. Defaults to the
   first non-empty line of the docs. Rendered with control characters and
   Unicode line/paragraph separators collapsed to spaces, then bounded in UTF-8
   **bytes** on a code-point boundary. Devices declared by third-party
@@ -544,7 +539,7 @@ error; a session never runs with a half-registered device set.
   a bare `object`, an un-annotated field — raises `SchemaError` at load rather
   than producing a schema the model cannot satisfy.
 - `examples` — a sequence of [`Example`](#ompexample). Examples are rendered
-  into the `docs` op and, critically, into the schema echo a malformed
+  into `xd <device> --help` and, critically, into the schema echo a malformed
   dispatch returns. A schema alone trains nothing; a schema plus a worked
   example trains the retry.
 - `available` — a zero-argument predicate returning `bool` or
@@ -573,7 +568,7 @@ error; a session never runs with a half-registered device set.
   devices and stated here: a device has **no wire schema**, so
   `intent.strict(...)` and `intent.grammar(...)` cannot constrain sampling of
   its arguments and resolve to a recorded `Adjustment` with reason
-  `device.dyn-transport` — a normal receipt, not an error;
+  `device.xd-transport` — a normal receipt, not an error;
   `intent.force_call(...)` and the request-shaping intents are unaffected,
   because they act on the turn rather than on a schema slot.
 - `effects` — the device's maximum declared effect envelope, an
@@ -697,7 +692,7 @@ below. The descriptions here are the surfaces under the default policy,
 `auto`:
 
 - `kind="soft"` (the default): a **soft tool** *is* a device. It ships as a
-  catalog entry in the `dyn` tree with its own path, and claims zero
+  catalog entry behind `xd` with its own path, and claims zero
   model-facing schema slots. This is the pit of success: the cheap thing is
   what the bare decorator does.
 - `kind="hard"`: a **hard tool** declares the intent to claim a model-facing
@@ -717,9 +712,8 @@ below. The descriptions here are the surfaces under the default policy,
   - a granted hard tool participates in `slot_hash()`, the prompt-cache
     identity, as any slotted tool must.
 
-  A hard tool **remains in the `dyn` tree and remains path-addressable**:
-  `dyn {"do_": "invoke/<name>", ...}` dispatches to it exactly as to any soft
-  device. That is deliberate — a demoted hard tool (a session declining the
+  A hard tool **remains in the device catalog and remains path-addressable**:
+  `xd <name> [args…]` dispatches to it exactly as to any soft device. That is deliberate — a demoted hard tool (a session declining the
   grant, the budget excluding it, or a `device_only` policy) never breaks a
   caller, because every caller path that worked without the slot still works.
 
@@ -731,9 +725,7 @@ at a glance. If a path-aware device deserves a slot, that is a core tool by
 pull request, per the promotion rule in Architectural choices below.
 
 **Raises** — the same load-time table as `@omp.device` (`DeviceNameError`,
-`SchemaError`, `DocsBudgetError`), plus `SchemaError` for a parameter named
-`do_` or ending in `_`, the `dyn` envelope reservation defined in the `dyn`
-section below. A `kind="hard"` declaration whose manifest entry does not say
+`SchemaError`, `DocsBudgetError`). A `kind="hard"` declaration whose manifest entry does not say
 `kind = "hard"` is a fail-closed activation error from
 [docs/py/14-deploy.md](14-deploy.md) — the manifest and the code must agree.
 A *granted-but-unbudgeted* or *ungranted* hard tool is not an error: it is
@@ -762,11 +754,9 @@ async def house_lint(
 ```
 
 That declaration mounts `house_lint` as a soft device — under the default
-`auto` policy (next section): discoverable via
-`dyn {"do_": "search", "q": "lint"}`, documented via
-`dyn {"do_": "docs/house_lint"}`, dispatched via
-`dyn {"do_": "invoke/house_lint", "path": "crates/tool/src"}` — and absent
-from every request's tool array. Compare the full `@omp.device` spelling of
+`auto` policy (next section): discoverable via `xd --q lint`, documented via
+`xd house_lint --help`, dispatched via
+`xd house_lint crates/tool/src` — and absent from every request's tool array. Compare the full `@omp.device` spelling of
 the same capability above: every argument that example passes is one this
 decorator inferred or refused to offer.
 
@@ -780,13 +770,13 @@ read, set, or condition on — with three values:
 |---|---|
 | `auto` (default) | the default surface is device; a declaration's `hard` intent is honored when its gates pass (`tools.hard` consent, per-claim digest, `devices.HARD_SLOT_BUDGET`) |
 | `device_only` | every non-core declaration surfaces as a device; `hard` intent is demoted to a device, no extension ever gets a slot, and `tools.hard` grants are inert |
-| `tool_only` | the `dyn` tool **does not exist** — it is never advertised; every declaration, soft and hard, `@omp.tool` and `@omp.device` alike, surfaces as a model-facing tool slot |
+| `tool_only` | the `xd` builtin is dropped; every declaration, soft and hard, `@omp.tool` and `@omp.device` alike, surfaces as a model-facing tool slot |
 
 The full resolution, intent × mode → surface:
 
 | Declaration | `auto` | `device_only` | `tool_only` |
 |---|---|---|---|
-| `@omp.tool(kind="soft")` | device in the `dyn` tree | device | slot |
+| `@omp.tool(kind="soft")` | device behind `xd` | device | slot |
 | `@omp.tool(kind="hard")` | slot when granted and budgeted, else device | device (grants inert) | slot |
 | `@omp.device` (implicit soft) | device | device | slot |
 
@@ -806,18 +796,17 @@ error naming both claimants, fail-closed like every other load-time
 collision in this document. The one exception is the legitimate sub-CORE
 transport claim on a core name (the `replaces=` mechanism above): under
 `tool_only` it cannot surface — the core tool keeps its slot and there is no
-`dyn` tree to fall back to — so it is unmounted with one notification naming
+`xd` device surface to fall back to — so it is unmounted with one notification naming
 the mode, never a brick. The `ToolPath` `jira/create` remains the journal
 and policy identity in every mode; the flattened spelling is
 advertisement-only.
 
 **Extension code is oblivious to the mode.** The body contract, the gate on
 the resolved target, journaling, and `omp.CallOutcome` are identical in all
-three modes; only advertisement and the dispatch envelope differ. A policy
+three modes; only advertisement and the dispatch transport differ. A policy
 hook written against `DeviceCall(path, ...)` fires identically whether the
-call arrived through `dyn {"do_": "invoke/..."}` or through a direct slot
-call under `tool_only` — the envelope is never the policy subject, in any
-mode. An extension cannot detect the mode, and a device that behaves
+call arrived through `xd` or through a direct slot call under `tool_only` —
+the builtin is never the dispatch policy subject, in any mode. An extension cannot detect the mode, and a device that behaves
 differently per surface has no API through which to try.
 
 ### `omp.Effects`
@@ -949,9 +938,9 @@ Methods:
   ```
 
   This registers `jira/issue/create`, dispatched as
-  `dyn {"do_": "invoke/jira/issue/create", ...}`, documented via
-  `dyn {"do_": "docs/jira/issue/create"}`, and listed under the `jira` node
-  of the search tree. Each leaf's schema and `omp.Field` argument metadata
+  `xd jira/issue/create [args…]`, documented via
+  `xd jira/issue/create --help`, and listed under the `jira` node of the
+  device catalog. Each leaf's schema and `omp.Field` argument metadata
   are derived from its handler signature by the ordinary device declaration
   extractor. The accepted overrides are `family`, `place`, `precedence`,
   `tier`, `effects`, `docs`, and `summary`; each property inherits the
@@ -1012,7 +1001,7 @@ typed location is the path itself. The grammar is `name[/sub]`, each segment
 matching the device-name grammar, with the claimant-qualified form
 `name@publisher/extension` addressing a shadowed implementation — never a
 schema revision, which is the Rev 2 shadowed-claimant correction (smaller
-#5) respelled on the path. Construction applies the same parse the `dyn`
+#5) respelled on the path. Construction applies the same parse the device
 router uses and raises `DeviceError` eagerly, so a malformed path fails
 where it was written rather than at dispatch. `name` is the device token,
 `sub` the sub-tool segment when present, and `claimant` the
@@ -1020,7 +1009,8 @@ where it was written rather than at dispatch. `name` is the device token,
 else `None`. `str(path)` renders the canonical spelling. `Device.path`,
 `DeviceInfo.path`, and `devices.resolve` traffic in this type; prose that
 shows bare `house_lint` or `jira/create` strings is showing what the model
-emits inside `do_`, which the router parses into exactly this value.
+passes as the first argument to `xd`, which the router parses into exactly
+this value.
 Journal, UI, and provenance references to a device carry a `ToolPath` plus
 provenance chrome.
 
@@ -1158,7 +1148,7 @@ ordering it produces is a static registry fact. It is not a gate chain and not
 an admission order: nothing is evaluated per call, nothing short-circuits, and
 no claimant can veto another's invocation. D6 (`PLAN.md` §D6)
 prohibits batch-level admission scheduling in the loop (the scope reading in
-the three-ops section above), and this mechanism is not scheduling of any
+the `xd` path section above), and this mechanism is not scheduling of any
 kind — by the time a device is dispatched, precedence has already been spent and only
 one claimant is live. Per-call policy is the environment's admission query; see
 [docs/py/06-policy.md](06-policy.md).
@@ -1185,7 +1175,7 @@ All derive from `omp.DeviceError`, which derives from `omp.ExtensionError`.
 | Exception | Raised when | When |
 |---|---|---|
 | `DeviceNameError` | name fails the grammar, claims a reserved name, or claims any name at or above `Precedence.CORE` | load |
-| `SchemaError` | schema underivable, duplicate `(name, family, rev)`, an example that fails its own schema, or a parameter named `do_` or ending in `_` (the `dyn` envelope reservation) | load |
+| `SchemaError` | schema underivable, duplicate `(name, family, rev)`, or an example that fails its own schema | load |
 | `PrecedenceConflict` | two claimants of one name at equal precedence, or an unnamed shadow attempt | load |
 | `DocsBudgetError` | a single device's docs exceed `PER_DEVICE_CAP` and no `summary` was supplied to fall back on | load |
 | `DeviceUnavailable` | `devices.get` finds no claimant, or a direct call targets a device whose `available` predicate is false | runtime |
@@ -1195,31 +1185,66 @@ activation. `DeviceUnavailable` at runtime is a structured fault, projected to
 the model through the device's own verdict projection — never an ad-hoc string.
 See [docs/py/02-verdicts.md](02-verdicts.md).
 
-### The `dyn` core tool
+### The `xd` shell builtin
 
-New in Rev 2.1, and the transport. `dyn` is one fixed core tool — advertised
-in every dynamic-tool-policy mode except `tool_only`, where it does not
-exist — the only schema slot the entire device world costs, with a
-permanently stable schema:
+`xd` is the device transport, implemented by `crates/envd/src/xd.rs` over the
+schema compiler in `crates/tools/src/device_ctl.rs` and installed as a builtin
+of omp's embedded brush shell. It is not a core-tool schema slot: the model invokes it by
+running the core `shell` tool. Consequently the mounted device set, device
+docs, and schema-derived usage remain model-visible content rather than
+request schema, and changes to them do not churn the request prefix.
 
-```json
-{
-  "type": "object",
-  "properties": { "do_": { "type": "string" } },
-  "required": ["do_"],
-  "additionalProperties": true
-}
+The builtin has these live command forms:
+
+| Command | Meaning |
+|---|---|
+| `xd` | list the live device catalog |
+| `xd --q <text>` | search the catalog |
+| `xd <device> --help` | render that device's docs and JSON schema, followed by schema-derived CLI usage |
+| `xd <device> [args…]` | invoke the device with one nested JSON argument object compiled from the CLI |
+| `xd <device> --json '<payload>'` | invoke with a raw JSON object instead of schema-derived flags |
+
+Catalog listing and search accept `--q TEXT`, repeatable `--tag TAG`,
+`--provenance OWNER`, `--offset N`, `--limit N`, `--depth N`, and
+`--under SUBTREE`. A bare `xd` is the full listing. `--under` limits the
+catalog to a subtree; the other flags filter or page the same live catalog.
+
+`xd <device> --help`, `xd <device> -h`, `xd <device> help`, and
+`xd help <device>` return the same authoritative device documentation plus
+the compiler's deterministic usage and flags block. A schema whose root
+cannot be represented as flags still has a complete invocation surface:
+help says that it accepts only `--json '<payload>'`.
+
+The schema-to-CLI compiler obeys these rules:
+
+| Rule | Mapping |
+|---|---|
+| R1/R2 | Up to the first two entries in the root `required` array whose schemas are scalar (`string`, `integer`, `number`, or `boolean`) or enums become positionals, in required-array order. Every other leaf is a flag. |
+| R3 | A plain `boolean` leaf is `--flag` / `--no-flag` and takes no value token. |
+| R4 | An `enum` takes one value and validates it against the declared members; usage renders `{a\|b\|c}`. |
+| R5 | An array of scalar items is a repeatable flag. Every occurrence is also comma-split: `-l a,b -l c` becomes `["a", "b", "c"]`, with each item coerced by the item schema. |
+| R6 | Nested objects with `properties` flatten to dotted flags. Path segments replace `_` with `-`, so `pr_meta.priority` becomes `--pr-meta.priority`. A child's requiredness propagates only when its parent is required. |
+| R7 | An object with `additionalProperties` is a repeatable `--flag KEY=VALUE`; each value is coerced by the `additionalProperties` schema. |
+| R8 | A string leaf named `content`, `body`, `sql`, `text`, `data`, `message`, or `query_text`, or with `maxLength > 1024`, is blob-capable. A literal stays literal, `@path` reads a UTF-8 file relative to the shell's current directory, and `-` reads standard input. This applies to flags and positionals. |
+| R9 | A root `oneOf` whose every branch has exactly one `const` property becomes subcommands. The first token selects the branch; the discriminator is injected into the JSON object and is never exposed as a flag. A missing or unknown token reports the valid variants. |
+| R10 | `--json '<payload>'` (or `-j`) is accepted only as the first argument after the device path, or after an R9 subcommand token. It must decode to a JSON object, is used verbatim, and rejects all additional argv; an R9 discriminator is still injected. |
+| R11 | Short flags use the first available ASCII letter in each long name, assigned in schema-property order. Already-taken letters are skipped; `h` and `j` are reserved for help and JSON. |
+
+For every flag, both `--flag value` and `--flag=value` are accepted. Scalar
+strings, integers, numbers, and booleans are coerced to their JSON types.
+Arrays of objects, `anyOf`, typeless leaves, and other non-mappable leaf
+shapes fall back to a value parsed as JSON when possible and otherwise kept
+as a string. Properties named `i` are ordinary optional flags. Defaults are
+not injected: absent CLI arguments remain absent so device-side schema
+defaults apply. Unknown flags report a near spelling when one is sufficiently
+close; missing required leaves and invalid scalar values fail before dispatch.
+
+For example:
+
 ```
-
-A **flat** object: `do_` is `<op>[/<path>]`, and the op's parameters ride
-flattened at top level beside it. No nested `args` object, no per-op variant
-schemas — the flatness is what keeps the slot byte-stable forever, and the
-prompt-cache argument is exactly that: `dyn` is one stable schema slot, and
-everything that varies — the catalog, the docs, the results — is
-model-visible *content*, never schema. A device mounting, a docs edit, a
-thousand MCP endpoints appearing: zero cache churn, because nothing in the
-request prefix moved. Anthropic's registered-discovery-tool variant charged a
-cache miss per catalog change; this design charges none.
+→ xd house_lint crates/tool/src --fix
+← 3 findings, 3 fixed. crates/tool/src/registry.rs:412 …
+```
 
 Static routes declared with `Device.subtool` or mounted from `omp.router` are
 separate frozen child declarations. The host projects each child's derived
@@ -1227,108 +1252,57 @@ argument schema, docs, summary, placement, effects, tier, family, and
 precedence at its full concatenated address; dispatch does not fall back to
 the parent's schema or policy metadata.
 
-**Reserved namespace.** A device parameter may not be named `do_`, and
-parameter names ending in `_` are reserved for future envelope growth. A
-declaration that violates either is an **activation-time** `SchemaError` —
-never a runtime surprise, because the collision is knowable at load.
+The first tokens `resolve`, `reject`, and `help` are reserved by the builtin.
+`xd resolve "<one-sentence reason>"` and
+`xd reject "<one-sentence reason>"` finalize the newest pending staged
+proposal directly against the environment registry. A reason is mandatory.
+Devices literally named `resolve`, `reject`, or `help` are therefore
+shadowed by these builtin verbs.
 
-Three ops in v1, shown as the model sees them.
+**Policy: one gate, bound to the resolved target.** A device dispatch fires
+exactly one `tool_call` with
+`target=DeviceCall(path, family, rev, decoded_args)`. `xd` is transport, never
+the dispatch policy subject: no `shell` gate precedes the device gate.
+Catalog and docs reads instead fire `target=CoreTool("shell")`; they are
+CONTROL, no DATA, non-effectful, and remain visible to policy and telemetry
+without prompting.
 
-**`search` — the tree, and the listing.** `{"do_": "search"}` or
-`{"do_": "search/<subpath>"}`, with flat params `q`, `tags`, `limit`,
-`depth`. Search with no `q` *is* the listing; there is no separate `list` op
-to learn. The result is the tool tree: paths, one-line descriptions,
-tier/effects badges, provenance.
+Exit status `0` means a catalog/docs operation or device dispatch completed,
+including a detached dispatch. Status `1` means catalog availability,
+proposal finalization, or device dispatch failed. Status `2` means command
+usage, device lookup, CLI parsing, or required-reason failure. Status `130`
+means the shell cancelled an in-flight dispatch.
 
-```
-→ dyn {"do_": "search", "q": "jira", "limit": 5}
-← jira/                Jira integration (acme/jira-tools)
-←   jira/create       Create an issue.                [WRITE] [net]
-←   jira/transition   Move an issue between states.   [WRITE] [net]
-← house_lint          Lint the workspace against house rules.  [WRITE]
-```
-
-**`docs` — the extended description.** `{"do_": "docs/<path>"}` returns full
-docs, the JSON args schema, worked examples, the effects envelope, the tier,
-and the provenance septet. This is the only docs surface; there is no
-parallel read-URL rendering to drift from.
-
-```
-→ dyn {"do_": "docs/house_lint"}
-← house_lint @ acme/house-tools — Lint the workspace against house rules.
-← args: { "path": string — File, directory, or glob to lint.,
-←         "fix":  boolean = false — Apply mechanical fixes. }
-← effects: documents.read, documents.write("**"), exec("ruff")   tier: WRITE
-← example: {"do_": "invoke/house_lint", "path": "crates/tool/src"}
-```
-
-**`invoke` — dispatch.** `{"do_": "invoke/<path>", ...}` with the device's
-arguments flattened at top level:
-
-```
-→ dyn {"do_": "invoke/house_lint", "path": "crates/tool/src", "fix": true}
-← 3 findings, 3 fixed. crates/tool/src/registry.rs:412 …
-```
-
-**Decode.** The flat map is re-nested against the RESOLVED sub-tool's schema
-at `ARGS_FINALIZED`: everything beside `do_` is lifted into the device's
-argument object and decoded exactly as any tool's arguments are — charitable
-surface repair and every P0#14 strictness rule of
-[docs/py/03-params.md](03-params.md) apply unchanged, and malformed arguments
-echo the resolved schema back for in-place self-correction. By the time the
-body runs, the dispatch has passed `ARGS_FINALIZED`, admission, and
-`EFFECTS_AUTHORIZED`, and what the body receives is the one canonical
-effective object shared with policy, the journal, and telemetry.
-
-**Policy: one gate, bound to the resolved target.** `invoke/<path>` fires
-exactly one `tool_call` with `target=DeviceCall(path, family, rev,
-decoded_args)`. `dyn` is transport, never the policy subject: a guard written
-against the resolved device cannot be bypassed by the envelope, and no policy
-author can gate "calls through dyn" while believing they gated a capability.
-`search` and `docs` are catalog reads — CONTROL, no DATA, non-effectful —
-and fire `tool_call` with `target=CoreTool("dyn")`, so they remain visible to
-policy and telemetry without ever prompting.
-
-**Errors.** An unknown op is a `Fault` listing the valid ops. An unknown path
-is a `Fault` carrying a near-miss tree fragment — an inline search of the
-nearest matches — so the repair is one glance, not a second discovery
-round-trip:
-
-```
-→ dyn {"do_": "invoke/hose_lint", "path": "src"}
-← Fault: no tool at "hose_lint". Nearest:
-←   house_lint    Lint the workspace against house rules.   [WRITE]
-```
+`xd` is reachable only in omp's embedded brush shell. It is not installed in
+external user-shell profiles or ACP-routed commands. Under `tool_only`, the
+builtin is dropped and every declaration surfaces directly as a
+model-facing tool slot; under `auto` and `device_only`, devices remain
+reachable through `xd`.
 
 ### Dispatch semantics
 
 Revision 2 defined dispatch as a JSON write against the retired device URL
-scheme; that surface is deleted and `dyn {"do_": "invoke/<path>", ...}` is
-the dispatch
-spelling — the reversal is recorded in the Purpose section above. The
-deviations Revision 2 handled before decode carry over to the new surface:
+scheme, and Revision 2.1 replaced that with a dedicated tool. Both surfaces
+are deleted; `xd <device> [args…]` in the embedded shell is the dispatch
+spelling. The reversals are recorded in the Purpose section above.
 
-**Help.** An invoke whose only payload beside `do_` is a token in
-`devices.HELP_TOKENS` — empty, `?`, or `help`, case-insensitively,
-whitespace-trimmed — returns the same text as `{"do_": "docs/<path>"}` and
-does not dispatch. This costs one turn and is far cheaper than a failed call
-plus a repair round-trip.
+**Help.** `xd <device> --help` returns the authoritative docs, JSON schema,
+and schema-derived usage without dispatching. `-h`, a `help` token after the
+device, and `xd help <device>` are equivalent.
 
-**The habitual intent field.** omp injects a top-level intent field `i` into
-core tool schemas. Models emit it out of muscle memory into device arguments
-too. A top-level `i` is stripped during re-nesting unless the device's own
-schema declares an `i` property. The device never sees a key it did not ask
-for, and the model is never punished for a habit the harness taught it.
+**The habitual intent field.** A property named `i` has no transport meaning
+and receives no special treatment. When a device schema declares it, it is an
+ordinary optional flag; otherwise `--i` is unknown like any undeclared flag.
 
-**Malformed arguments echo the schema.** A re-nesting failure or a validation
-failure settles `ArgsRejected`
-([docs/py/02-verdicts.md](02-verdicts.md)), whose projection carries: the
-failing path, the expected shape, the resolved device's full schema, and its
-examples. The model self-corrects in place. Validation is scoped to what the
-device actually consumes — an unknown extra key never fails a call — and the
-raw emission is recorded with the repair flagged alongside it, because
-arguments laundered silently cannot be measured. The mechanism is shared with
-core tools and documented in [docs/py/03-params.md](03-params.md).
+**Malformed arguments expose the schema.** CLI compilation, coercion, and
+requiredness failures happen before dispatch, exit 2, and point to
+`xd <device> --help`, where the resolved schema and usage are available.
+Arguments that reach device decoding and fail its validation settle
+`ArgsRejected` ([docs/py/02-verdicts.md](02-verdicts.md)); that projection
+carries the failing path, expected shape, full schema, and examples. The raw
+emission is recorded with the repair flagged alongside it, because arguments
+laundered silently cannot be measured. Device-side validation remains shared
+with core tools and is documented in [docs/py/03-params.md](03-params.md).
 
 ### MCP mounting
 
@@ -1354,7 +1328,7 @@ Surface:
 
 - `omp.mcp.mount(spec: McpMount) -> tuple[Device, ...]` — declare a server and
   mount its endpoints as devices named `<server>.<tool>`
-  (path `github.create_issue` in the `dyn` tree). Returns a handle per mounted endpoint. CONTROL,
+  (path `github.create_issue` in the catalog behind `xd`). Returns a handle per mounted endpoint. CONTROL,
   per-session, fail-closed at load; a server that is unreachable at load mounts
   nothing and emits one notification, rather than failing activation.
 - `omp.mcp.unmount(server: str) -> None` — remove every device from one server and
@@ -1424,8 +1398,8 @@ carried a `mcp` proxy tool with `search` / `list` / `describe` / `call` /
 `status` / `auth_start` / `auth_complete` sub-actions specifically to avoid
 flooding context with hundreds of schemas, then re-introduced the flood by
 dynamically promoting endpoints to real tools and hot-swapping them with
-`setActiveTools` / `unregisterTool`. Under the `dyn` tree, the proxy trick is
-unnecessary — every endpoint is already schema-free until read — and the
+`setActiveTools` / `unregisterTool`. In the catalog behind `xd`, the proxy
+trick is unnecessary — every endpoint is already schema-free until read — and the
 promotion path does not exist, because there is nothing to promote to.
 
 ## Patterns
@@ -1508,7 +1482,7 @@ real session transition and fires only for eager extensions
 | loopback OAuth callback server | `McpAuth.oauth(...)`; the redirect capture is Rust |
 | OS keyring helper subprocess | scoped credential store; see [docs/py/13-inference.md](13-inference.md) |
 | disk metadata cache with TTL | env-side connection state; `mcp.servers()` reads it |
-| `mcp__<server>_<tool>` name mangling | `<server>.<tool>` in the device tree — no wire name to sanitize |
+| `mcp__<server>_<tool>` name mangling | `<server>.<tool>` in the device catalog — no wire name to sanitize |
 | alphabetical sort for cache safety | moot; the array never changes |
 | `/mcp`, `/mcp-auth`, `/mcp-setup`, `/mcp-tools`, `/mcp-prompts` | `@omp.command`, see [docs/py/07-ui.md](07-ui.md) |
 | `createMcpToolResultRenderer` | `@omp.renderer` keyed by `(name, rev)`, see [docs/py/02-verdicts.md](02-verdicts.md) |
@@ -1848,8 +1822,8 @@ scheme's spelling, complete with did-you-mean corrections for its
 misspellings. Those diagnostics predate the Rev 2.1 rulings and now point at
 a surface that no longer exists: the refusal stays (a URI-like write target
 is never valid), but the teaching text must steer to
-`dyn {"do_": "invoke/<tool>", ...}` for dispatch and
-`dyn {"do_": "docs/<tool>"}` for docs, and the retired scheme's spelling is
+`xd <tool> [args…]` for dispatch and
+`xd <tool> --help` for docs, and the retired scheme's spelling is
 removed from the diagnostic strings rather than kept as a museum piece.
 
 **The thing that must be undone.** Today, a Python worker declaration *does*
@@ -1872,10 +1846,11 @@ native or worker-routed, and neither should be advertised — so the fix
 introduces the distinction rather than reusing an approximation of it.
 The target behaviour, stated once so every later section can lean on it: the
 registry's `advertise` emits exactly what the dynamic tool policy resolves —
-under the default `auto`, **core tools + `dyn` + granted hard tools, nothing
-else**. Soft tools, `@omp.device` declarations, MCP endpoints, and shadowed
-claimants are never advertised under `auto` or `device_only`, whatever their
-route; `tool_only` advertises every declaration and drops `dyn`.
+under the default `auto`, **core tools + granted hard tools, nothing else**;
+devices ride the `xd` builtin inside `shell`. Soft tools, `@omp.device`
+declarations, MCP endpoints, and shadowed claimants are never advertised
+under `auto` or `device_only`, whatever their route; `tool_only` advertises
+every declaration and drops `xd`.
 
 `live_hash` (`:458-467`) inherits the same conflation: one digest over every
 live identity, which is only correct while everything live is also advertised.
@@ -1922,15 +1897,15 @@ slotted, and a granted hard tool is slotted whatever its route.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Presentation {
 	/// Advertised in the request tool array and billed to every turn:
-	/// core tools, `dyn`, and granted hard tools.
+	/// core tools and granted hard tools.
 	Slot,
-	/// Reachable only through `dyn`; never advertised.
+	/// Reachable only through the `xd` builtin in `shell`; never advertised.
 	Device,
 }
 ```
 
 `advertise` filters to `Presentation::Slot` — which, per the target behaviour
-above, is core tools + `dyn` + granted hard tools and nothing else. A new
+above, is core tools + granted hard tools and nothing else. A new
 `Registry::devices(&self) -> impl Iterator<Item = MountedDevice<'_>>` yields the
 device set with borrowed name, rev, summary, schema, and docs — no allocation
 per call, and no `Vec` where the caller only iterates.
@@ -2027,14 +2002,13 @@ SIGKILL of the extension's own process group. This document therefore no
 longer claims concurrent device calls are unsafe; they fate-share per
 extension, by design.
 
-### `crates/tools` — the router and the `dyn` core tool
+### `crates/tools` — catalog rendering and the `xd` CLI compiler
 
-A new module, `crates/tools/src/device.rs`, owning the whole transport: path
-parse, tree and catalog render, docs render, flat-map re-nesting, argument
-decode, schema echo, dispatch. The `dyn` core tool is its only caller, so
-there is exactly one implementation of device semantics — and `dyn` is a core
-tool like any other in `crates/app/src/envd/tools.rs`, registered with
-`Presentation::Slot` and versioned with the harness.
+`crates/tools/src/device.rs` owns device catalog, docs, near-miss, and prompt
+rendering. `crates/tools/src/device_ctl.rs` owns the pure schema-to-CLI
+compiler documented above. Envd binds those pieces to the `xd` builtin in the
+embedded shell and owns dispatch. There is one implementation of device
+semantics without a dedicated model-facing transport slot.
 
 The path value mirrors [`omp.ToolPath`](#omptoolpath) on the Rust side:
 
@@ -2054,14 +2028,13 @@ device catalog: a new scheme in `read`'s selector classifier
 catalog handle in `read`'s constructor state, and selector slicing over
 rendered docs. That work is struck, not deferred: with the device URL scheme
 deleted there is nothing for `read` to classify, and `read` never serves
-device content. The one piece worth salvaging moves into `dyn`: a line
-selector on long docs is still useful, so the `docs` op accepts optional
-flat params `offset` and `limit` over the rendered text.
+device content. Catalog pagination belongs to `xd` through `--offset` and
+`--limit`; device docs are rendered by `xd <device> --help`.
 
 **The write side becomes a pure refusal.** `write.rs:736-777` currently
 converts URI-like targets into `Fault::UnsupportedScheme`; that stays a
-refusal, with its diagnostics re-pointed at `dyn` per the seam note above.
-Dispatch faults live on the `dyn` tool itself, which gains one variant:
+refusal, with its diagnostics re-pointed at the `xd` builtin per the seam
+note above. Dispatch faults remain device verdicts projected by the registry:
 
 ```rust
 /// A device dispatch failed before or during the device's own execution.
@@ -2178,19 +2151,19 @@ environment owns the gate and the enforcement. What Core never does is
 schedule: no batch-level admission scheduler, no approval prompts in the
 mailbox loop, no parallelism detection — the scope D6 actually protects,
 now in D6's own amended words (`PLAN.md` §D6; the amendment this
-document once flagged is ratified — see the three-ops section). Agent Core
+document once flagged is ratified — see the `xd` path section). Agent Core
 opens the invocation, relays fragments, sends one commit frame, holds the
 RAII guard (`crates/agent/src/batch.rs:360-420`), and gates each invocation
-independently, so one slow approval never serializes the batch. The path
-resolution and flat-map re-nesting still happen env-side in the device
+independently, so one slow approval never serializes the batch. Path
+resolution and schema-derived CLI nesting happen env-side in the device
 router, which is where the schema and the device catalog live anyway.
 
-The practical consequence for this document: nothing in `loop.rs` needs to
-know that devices exist. A device dispatch is a `dyn` invocation like any
-other core-tool invocation until it reaches the router. That is a strictly
-better outcome than the draft it replaces, and it is the second time in this
-document that following a locked decision produced a smaller diff than
-working around it would have.
+The practical consequence for this document: `loop.rs` needs no dedicated
+device transport. The model runs `xd` through `shell`; the env-side builtin
+resolves a dispatch before emitting the one device-targeted policy event.
+That is a strictly better outcome than the draft it replaces, and it is the
+second time in this document that following a locked decision produced a
+smaller diff than working around it would have.
 
 ### Feature-map reconciliation
 
@@ -2227,9 +2200,9 @@ struck from the port tree rather than ported:
    the transport auto-grant that adds `read`/`write` when devices are mounted
    (`tools-misc.md:47`). All three are artifacts of the old design
    retrofitting device dispatch over the core `read`/`write` tools of a
-   slotted registry. In omp the transport is the `dyn` core tool,
-   unconditionally present, so there is nothing to switch and nothing to
-   auto-grant; the keep-top-level and transport-tool constants of
+   slotted registry. In omp the transport is the `xd` builtin inside the
+   embedded `shell`, so there is no dedicated slot to switch or auto-grant;
+   the keep-top-level and transport-tool constants of
    `tools-misc.md:48-49` similarly have no referent.
 3. `mcp.md:149` — `mcp__<server>_<tool>` naming with dedup and redundant-prefix
    stripping. Device names appear only in tree paths and docs, so the mangling
@@ -2290,23 +2263,14 @@ a runtime flag flipping a device into the request array mid-session. If a
 capability outgrows even that, it deserves harness ownership, review, and a
 rev history — a core tool, by pull request.
 
-**Whether the transport should be a dedicated tool instead of `read`/`write`
-overloading.** Revision 2 kept dispatch on the core `read`/`write` tools via
-the retired device URL scheme and committed the choice to measurement: a
-six-axis benchmark against a dedicated core tool with
-`op: list | search | describe | call` (UX#4). That benchmark is superseded,
-and honestly: the question it was designed to answer has been decided by
-user fiat, not by the measurement it was promised — the transport is the
-dedicated `dyn` core tool with the `do_` grammar, and no URI form remains to
-compare against. What survives is the measurement *appetite*, re-pointed at
-the questions that still have empirical answers: `do_` grammar variants
-(op-in-path, as shipped, versus split op/path fields), discovery quality
-(does the tree-with-badges search find the right device first?), and the
-malformed-call rate on weaker local models. The axes that mattered —
-successful discovery rate, malformed-call rate, token cost — carry over;
-the tool-vs-URI axis is retired with the scheme. If a grammar variant wins,
-the investment goes into the catalog: structured search, pagination, tags,
-and provenance filters rather than one alphabetical listing.
+**Whether the transport should occupy a dedicated tool slot.** No. Revision 2
+used the core `read`/`write` tools via the retired device URL scheme, and
+Revision 2.1 replaced that with a dedicated tool. Revision 2.2 removes the
+dedicated slot and installs `xd` inside the embedded `shell`. The useful
+measurement questions now concern discovery quality, schema-to-CLI repair
+rates on weaker models, and token cost. If a grammar variant wins, the
+investment goes into the catalog and CLI compiler: structured search,
+pagination, tags, provenance filters, and deterministic usage.
 
 ### Performance consequences
 
@@ -2325,13 +2289,12 @@ Under omp's allocation and async discipline:
 - **No `BoxFuture` on the device path.** The router's parse, catalog, and docs
   functions are synchronous and borrow-returning. `ErasedStream` is already
   `Pin<Box<dyn Stream>>` (`registry.rs:88-89`), allocated exactly once per
-  invocation at a cold dyn boundary whose latency is dominated by real I/O —
-  the sanctioned exception, not a new one. Everything above it is RPITIT.
-- **Arguments cross as `Bytes`, not `String`.** The `dyn` invocation's raw
-  argument text is a `Str` whose heap side is already `Bytes`, so the
-  `args_json` field of `InvokeTool` (`toolhost.proto:71`) is a zero-copy
-  handoff after re-nesting. No re-encode between the model's emission and
-  the interpreter.
+  invocation at the cold device boundary whose latency is dominated by real
+  I/O — the sanctioned exception, not a new one. Everything above it is RPITIT.
+- **Arguments cross as `Bytes`, not `String`.** The builtin serializes the
+  schema-derived nested JSON object once into the `args_json` field of
+  `InvokeTool` (`toolhost.proto:71`); the device boundary does not add a
+  second textual envelope.
 - **Availability deltas batch.** One `SetAvailability` frame, one system item,
   one journal entry per `devices.refresh()`, regardless of device count. The
   alternative — one frame per device — is how a fifty-endpoint MCP server would
@@ -2351,9 +2314,8 @@ Under omp's allocation and async discipline:
 | malformed device declaration | fail-closed at load; extension activation aborts, structured error names the field |
 | precedence tie | fail-closed at load; both claimants and both packages named |
 | `available` predicate raises | device unmounted, traceback journaled, one notification with the exception text as `reason` |
-| unknown `do_` op | structured `dyn` fault listing the valid ops (`search`, `docs`, `invoke`) |
-| unknown device path in `invoke`/`docs` | structured `dyn` fault carrying a near-miss tree fragment from the live catalog |
-| parameter named `do_` or ending in `_` | fail-closed at activation; `SchemaError` names the parameter and the reserving rule |
+| unknown `xd` command or flag | exit 2 with a usage error and, for close flag spellings, a suggestion |
+| unknown device path in invoke/help | exit 2 with a near-miss fragment from the live catalog |
 | malformed device arguments | structured fault whose projection is the schema echo plus examples; raw emission recorded with the repair flagged |
 | device body raises | a known `EnvError` is lowered to a `Faulted` outcome carrying its `fault` value; any other exception settles `Aborted`; ad-hoc error strings are not representable ([docs/py/02-verdicts.md](02-verdicts.md)) |
 | deadline exceeded | invocation guard drops; for a Python device that is SIGKILL of the owning extension's process group + respawn per D5, so **that extension's concurrent calls die with it** — other extensions are untouched, and `--pool` widens the fate-sharing only by explicit opt-in; the call settles `Aborted` |
@@ -2599,3 +2561,22 @@ Changes this file made applying the Rev 2.1 rulings, each reversal in prose:
   specifies one supervised worker process per active extension
   (`PLAN.md` §D5/§D6). Every "amendment recommended" passage in this
   file now cites the amended text as ratified.
+
+**Revision 2.2** — the `xd` shell-builtin transport ruling: the dedicated
+`dyn` core tool and its `do_` envelope are deleted. Devices are discovered,
+documented, and dispatched through the `xd` builtin of the embedded shell,
+inside the core `shell` tool: `xd` lists the catalog (`xd --q <text>`
+searches), `xd <device> --help` returns docs plus schema-derived CLI usage,
+and `xd <device> [args…]` (or `xd <device> --json '<payload>'`) invokes —
+arguments arrive as one nested JSON document mapped from the CLI
+([01-devices.md](01-devices.md) owns the schema→CLI grammar). Staged-proposal
+resolution is `xd resolve "<reason>"` / `xd reject "<reason>"`. The
+`do_`/trailing-underscore reserved-parameter rule is deleted with the
+envelope. The one-gate rule transfers intact: an `xd` device dispatch fires
+one `tool_call` with the RESOLVED `target=DeviceCall(...)`; catalog and docs
+reads fire `target=CoreTool("shell")` — the builtin is transport, never the
+policy subject. The model's tool array shrinks by the `dyn` slot; a device
+still has no schema in the request. This file replaces its live transport
+table, ruling record, sequence, reference, policy, build, and failure prose
+with the authoritative `xd` catalog and schema-to-CLI contract, and deletes
+the live reserved-parameter `SchemaError` rulings.

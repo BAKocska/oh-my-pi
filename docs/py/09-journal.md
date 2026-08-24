@@ -1178,12 +1178,14 @@ extensions instead returned `/tmp` paths and hoped.
 
 The sanctioned way to add capability is a device. This is worth being exact
 about, because it is the one place where minting an address and registering a
-schema are easy to confuse: `@omp.device` places a name in the `dyn` tool tree
-(a typed `omp.ToolPath`, `docs/py/01-devices.md`) with docs and a JSON schema the
-model fetches on demand (`{"do_": "docs/<name>"}`) and discovers by search
-(`{"do_": "search"}`), and it adds **zero** registered tool slots to any request;
-invocation rides the `dyn` core tool (`{"do_": "invoke/<name>", …}`), and no URL
-scheme is ever writable by declaring a device. Availability changes arrive as one
+schema are easy to confuse: `@omp.device` places a typed `omp.ToolPath`
+(`docs/py/01-devices.md`) in the device catalog behind the `xd` shell builtin,
+with docs and a JSON schema the model fetches on demand with
+`xd <name> --help` and discovers with `xd` or `xd --q <text>`. It adds **zero**
+registered tool slots to any request; invocation runs `xd <name> [args…]` inside
+the core `shell` tool, where the schema-derived CLI maps arguments into one nested
+JSON document. No URL scheme is ever writable by declaring a device. Availability
+changes arrive as one
 system-notification thread item, never as a mutation of the request's tool array,
 so the prompt prefix cache survives (`docs/py/01-devices.md`). An extension never
 registers anything with the model. (Rev 2 modeled the device catalog as a mintable
@@ -1886,7 +1888,7 @@ in shipped code.** `Registry::register_worker` inserts worker declarations into
 `advertise` (`:483-492`) lowers every `self.live` entry with no route filter
 despite a comment describing "one selected route." So a Python worker declaration
 occupies a slot in the model's advertised tool array today — exactly the failure
-the `dyn` device design exists to prevent, and exactly what the device paragraph
+the `xd` device transport exists to prevent, and exactly what the device paragraph
 under `omp.Scheme` describes as costing "zero registered tool slots." That design is the target. The
 fix is clean because route-awareness already exists elsewhere: `invoke` checks
 route and refuses `ToolRoute::Worker` (`:476-478`), and `live_identities`
@@ -2497,3 +2499,7 @@ Changes this file made in response to the external review, by review point:
   worker processes keyed `(layer, tier, extension)`, pooling as opt-in fate-sharing,
   durable approval tickets (`PLAN.md` §D5) — where Rev 2 flagged it as a
   recommendation. The Rev 2 flags are kept in prose as historical records.
+
+**Revision 2.2** — the `xd` shell-builtin transport ruling: the dedicated `dyn` core tool and its `do_` envelope are deleted. Devices are discovered, documented, and dispatched through the `xd` builtin of the embedded shell, inside the core `shell` tool: `xd` lists the catalog (`xd --q <text>` searches), `xd <device> --help` returns docs plus schema-derived CLI usage, and `xd <device> [args…]` (or `xd <device> --json '<payload>'`) invokes — arguments arrive as one nested JSON document mapped from the CLI ([01-devices.md](01-devices.md) owns the schema→CLI grammar). Staged-proposal resolution is `xd resolve "<reason>"` / `xd reject "<reason>"`. The `do_`/trailing-underscore reserved-parameter rule is deleted with the envelope. The one-gate rule transfers intact: an `xd` device dispatch fires one `tool_call` with the RESOLVED `target=DeviceCall(...)`; catalog and docs reads fire `target=CoreTool("shell")` — the builtin is transport, never the policy subject. The model's tool array shrinks by the `dyn` slot; a device still has no schema in the request.
+
+- **Journal and scheme prose.** The live minting-versus-registering account now uses `xd` catalog, help, and invocation commands, identifies `shell` as the transport's core-tool target, and keeps devices out of the model's registered tool slots.
