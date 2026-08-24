@@ -102,7 +102,8 @@ impl ApprovalOverlay {
 			| UiEvent::Filtered { .. }
 			| UiEvent::Highlighted { .. }
 			| UiEvent::Pressed(_)
-			| UiEvent::Copied(_) => ApprovalEvent::Consumed,
+			| UiEvent::Copied(_)
+			| UiEvent::DiffAction { .. } => ApprovalEvent::Consumed,
 		}
 	}
 }

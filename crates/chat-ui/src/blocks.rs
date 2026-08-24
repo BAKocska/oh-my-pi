@@ -14,8 +14,8 @@
 //! native history. [`Blocks::retirement_batch`] exposes only the maximal
 //! finalized prefix at the monotonic commit frontier. Allocation never
 //! changes that frontier, and retirement never selects a block across an
-//! unfinished predecessor. [`Blocks::reset_retirement`] rewinds the frontier
-//! so a display replay can re-retire the complete finalized transcript.
+//! unfinished predecessor. Display replay is owned separately by the scene
+//! and never rewinds this logical frontier.
 
 use std::ops::Range;
 
@@ -35,7 +35,8 @@ pub enum BlockPhase {
 	Queued,
 	/// Admitted to the live viewport allocator.
 	Active,
-	/// Finalized and waiting for its exit bridge and  ordered retirement.
+	/// Finalized, removed from active sampling, and waiting for ordered
+	/// retirement.
 	FinalizedPending,
 	/// Successfully retired into native history.
 	Committed,
@@ -53,19 +54,19 @@ pub struct BlockTarget {
 /// Viewport-only fallback when all active blocks cannot each occupy one row.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Overflow {
-	/// Most-recent active blocks that retain a visible row, in ordinal order.
+	/// Most-recent active blocks that fit the caller-supplied row budget.
 	pub visible: SmallVec<BlockOrdinal, 8>,
-	/// Number of active blocks represented only by the summary row.
+	/// Number of active blocks hidden outside that budget.
 	pub hidden:  u32,
 }
 
 /// Result of one sampled-height allocation step.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Plan {
-	/// Height requests for active blocks and live finalization bridges.
+	/// Height requests for active blocks.
 	///
-	/// Queued, fully hidden finalized, and committed blocks implicitly target
-	/// zero and are omitted.
+	/// Queued, finalized, and committed blocks implicitly target zero and are
+	/// omitted.
 	pub targets:  SmallVec<BlockTarget, 8>,
 	/// Blocks admitted from the FIFO queue during this step.
 	pub admitted: SmallVec<BlockOrdinal, 4>,
@@ -90,6 +91,12 @@ impl Plan {
 struct BlockRecord {
 	phase:  BlockPhase,
 	target: u16,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Admission {
+	Allow,
+	Defer,
 }
 
 /// Ordered block store, sampled-height allocator, and commit frontier.
@@ -120,22 +127,6 @@ impl Blocks {
 	#[must_use]
 	pub fn live_count(&self) -> u64 {
 		self.records.len() as u64 - self.frontier
-	}
-
-	/// Rewinds the commit frontier so a display replay can re-retire the
-	/// complete finalized transcript under the current width.
-	///
-	/// Committed blocks become settled ([`BlockPhase::FinalizedPending`])
-	/// again; active, queued, and already-settled blocks are untouched. The
-	/// caller owns erasing or retaining the native rows the previous
-	/// generation wrote.
-	pub fn reset_retirement(&mut self) {
-		for record in &mut self.records[..self.frontier as usize] {
-			debug_assert_eq!(record.phase, BlockPhase::Committed);
-			record.phase = BlockPhase::FinalizedPending;
-			record.target = 0;
-		}
-		self.frontier = 0;
 	}
 
 	/// Finalizes an active or queued block.
@@ -169,6 +160,27 @@ impl Blocks {
 		h_live: u16,
 		sampled: impl Fn(BlockOrdinal) -> u16,
 		natural: impl Fn(BlockOrdinal) -> u16,
+	) -> Plan {
+		self.tick_with(h_live, sampled, natural, Admission::Allow)
+	}
+
+	/// Computes contraction targets without admitting queued blocks while a
+	/// terminal retirement transaction is still unacknowledged.
+	pub(crate) fn tick_without_admission(
+		&mut self,
+		h_live: u16,
+		sampled: impl Fn(BlockOrdinal) -> u16,
+		natural: impl Fn(BlockOrdinal) -> u16,
+	) -> Plan {
+		self.tick_with(h_live, sampled, natural, Admission::Defer)
+	}
+
+	fn tick_with(
+		&mut self,
+		h_live: u16,
+		sampled: impl Fn(BlockOrdinal) -> u16,
+		natural: impl Fn(BlockOrdinal) -> u16,
+		admission: Admission,
 	) -> Plan {
 		let mut samples = SmallVec::<Sample, 8>::new();
 		let mut active_ordinals = SmallVec::<BlockOrdinal, 8>::new();
@@ -214,7 +226,7 @@ impl Blocks {
 		}
 
 		let mut free = u32::from(h_live).saturating_sub(occupied);
-		if queue_waiting {
+		if queue_waiting && admission == Admission::Allow {
 			for (index, record) in self.records.iter_mut().enumerate() {
 				if free == 0 {
 					break;
@@ -229,7 +241,7 @@ impl Blocks {
 				plan.admitted.push(ordinal);
 				free -= 1;
 			}
-		} else {
+		} else if !queue_waiting {
 			for (sample, target) in samples.iter().zip(plan.targets.iter_mut()) {
 				if free == 0 {
 					break;
@@ -311,7 +323,7 @@ impl Blocks {
 		samples: &[Sample],
 		active_ordinals: &[BlockOrdinal],
 	) -> Plan {
-		let visible_count = usize::from(h_live.saturating_sub(1)).min(active_ordinals.len());
+		let visible_count = usize::from(h_live).min(active_ordinals.len());
 		let visible = active_ordinals[active_ordinals.len() - visible_count..]
 			.iter()
 			.copied()
@@ -542,28 +554,6 @@ mod tests {
 	}
 
 	#[test]
-	fn reset_retirement_reopens_the_committed_prefix_for_replay() {
-		let mut blocks = Blocks::new();
-		let first = blocks.create();
-		let second = blocks.create();
-		blocks.tick(2, |_| 0, |_| 1);
-		assert!(blocks.finalize(first));
-		blocks.mark_committed(1);
-		assert_eq!(blocks.live_count(), 1);
-
-		blocks.reset_retirement();
-		assert_eq!(blocks.frontier(), 0);
-		assert_eq!(blocks.live_count(), 2);
-		assert_eq!(blocks.phase(first), Some(BlockPhase::FinalizedPending));
-		assert_eq!(blocks.phase(second), Some(BlockPhase::Active));
-		// The replayed prefix retires in the original order, stopping at the
-		// still-active successor.
-		assert_eq!(blocks.retirement_batch(), Some(0..1));
-		blocks.mark_committed(1);
-		assert_eq!(blocks.frontier(), 1);
-	}
-
-	#[test]
 	fn concurrent_lagging_shrink_and_expand_never_overgrant_rows() {
 		let mut budget = Blocks::new();
 		let growing = budget.create();
@@ -622,10 +612,10 @@ mod tests {
 		blocks.tick(3, |_| 0, |_| 1);
 		let plan = blocks.tick(2, |_| 1, |_| 1);
 		let overflow = plan.overflow.as_ref().expect("active overflow");
-		assert_eq!(overflow.visible.as_slice(), &[third]);
-		assert_eq!(overflow.hidden, 2);
+		assert_eq!(overflow.visible.as_slice(), &[second, third]);
+		assert_eq!(overflow.hidden, 1);
 		assert_eq!(plan.target(first), Some(0));
-		assert_eq!(plan.target(second), Some(0));
+		assert_eq!(plan.target(second), Some(1));
 		assert_eq!(plan.target(third), Some(1));
 		assert_eq!(blocks.frontier(), 0);
 		assert!(blocks.retirement_batch().is_none());
@@ -775,7 +765,7 @@ mod tests {
 				let target_sum = plan.targets.iter().map(|target| u32::from(target.height)).sum::<u32>();
 				prop_assert!(target_sum <= u32::from(h_live));
 				if let Some(overflow) = &plan.overflow {
-					prop_assert!(overflow.visible.len() <= usize::from(h_live.saturating_sub(1)));
+					prop_assert!(overflow.visible.len() <= usize::from(h_live));
 					prop_assert_eq!(
 						overflow.visible.len() as u32 + overflow.hidden,
 						blocks.records.iter().filter(|record| record.phase == BlockPhase::Active).count() as u32,

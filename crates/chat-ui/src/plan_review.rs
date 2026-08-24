@@ -201,7 +201,8 @@ impl PlanReviewOverlay {
 			| UiEvent::Highlighted { .. }
 			| UiEvent::Filtered { .. }
 			| UiEvent::Pressed(_)
-			| UiEvent::Copied(_) => PlanReviewEvent::Consumed,
+			| UiEvent::Copied(_)
+			| UiEvent::DiffAction { .. } => PlanReviewEvent::Consumed,
 		}
 	}
 
@@ -336,8 +337,9 @@ fn line_offsets(text: &str) -> impl Iterator<Item = (usize, &str)> {
 }
 #[cfg(test)]
 mod tests {
-	use super::{PlanReviewEvent, PlanReviewOverlay};
 	use omp_tui::{Key, UiContext};
+
+	use super::{PlanReviewEvent, PlanReviewOverlay};
 
 	#[test]
 	fn save_and_quit_returns_exact_reviewed_markdown() {

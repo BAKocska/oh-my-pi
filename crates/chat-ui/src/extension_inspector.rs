@@ -65,47 +65,47 @@ pub enum ExtensionDisposition {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExtensionOrigin {
 	/// Stable discovery provider ID.
-	pub provider_id: Str,
+	pub provider_id:   Str,
 	/// Human-readable provider name.
 	pub provider_name: Str,
 	/// Canonical source file or manifest path.
-	pub path: Str,
+	pub path:          Str,
 	/// Source scope (`project`, `user`, `package`, `native`, or `built-in`).
-	pub scope: Str,
+	pub scope:         Str,
 	/// Project label used in compact list hints.
-	pub project: Option<Str>,
+	pub project:       Option<Str>,
 	/// Whether the source authority forbids local mutation.
-	pub read_only: bool,
+	pub read_only:     bool,
 }
 
 /// One live custom tool from a single session catalog snapshot.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LiveToolView {
 	/// Runtime tool name.
-	pub name: Str,
+	pub name:         Str,
 	/// Optional runtime display label.
-	pub label: Option<Str>,
+	pub label:        Option<Str>,
 	/// Optional runtime description.
-	pub description: Option<Str>,
+	pub description:  Option<Str>,
 	/// JSON Schema input contract.
 	pub input_schema: Value,
 	/// Authoritative originating source file, when known.
-	pub source_path: Option<Str>,
+	pub source_path:  Option<Str>,
 	/// Whether the tool is hidden from default discovery.
-	pub hidden: bool,
+	pub hidden:       bool,
 	/// Runtime source class (`extension`, `builtin`, `mcp`, or `sdk`).
-	pub source: Str,
+	pub source:       Str,
 }
 
 /// One MCP tool catalog entry.
 #[derive(Clone, Debug, PartialEq)]
 pub struct McpToolView {
 	/// Protocol tool name.
-	pub name: Str,
+	pub name:         Str,
 	/// Optional protocol title.
-	pub title: Option<Str>,
+	pub title:        Option<Str>,
 	/// Optional protocol description.
-	pub description: Option<Str>,
+	pub description:  Option<Str>,
 	/// MCP `inputSchema`.
 	pub input_schema: Value,
 }
@@ -114,9 +114,9 @@ pub struct McpToolView {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct McpCatalogEntry {
 	/// Protocol entry name.
-	pub name: Str,
+	pub name:        Str,
 	/// Optional protocol title.
-	pub title: Option<Str>,
+	pub title:       Option<Str>,
 	/// Optional protocol description.
 	pub description: Option<Str>,
 }
@@ -141,29 +141,29 @@ pub enum McpHealth {
 #[derive(Clone, Debug, PartialEq)]
 pub struct McpLiveSnapshot {
 	/// Declared server name used for the join.
-	pub server: Str,
+	pub server:           Str,
 	/// Current lifecycle health.
-	pub health: McpHealth,
+	pub health:           McpHealth,
 	/// Monotone connection generation.
-	pub generation: u64,
+	pub generation:       u64,
 	/// Monotone definition catalog epoch.
 	pub definition_epoch: u64,
 	/// Server implementation name.
-	pub implementation: Option<Str>,
+	pub implementation:   Option<Str>,
 	/// Server implementation version.
-	pub version: Option<Str>,
+	pub version:          Option<Str>,
 	/// Server-provided title.
-	pub title: Option<Str>,
+	pub title:            Option<Str>,
 	/// Server-provided description.
-	pub description: Option<Str>,
+	pub description:      Option<Str>,
 	/// Initialize instructions.
-	pub instructions: Option<Str>,
+	pub instructions:     Option<Str>,
 	/// Live tool catalog.
-	pub tools: Vec<McpToolView>,
+	pub tools:            Vec<McpToolView>,
 	/// Live resource catalog.
-	pub resources: Vec<McpCatalogEntry>,
+	pub resources:        Vec<McpCatalogEntry>,
 	/// Live prompt catalog.
-	pub prompts: Vec<McpCatalogEntry>,
+	pub prompts:          Vec<McpCatalogEntry>,
 }
 
 /// Kind-specific declared inspector facts.
@@ -174,7 +174,7 @@ pub enum ExtensionDetail {
 	/// Declared custom-tool schema before the live join.
 	Tool {
 		/// Static description.
-		description: Option<Str>,
+		description:  Option<Str>,
 		/// Static input schema.
 		input_schema: Value,
 	},
@@ -183,36 +183,36 @@ pub enum ExtensionDetail {
 		/// Transport label.
 		transport: Str,
 		/// Command or URL.
-		endpoint: Option<Str>,
+		endpoint:  Option<Str>,
 		/// Static command arguments.
-		args: Vec<Str>,
+		args:      Vec<Str>,
 		/// Number of declared environment variables.
 		env_count: usize,
 	},
 	/// Slash-command metadata and parsed body.
 	SlashCommand {
 		/// Parsed frontmatter description.
-		description: Option<Str>,
+		description:   Option<Str>,
 		/// Parsed argument hint.
 		argument_hint: Option<Str>,
 		/// Body with frontmatter removed, including an intentionally empty body.
-		body: Str,
+		body:          Str,
 	},
 	/// Named preview section used by rules, skills, prompts, and instructions.
 	Document {
 		/// Preview heading.
 		heading: Str,
 		/// Parsed body.
-		body: Str,
+		body:    Str,
 		/// Compact applicability or discovery facts.
-		facts: Vec<(Str, Str)>,
+		facts:   Vec<(Str, Str)>,
 	},
 	/// Hook timing and target.
 	Hook {
 		/// Hook phase.
 		phase: Str,
 		/// Tool selector.
-		tool: Str,
+		tool:  Str,
 	},
 }
 
@@ -220,23 +220,23 @@ pub enum ExtensionDetail {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ExtensionRow {
 	/// Stable row identity; source path distinguishes same-name losers.
-	pub id: Str,
+	pub id:          Str,
 	/// Capability family.
-	pub kind: ExtensionKind,
+	pub kind:        ExtensionKind,
 	/// Stable capability name.
-	pub name: Str,
+	pub name:        Str,
 	/// Optional human-readable description.
 	pub description: Option<Str>,
 	/// Discovery provenance.
-	pub origin: ExtensionOrigin,
+	pub origin:      ExtensionOrigin,
 	/// Winner, disabled winner, or shadowed loser.
 	pub disposition: ExtensionDisposition,
 	/// Kind-specific static facts.
-	pub detail: ExtensionDetail,
+	pub detail:      ExtensionDetail,
 	/// Live tools joined from the same source file.
-	pub live_tools: Vec<LiveToolView>,
+	pub live_tools:  Vec<LiveToolView>,
 	/// Live MCP snapshot, joined only onto the effective winner.
-	pub mcp: Option<McpLiveSnapshot>,
+	pub mcp:         Option<McpLiveSnapshot>,
 }
 
 impl ExtensionRow {
@@ -244,12 +244,17 @@ impl ExtensionRow {
 	pub fn toggleable(&self) -> bool {
 		!self.origin.read_only
 			&& !matches!(self.disposition, ExtensionDisposition::Shadowed { .. })
-			&& !matches!(self.kind, ExtensionKind::ContextFile | ExtensionKind::Prompt | ExtensionKind::Instruction)
+			&& !matches!(
+				self.kind,
+				ExtensionKind::ContextFile | ExtensionKind::Prompt | ExtensionKind::Instruction
+			)
 	}
 
 	/// Returns the enablement value requested by a toggle.
 	pub fn toggled_enabled(&self) -> Option<bool> {
-		self.toggleable().then(|| matches!(self.disposition, ExtensionDisposition::Disabled { .. }))
+		self
+			.toggleable()
+			.then(|| matches!(self.disposition, ExtensionDisposition::Disabled { .. }))
 	}
 }
 
@@ -257,7 +262,7 @@ impl ExtensionRow {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ExtensionSnapshot {
 	/// Declared rows in registry precedence order.
-	pub rows: Vec<ExtensionRow>,
+	pub rows:       Vec<ExtensionRow>,
 	/// Generation shared by declared and live facts.
 	pub generation: u64,
 }
@@ -269,7 +274,10 @@ impl ExtensionSnapshot {
 		let mut exact = BTreeMap::<Str, LiveToolView>::new();
 		for tool in live_tools {
 			if let Some(path) = tool.source_path.as_deref() {
-				by_path.entry(normalize_source_path(path)).or_default().push(tool.clone());
+				by_path
+					.entry(normalize_source_path(path))
+					.or_default()
+					.push(tool.clone());
 			} else if tool.source.as_str() == "extension" {
 				exact.insert(tool.name.clone(), tool.clone());
 			}
@@ -289,7 +297,8 @@ impl ExtensionSnapshot {
 		}
 	}
 
-	/// Replaces one server's live catalog without dropping unrelated connected servers.
+	/// Replaces one server's live catalog without dropping unrelated connected
+	/// servers.
 	pub fn merge_mcp(&mut self, update: McpLiveSnapshot) {
 		for row in &mut self.rows {
 			if row.kind == ExtensionKind::Mcp
@@ -327,7 +336,7 @@ pub enum ExtensionInspectorEvent {
 	/// Request an item-level enablement change.
 	Toggle {
 		/// Stable row identity.
-		id: Str,
+		id:      Str,
 		/// Requested enabled value.
 		enabled: bool,
 	},
@@ -335,15 +344,15 @@ pub enum ExtensionInspectorEvent {
 
 /// Retained two-pane `/extensions` overlay.
 pub struct ExtensionInspector {
-	ui: Ui,
-	ctx: UiContext,
-	options: OverlayOptions,
-	snapshot: ExtensionSnapshot,
-	selected: usize,
-	expanded: bool,
-	inspector_top: usize,
+	ui:             Ui,
+	ctx:            UiContext,
+	options:        OverlayOptions,
+	snapshot:       ExtensionSnapshot,
+	selected:       usize,
+	expanded:       bool,
+	inspector_top:  usize,
 	inspector_rows: u16,
-	width: u16,
+	width:          u16,
 }
 
 impl ExtensionInspector {
@@ -377,7 +386,11 @@ impl ExtensionInspector {
 
 	/// Replaces declared and live facts while preserving selection by stable ID.
 	pub fn update_snapshot(&mut self, snapshot: ExtensionSnapshot) {
-		let selected = self.snapshot.rows.get(self.selected).map(|row| row.id.clone());
+		let selected = self
+			.snapshot
+			.rows
+			.get(self.selected)
+			.map(|row| row.id.clone());
 		self.snapshot = snapshot;
 		self.selected = selected
 			.as_ref()
@@ -398,7 +411,8 @@ impl ExtensionInspector {
 		self.update_snapshot(source.snapshot());
 	}
 
-	/// Merges a connection/catalog event and repaints without replacing other servers.
+	/// Merges a connection/catalog event and repaints without replacing other
+	/// servers.
 	pub fn update_mcp(&mut self, update: McpLiveSnapshot) {
 		self.snapshot.merge_mcp(update);
 		self.rebuild();
@@ -450,7 +464,10 @@ impl ExtensionInspector {
 		kind: Mouse,
 		viewport: Size,
 	) -> ExtensionInspectorEvent {
-		match self.ui.handle_mouse_as_layer(&self.options, viewport, col, row, kind) {
+		match self
+			.ui
+			.handle_mouse_as_layer(&self.options, viewport, col, row, kind)
+		{
 			Some(event) => self.route(event),
 			None if kind == Mouse::Click => ExtensionInspectorEvent::Close,
 			None => ExtensionInspectorEvent::Consumed,
@@ -459,7 +476,10 @@ impl ExtensionInspector {
 
 	/// Returns the responsive full-width overlay layer.
 	pub fn layer(&mut self, viewport: Size) -> Layer<'_> {
-		let rows = viewport.height.saturating_sub(FRAME_ROWS).max(MIN_INSPECTOR_ROWS);
+		let rows = viewport
+			.height
+			.saturating_sub(FRAME_ROWS)
+			.max(MIN_INSPECTOR_ROWS);
 		if rows != self.inspector_rows || viewport.width != self.width {
 			self.inspector_rows = rows;
 			self.width = viewport.width;
@@ -525,9 +545,9 @@ impl ExtensionInspector {
 
 #[derive(Clone)]
 struct InspectorLine {
-	text: Str,
+	text:  Str,
 	color: &'static str,
-	bold: bool,
+	bold:  bool,
 }
 
 impl InspectorLine {
@@ -557,7 +577,11 @@ fn build(
 	width: u16,
 	ctx: &UiContext,
 ) -> Ui {
-	let list_width = if width >= 78 { width.saturating_mul(2) / 5 } else { width.saturating_sub(4) };
+	let list_width = if width >= 78 {
+		width.saturating_mul(2) / 5
+	} else {
+		width.saturating_sub(4)
+	};
 	let list_height = inspector_rows;
 	let list = snapshot
 		.rows
@@ -635,15 +659,23 @@ fn disposition_glyph(row: &ExtensionRow, ctx: &UiContext) -> (Str, &'static str)
 
 fn list_hint(row: &ExtensionRow) -> Str {
 	let detail = match row.kind {
-		ExtensionKind::Tool if row.live_tools.len() > 1 => Some(sf!("{} tools", row.live_tools.len())),
+		ExtensionKind::Tool if row.live_tools.len() > 1 => {
+			Some(sf!("{} tools", row.live_tools.len()))
+		},
 		ExtensionKind::Tool if row.live_tools.iter().any(|tool| tool.hidden) => Some(sf!("hidden")),
 		ExtensionKind::Mcp => row.mcp.as_ref().map(mcp_hint),
-		ExtensionKind::Skill if matches!(&row.detail, ExtensionDetail::Document { facts, .. } if facts.iter().any(|(key, value)| key.as_str() == "discovery" && value.as_str() == "hidden")) => Some(sf!("hidden")),
+		ExtensionKind::Skill if matches!(&row.detail, ExtensionDetail::Document { facts, .. } if facts.iter().any(|(key, value)| key.as_str() == "discovery" && value.as_str() == "hidden")) => {
+			Some(sf!("hidden"))
+		},
 		ExtensionKind::SlashCommand => Some(sf!("/{}", row.name)),
 		ExtensionKind::ContextFile => None,
 		_ => None,
 	};
-	let project = row.origin.project.as_ref().map(|value| sanitize_line(value.as_str()));
+	let project = row
+		.origin
+		.project
+		.as_ref()
+		.map(|value| sanitize_line(value.as_str()));
 	match (detail, project) {
 		(Some(detail), Some(project)) if !detail.eq_ignore_ascii_case(project.as_str()) => {
 			sanitize_line(sf!("{detail} · {project}").as_str())
@@ -659,12 +691,22 @@ fn mcp_hint(snapshot: &McpLiveSnapshot) -> Str {
 		McpHealth::Connected => {
 			let mut parts = vec![sf!("{} tool{}", snapshot.tools.len(), plural(snapshot.tools.len()))];
 			if !snapshot.resources.is_empty() {
-				parts.push(sf!("{} resource{}", snapshot.resources.len(), plural(snapshot.resources.len())));
+				parts.push(sf!(
+					"{} resource{}",
+					snapshot.resources.len(),
+					plural(snapshot.resources.len())
+				));
 			}
 			if !snapshot.prompts.is_empty() {
 				parts.push(sf!("{} prompt{}", snapshot.prompts.len(), plural(snapshot.prompts.len())));
 			}
-			Str::from(parts.iter().map(Str::as_str).collect::<Vec<_>>().join(" · "))
+			Str::from(
+				parts
+					.iter()
+					.map(Str::as_str)
+					.collect::<Vec<_>>()
+					.join(" · "),
+			)
 		},
 		McpHealth::Connecting => Str::new_static("connecting"),
 		McpHealth::Disconnected => Str::new_static("unavailable"),
@@ -691,11 +733,7 @@ fn detail_lines(row: Option<&ExtensionRow>, expanded: bool) -> Vec<InspectorLine
 	if let Some(description) = &row.description {
 		push_collapsible_text(&mut out, description.as_str(), expanded);
 	}
-	out.push(InspectorLine::muted(sf!(
-		"via {} ({})",
-		row.origin.provider_name,
-		row.origin.scope
-	)));
+	out.push(InspectorLine::muted(sf!("via {} ({})", row.origin.provider_name, row.origin.scope)));
 	out.push(InspectorLine::muted(row.origin.path.as_str()));
 	out.push(InspectorLine::plain(""));
 	match &row.detail {
@@ -706,13 +744,13 @@ fn detail_lines(row: Option<&ExtensionRow>, expanded: bool) -> Vec<InspectorLine
 			}
 			let tools = if row.live_tools.is_empty() {
 				vec![LiveToolView {
-					name: row.name.clone(),
-					label: None,
-					description: None,
+					name:         row.name.clone(),
+					label:        None,
+					description:  None,
 					input_schema: input_schema.clone(),
-					source_path: Some(row.origin.path.clone()),
-					hidden: false,
-					source: Str::new_static("extension"),
+					source_path:  Some(row.origin.path.clone()),
+					hidden:       false,
+					source:       Str::new_static("extension"),
 				}]
 			} else {
 				row.live_tools.clone()
@@ -771,7 +809,11 @@ fn detail_lines(row: Option<&ExtensionRow>, expanded: bool) -> Vec<InspectorLine
 }
 
 fn push_tools(out: &mut Vec<InspectorLine>, tools: &[LiveToolView], expanded: bool) {
-	out.push(InspectorLine::muted(if tools.len() == 1 { "Arguments" } else { "Tools" }));
+	out.push(InspectorLine::muted(if tools.len() == 1 {
+		"Arguments"
+	} else {
+		"Tools"
+	}));
 	for tool in tools {
 		if tools.len() > 1 {
 			out.push(InspectorLine::accent(sf!("  {}", tool.name)));
@@ -817,15 +859,12 @@ fn push_mcp(out: &mut Vec<InspectorLine>, row: &ExtensionRow, expanded: bool) {
 		));
 		return;
 	};
-	out.push(InspectorLine::status(
-		snapshot.health.to_string(),
-		match snapshot.health {
-			McpHealth::Connected => "success",
-			McpHealth::Connecting => "accent",
-			McpHealth::Failed => "error",
-			McpHealth::Disconnected | McpHealth::Inactive => "muted",
-		},
-	));
+	out.push(InspectorLine::status(snapshot.health.to_string(), match snapshot.health {
+		McpHealth::Connected => "success",
+		McpHealth::Connecting => "accent",
+		McpHealth::Failed => "error",
+		McpHealth::Disconnected | McpHealth::Inactive => "muted",
+	}));
 	if let Some(title) = &snapshot.title {
 		out.push(InspectorLine::accent(title.as_str()));
 	}
@@ -845,17 +884,21 @@ fn push_mcp(out: &mut Vec<InspectorLine>, row: &ExtensionRow, expanded: bool) {
 		.tools
 		.iter()
 		.map(|tool| LiveToolView {
-			name: tool.name.clone(),
-			label: tool.title.clone(),
-			description: tool.description.clone(),
+			name:         tool.name.clone(),
+			label:        tool.title.clone(),
+			description:  tool.description.clone(),
 			input_schema: tool.input_schema.clone(),
-			source_path: None,
-			hidden: false,
-			source: Str::new_static("mcp"),
+			source_path:  None,
+			hidden:       false,
+			source:       Str::new_static("mcp"),
 		})
 		.collect::<Vec<_>>();
 	if !tools.is_empty() {
-		let shown = if expanded { tools.len() } else { tools.len().min(COLLAPSED_CATALOG_ITEMS) };
+		let shown = if expanded {
+			tools.len()
+		} else {
+			tools.len().min(COLLAPSED_CATALOG_ITEMS)
+		};
 		push_tools(out, &tools[..shown], expanded);
 		if shown < tools.len() {
 			out.push(InspectorLine::muted(sf!("  … {} more · Ctrl+O to expand", tools.len() - shown)));
@@ -865,12 +908,21 @@ fn push_mcp(out: &mut Vec<InspectorLine>, row: &ExtensionRow, expanded: bool) {
 	push_catalog(out, "Prompts", &snapshot.prompts, expanded);
 }
 
-fn push_catalog(out: &mut Vec<InspectorLine>, heading: &str, entries: &[McpCatalogEntry], expanded: bool) {
+fn push_catalog(
+	out: &mut Vec<InspectorLine>,
+	heading: &str,
+	entries: &[McpCatalogEntry],
+	expanded: bool,
+) {
 	if entries.is_empty() {
 		return;
 	}
 	out.push(InspectorLine::muted(heading));
-	let shown = if expanded { entries.len() } else { entries.len().min(COLLAPSED_CATALOG_ITEMS) };
+	let shown = if expanded {
+		entries.len()
+	} else {
+		entries.len().min(COLLAPSED_CATALOG_ITEMS)
+	};
 	for entry in &entries[..shown] {
 		out.push(InspectorLine::accent(sf!("  {}", entry.name)));
 		if let Some(title) = &entry.title
@@ -892,8 +944,16 @@ fn push_collapsible_text(out: &mut Vec<InspectorLine>, text: &str, expanded: boo
 		.lines()
 		.map(Str::new)
 		.collect::<Vec<_>>();
-	let shown = if expanded { lines.len() } else { lines.len().min(COLLAPSED_TEXT_LINES) };
-	out.extend(lines[..shown].iter().map(|line| InspectorLine::plain(line.as_str())));
+	let shown = if expanded {
+		lines.len()
+	} else {
+		lines.len().min(COLLAPSED_TEXT_LINES)
+	};
+	out.extend(
+		lines[..shown]
+			.iter()
+			.map(|line| InspectorLine::plain(line.as_str())),
+	);
 	if shown < lines.len() {
 		out.push(InspectorLine::muted(sf!("… {} more · Ctrl+O to expand", lines.len() - shown)));
 	}
@@ -908,16 +968,24 @@ fn push_preview(out: &mut Vec<InspectorLine>, body: &str, expanded: bool) {
 		.lines()
 		.map(Str::new)
 		.collect::<Vec<_>>();
-	let limit = if expanded { lines.len() } else { lines.len().min(COLLAPSED_CATALOG_ITEMS) };
-	out.extend(lines[..limit].iter().map(|line| InspectorLine::plain(line.as_str())));
+	let limit = if expanded {
+		lines.len()
+	} else {
+		lines.len().min(COLLAPSED_CATALOG_ITEMS)
+	};
+	out.extend(
+		lines[..limit]
+			.iter()
+			.map(|line| InspectorLine::plain(line.as_str())),
+	);
 	if limit < lines.len() {
 		out.push(InspectorLine::muted(sf!("… {} more · Ctrl+O to expand", lines.len() - limit)));
 	}
 }
 
 struct SchemaParam {
-	name: Str,
-	kind: Str,
+	name:        Str,
+	kind:        Str,
 	requirement: Str,
 	description: Option<Str>,
 }
@@ -944,10 +1012,13 @@ fn schema_params(schema: &Value) -> Vec<SchemaParam> {
 				Str::new_static("Optional")
 			};
 			SchemaParam {
-				name: sanitize_line(name),
-				kind: schema_type(value),
+				name:        sanitize_line(name),
+				kind:        schema_type(value),
 				requirement: sanitize_line(requirement.as_str()),
-				description: value.get("description").and_then(Value::as_str).map(sanitize_text),
+				description: value
+					.get("description")
+					.and_then(Value::as_str)
+					.map(sanitize_text),
 			}
 		})
 		.collect()
@@ -956,7 +1027,13 @@ fn schema_params(schema: &Value) -> Vec<SchemaParam> {
 fn schema_type(value: &Value) -> Str {
 	if let Some(kind) = value.get("type").and_then(Value::as_str) {
 		if kind == "array" {
-			return sf!("array<{}>", value.get("items").map(schema_type).unwrap_or_else(|| Str::new_static("any")));
+			return sf!(
+				"array<{}>",
+				value
+					.get("items")
+					.map(schema_type)
+					.unwrap_or_else(|| Str::new_static("any"))
+			);
 		}
 		return sanitize_line(kind);
 	}
@@ -972,7 +1049,8 @@ fn schema_type(value: &Value) -> Str {
 fn compact_default(value: &Value) -> Str {
 	match value {
 		Value::String(value) => sanitize_line(value),
-		_ => serde_json::to_string(value).map_or_else(|_| Str::new_static("?"), |value| sanitize_line(&value)),
+		_ => serde_json::to_string(value)
+			.map_or_else(|_| Str::new_static("?"), |value| sanitize_line(&value)),
 	}
 }
 
@@ -1009,7 +1087,13 @@ fn normalize_source_path(path: &str) -> String {
 			_ => parts.push(part),
 		}
 	}
-	let prefix = if unc { "//" } else if replaced.starts_with('/') { "/" } else { "" };
+	let prefix = if unc {
+		"//"
+	} else if replaced.starts_with('/') {
+		"/"
+	} else {
+		""
+	};
 	format!("{prefix}{}", parts.join("/"))
 }
 
@@ -1028,70 +1112,70 @@ mod tests {
 
 	fn origin(path: &str) -> ExtensionOrigin {
 		ExtensionOrigin {
-			provider_id: Str::new_static("native"),
+			provider_id:   Str::new_static("native"),
 			provider_name: Str::new_static("OMP project"),
-			path: Str::new(path),
-			scope: Str::new_static("project"),
-			project: Some(Str::new_static("demo")),
-			read_only: false,
+			path:          Str::new(path),
+			scope:         Str::new_static("project"),
+			project:       Some(Str::new_static("demo")),
+			read_only:     false,
 		}
 	}
 
 	fn tool_row(id: &str, path: &str) -> ExtensionRow {
 		ExtensionRow {
-			id: Str::new(id),
-			kind: ExtensionKind::Tool,
-			name: Str::new(id),
+			id:          Str::new(id),
+			kind:        ExtensionKind::Tool,
+			name:        Str::new(id),
 			description: None,
-			origin: origin(path),
+			origin:      origin(path),
 			disposition: ExtensionDisposition::Winner,
-			detail: ExtensionDetail::Tool {
-				description: None,
+			detail:      ExtensionDetail::Tool {
+				description:  None,
 				input_schema: json!({"type":"object","properties":{}}),
 			},
-			live_tools: Vec::new(),
-			mcp: None,
+			live_tools:  Vec::new(),
+			mcp:         None,
 		}
 	}
 
 	fn mcp_row(name: &str) -> ExtensionRow {
 		ExtensionRow {
-			id: Str::new(name),
-			kind: ExtensionKind::Mcp,
-			name: Str::new(name),
+			id:          Str::new(name),
+			kind:        ExtensionKind::Mcp,
+			name:        Str::new(name),
 			description: None,
-			origin: origin("/repo/.omp/mcp.json"),
+			origin:      origin("/repo/.omp/mcp.json"),
 			disposition: ExtensionDisposition::Winner,
-			detail: ExtensionDetail::Mcp {
+			detail:      ExtensionDetail::Mcp {
 				transport: Str::new_static("stdio"),
-				endpoint: Some(Str::new_static("server")),
-				args: Vec::new(),
+				endpoint:  Some(Str::new_static("server")),
+				args:      Vec::new(),
 				env_count: 0,
 			},
-			live_tools: Vec::new(),
-			mcp: None,
+			live_tools:  Vec::new(),
+			mcp:         None,
 		}
 	}
 
 	fn live_mcp(name: &str, tool: &str) -> McpLiveSnapshot {
 		McpLiveSnapshot {
-			server: Str::new(name),
-			health: McpHealth::Connected,
-			generation: 1,
+			server:           Str::new(name),
+			health:           McpHealth::Connected,
+			generation:       1,
 			definition_epoch: 1,
-			implementation: Some(Str::new_static("fixture")),
-			version: Some(Str::new_static("1")),
-			title: None,
-			description: None,
-			instructions: None,
-			tools: vec![McpToolView {
-				name: Str::new(tool),
-				title: None,
-				description: None,
+			implementation:   Some(Str::new_static("fixture")),
+			version:          Some(Str::new_static("1")),
+			title:            None,
+			description:      None,
+			instructions:     None,
+			tools:            vec![McpToolView {
+				name:         Str::new(tool),
+				title:        None,
+				description:  None,
 				input_schema: json!({"type":"object","properties":{}}),
 			}],
-			resources: Vec::new(),
-			prompts: Vec::new(),
+			resources:        Vec::new(),
+			prompts:          Vec::new(),
 		}
 	}
 
@@ -1101,27 +1185,27 @@ mod tests {
 		let mut shadowed = tool_row("bundle-shadow", unc);
 		shadowed.disposition = ExtensionDisposition::Shadowed { by: Str::new_static("bundle") };
 		let mut snapshot = ExtensionSnapshot {
-			rows: vec![tool_row("bundle", unc), tool_row("other", "/tmp/other.ts"), shadowed],
+			rows:       vec![tool_row("bundle", unc), tool_row("other", "/tmp/other.ts"), shadowed],
 			generation: 1,
 		};
 		snapshot.join_live_tools(&[
 			LiveToolView {
-				name: Str::new_static("inspect"),
-				label: None,
-				description: None,
+				name:         Str::new_static("inspect"),
+				label:        None,
+				description:  None,
 				input_schema: json!({}),
-				source_path: Some(Str::new_static("//server/share/.omp/tools/bundle.ts")),
-				hidden: false,
-				source: Str::new_static("extension"),
+				source_path:  Some(Str::new_static("//server/share/.omp/tools/bundle.ts")),
+				hidden:       false,
+				source:       Str::new_static("extension"),
 			},
 			LiveToolView {
-				name: Str::new_static("builtin_collision"),
-				label: None,
-				description: None,
+				name:         Str::new_static("builtin_collision"),
+				label:        None,
+				description:  None,
 				input_schema: json!({}),
-				source_path: None,
-				hidden: false,
-				source: Str::new_static("builtin"),
+				source_path:  None,
+				hidden:       false,
+				source:       Str::new_static("builtin"),
 			},
 		]);
 		assert_eq!(snapshot.rows[0].live_tools.len(), 1);
@@ -1133,7 +1217,8 @@ mod tests {
 	fn incremental_mcp_updates_keep_other_servers_and_provider_disable_drops_live_state() {
 		let mut beta = mcp_row("beta");
 		beta.origin.provider_id = Str::new_static("foreign");
-		let mut snapshot = ExtensionSnapshot { rows: vec![mcp_row("alpha"), beta], generation: 1 };
+		let mut snapshot =
+			ExtensionSnapshot { rows: vec![mcp_row("alpha"), beta], generation: 1 };
 		snapshot.merge_mcp(live_mcp("alpha", "a"));
 		snapshot.merge_mcp(live_mcp("beta", "b"));
 		assert_eq!(snapshot.rows[0].mcp.as_ref().unwrap().tools[0].name, "a");
@@ -1177,19 +1262,19 @@ mod tests {
 	#[test]
 	fn command_keeps_frontmatter_fields_and_empty_parsed_body() {
 		let row = ExtensionRow {
-			id: Str::new_static("deploy"),
-			kind: ExtensionKind::SlashCommand,
-			name: Str::new_static("deploy"),
+			id:          Str::new_static("deploy"),
+			kind:        ExtensionKind::SlashCommand,
+			name:        Str::new_static("deploy"),
 			description: None,
-			origin: origin("/repo/.omp/commands/deploy.md"),
+			origin:      origin("/repo/.omp/commands/deploy.md"),
 			disposition: ExtensionDisposition::Winner,
-			detail: ExtensionDetail::SlashCommand {
-				description: Some(Str::new_static("Deploy a service")),
+			detail:      ExtensionDetail::SlashCommand {
+				description:   Some(Str::new_static("Deploy a service")),
 				argument_hint: Some(Str::new_static("<service>")),
-				body: Str::default(),
+				body:          Str::default(),
 			},
-			live_tools: Vec::new(),
-			mcp: None,
+			live_tools:  Vec::new(),
+			mcp:         None,
 		};
 		let text = detail_lines(Some(&row), false)
 			.into_iter()
@@ -1223,7 +1308,7 @@ mod tests {
 	}
 
 	struct CountingSource {
-		calls: Cell<usize>,
+		calls:    Cell<usize>,
 		snapshot: ExtensionSnapshot,
 	}
 
@@ -1236,24 +1321,27 @@ mod tests {
 
 	#[test]
 	fn listing_uses_one_snapshot_and_keyboard_pages_overflow() {
-		let body = (0..60).map(|index| sf!("line-{index}")).collect::<Vec<_>>().join("\n");
+		let body = (0..60)
+			.map(|index| sf!("line-{index}"))
+			.collect::<Vec<_>>()
+			.join("\n");
 		let row = ExtensionRow {
-			id: Str::new_static("long"),
-			kind: ExtensionKind::Rule,
-			name: Str::new_static("long"),
+			id:          Str::new_static("long"),
+			kind:        ExtensionKind::Rule,
+			name:        Str::new_static("long"),
 			description: None,
-			origin: origin("/repo/.omp/rules/long.md"),
+			origin:      origin("/repo/.omp/rules/long.md"),
 			disposition: ExtensionDisposition::Winner,
-			detail: ExtensionDetail::Document {
+			detail:      ExtensionDetail::Document {
 				heading: Str::new_static("Rule"),
-				body: Str::from(body),
-				facts: Vec::new(),
+				body:    Str::from(body),
+				facts:   Vec::new(),
 			},
-			live_tools: Vec::new(),
-			mcp: None,
+			live_tools:  Vec::new(),
+			mcp:         None,
 		};
 		let source = CountingSource {
-			calls: Cell::new(0),
+			calls:    Cell::new(0),
 			snapshot: ExtensionSnapshot { rows: vec![row], generation: 1 },
 		};
 		let mut inspector = ExtensionInspector::open_from(&source, &UiContext::default());

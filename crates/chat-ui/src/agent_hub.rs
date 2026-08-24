@@ -503,10 +503,11 @@ fn build(
 }
 #[cfg(test)]
 mod tests {
-	use super::{AgentHub, AgentHubEvent, HubView};
-	use crate::AgentRow;
 	use omp_core::Str;
 	use omp_tui::{Key, UiContext};
+
+	use super::{AgentHub, AgentHubEvent, HubView};
+	use crate::AgentRow;
 
 	fn row(status: &'static str, can_steer: bool, can_revive: bool) -> AgentRow {
 		AgentRow {
@@ -548,15 +549,9 @@ mod tests {
 		assert_eq!(aborted.view, HubView::Transcript);
 
 		let mut live = AgentHub::open(&[row("running", true, false)], &ctx);
-		assert_eq!(
-			live.handle_key(Key::Enter),
-			AgentHubEvent::Steer(Str::new_static("agent")),
-		);
+		assert_eq!(live.handle_key(Key::Enter), AgentHubEvent::Steer(Str::new_static("agent")),);
 
 		let mut parked = AgentHub::open(&[row("parked", false, true)], &ctx);
-		assert_eq!(
-			parked.handle_key(Key::Enter),
-			AgentHubEvent::Revive(Str::new_static("agent")),
-		);
+		assert_eq!(parked.handle_key(Key::Enter), AgentHubEvent::Revive(Str::new_static("agent")),);
 	}
 }

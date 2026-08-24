@@ -199,7 +199,8 @@ impl ListPicker {
 			| UiEvent::Submit
 			| UiEvent::Highlighted { .. }
 			| UiEvent::Pressed(_)
-			| UiEvent::Copied(_) => PickerEvent::Consumed,
+			| UiEvent::Copied(_)
+			| UiEvent::DiffAction { .. } => PickerEvent::Consumed,
 		}
 	}
 }
@@ -287,11 +288,7 @@ impl PromptOverlay {
 	}
 
 	/// Opens a plain prompt with an editable suggested value.
-	pub fn open_prefilled(
-		title: impl IntoStr,
-		value: impl IntoStr,
-		ctx: &UiContext,
-	) -> Self {
+	pub fn open_prefilled(title: impl IntoStr, value: impl IntoStr, ctx: &UiContext) -> Self {
 		let mut prompt = Self::open(title, false, ctx);
 		let value = value.into_str();
 		prompt.ui.set_text("prompt-input", value.as_str());
@@ -347,7 +344,8 @@ impl PromptOverlay {
 			| UiEvent::Highlighted { .. }
 			| UiEvent::Filtered { .. }
 			| UiEvent::Pressed(_)
-			| UiEvent::Copied(_) => PromptEvent::Consumed,
+			| UiEvent::Copied(_)
+			| UiEvent::DiffAction { .. } => PromptEvent::Consumed,
 		}
 	}
 
@@ -406,7 +404,8 @@ mod tests {
 			PromptEvent::Submit(path) if path == "TOPIC_PLAN.md"
 		));
 
-		let mut custom = PromptOverlay::open_prefilled("Save", "TOPIC_PLAN.md", &UiContext::default());
+		let mut custom =
+			PromptOverlay::open_prefilled("Save", "TOPIC_PLAN.md", &UiContext::default());
 		for _ in 0.."TOPIC_PLAN.md".len() {
 			let _ = custom.handle_key(Key::Backspace);
 		}

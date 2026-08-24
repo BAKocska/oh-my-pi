@@ -21,9 +21,9 @@ use smallvec::SmallVec;
 
 use crate::{
 	AgentHub, AgentHubEvent, ApprovalAction, ApprovalTicketView, BackendEvent, Chat, ChatKey,
-	CommandPalette, ExtensionInspector, ExtensionInspectorEvent, HistoryInspector,
-	HistoryInspectorEvent, ImageOverlay, ImageOverlayEvent, Intent, ListPicker, ListRow, ModelPicker,
-	ModelRow, PaletteAction, PaletteEntry, PaletteEvent,
+	CommandPalette, ExtensionInspector, ExtensionInspectorEvent, GitIntent, GitWorkbench,
+	GitWorkbenchEvent, HistoryInspector, HistoryInspectorEvent, ImageOverlay, ImageOverlayEvent,
+	Intent, ListPicker, ListRow, ModelPicker, ModelRow, PaletteAction, PaletteEntry, PaletteEvent,
 	PickerEvent, PromptEvent, PromptOverlay, ProviderPicker, PtyEvent, PtyOverlay, RewindTargetRow,
 	SelectionPurpose, SessionRow, SettingChange, SettingRow, Sidebar, SubmitMode, Welcome,
 	WelcomeEvent,
@@ -796,7 +796,9 @@ impl RetainedChat {
 					changed = true;
 				},
 				Ok(event) => {
-					apply_backend(&mut self.host, event, &self.ctx);
+					if let Some(intent) = apply_backend(&mut self.host, event, &self.ctx) {
+						send(&self.intents, Intent::Git(intent));
+					}
 					send_pty_resize(&mut self.host, self.viewport, &self.intents);
 					changed = true;
 				},
@@ -834,6 +836,7 @@ enum ListPurpose {
 }
 
 enum Overlay {
+	Git(GitWorkbench),
 	Models(ModelPicker),
 	GuidedGoal(GuidedGoalInterview),
 	PlanReview(PlanReviewOverlay),
@@ -858,6 +861,7 @@ enum Overlay {
 
 enum OverlayEvent {
 	Consumed,
+	Git(GitIntent),
 	GoalComplete { objective: Str, token_budget: Option<u64> },
 	PlanReviewComplete(Str),
 	PlanSavePathRequest(Str),
@@ -889,6 +893,7 @@ enum OverlayEvent {
 impl Overlay {
 	fn handle_key(&mut self, key: Key) -> OverlayEvent {
 		match self {
+			Self::Git(workbench) => git_workbench_event(workbench.handle_key(key)),
 			Self::Models(picker) => picker_event(picker.handle_key(key)),
 			Self::GuidedGoal(interview) => guided_goal_event(interview.handle_key(key)),
 			Self::PlanReview(review) => {
@@ -945,6 +950,7 @@ impl Overlay {
 
 	fn handle_paste(&mut self, text: &str) -> OverlayEvent {
 		match self {
+			Self::Git(workbench) => git_workbench_event(workbench.handle_paste(text)),
 			Self::Models(picker) => picker_event(picker.handle_paste(text)),
 			Self::GuidedGoal(interview) => guided_goal_event(interview.handle_paste(text)),
 			Self::PlanReview(review) => {
@@ -1000,6 +1006,9 @@ impl Overlay {
 
 	fn handle_mouse(&mut self, col: u16, row: u16, kind: Mouse, viewport: Size) -> OverlayEvent {
 		match self {
+			Self::Git(workbench) => {
+				git_workbench_event(workbench.handle_mouse(col, row, kind, viewport))
+			},
 			Self::Models(picker) => picker_event(picker.handle_mouse(col, row, kind, viewport)),
 			Self::GuidedGoal(interview) => {
 				guided_goal_event(interview.handle_mouse(col, row, kind, viewport))
@@ -1055,6 +1064,7 @@ impl Overlay {
 
 	fn layer(&mut self, viewport: Size) -> Layer<'_> {
 		match self {
+			Self::Git(workbench) => workbench.layer(viewport),
 			Self::Models(picker) => picker.layer(viewport),
 			Self::GuidedGoal(interview) => interview.layer(viewport),
 			Self::PlanReview(review) => review.layer(viewport),
@@ -1076,6 +1086,14 @@ impl Overlay {
 			Self::Ask { dialog, .. } => dialog.layer(viewport),
 			Self::AutoQaConsent { dialog, .. } => dialog.layer(viewport),
 		}
+	}
+}
+
+fn git_workbench_event(event: GitWorkbenchEvent) -> OverlayEvent {
+	match event {
+		GitWorkbenchEvent::Consumed => OverlayEvent::Consumed,
+		GitWorkbenchEvent::Intent(intent) => OverlayEvent::Git(intent),
+		GitWorkbenchEvent::Close => OverlayEvent::Close,
 	}
 }
 
@@ -1245,10 +1263,11 @@ async fn run_chat(
 ) -> io::Result<HostOutcome> {
 	let mut host = ChatHost::new(chat, ctx, viewport, models, current_model, true);
 	let ask_binding = ask::bind();
-	paint_host(renderer, &mut host, viewport, false)?;
+	paint_host(renderer, &mut host, viewport, Retirement::Disabled)?;
 
 	let mut resize = None;
 	let mut settled_width = viewport.width;
+	let mut pending_replay: Option<ResizeScrollback> = None;
 	let mut paste_read: Option<PasteRead> = None;
 	let mut next_frame = chat_deadline(&host.chat);
 	let mut requested_exit = HostExit::Quit;
@@ -1306,21 +1325,17 @@ async fn run_chat(
 												break;
 											} else if key == Key::Alt('l') {
 												terminal.refresh_appearance()?;
-												// Destructive redraw gesture (pi's Ctrl+L): replay the
-												// complete finalized transcript under the refreshed
-												// appearance. ED3 is skipped inside multiplexers, where
-												// it would wipe pane history; the replay then appends.
-												host.chat.reset_retirement();
-												if !terminal.inside_multiplexer() {
-													renderer.reset_history()?;
-												}
-												let rendered = host.chat.render(viewport);
-												let layers = rail_layers(&mut host.sidebar, viewport);
-												renderer.repaint(
-													"",
-													rendered.frame.clone(),
-													viewport.height,
-													&layers,
+												// Rebuild directly, or append inside multiplexers where
+												// ED3 would irreversibly erase pane history.
+												pending_replay = Some(if terminal.inside_multiplexer() {
+													ResizeScrollback::Append
+												} else {
+													ResizeScrollback::Rebuild
+												});
+												start_pending_replay(
+													renderer,
+													&mut host,
+													&mut pending_replay,
 												)?;
 											} else if key == Key::RestoreQueue {
 												send(intents, Intent::Dequeue);
@@ -1539,7 +1554,9 @@ async fn run_chat(
 										_ => {},
 									}
 									let had_overlay = host.overlay.is_some();
-									apply_terminal_backend(&mut host, event, ctx);
+									if let Some(intent) = apply_terminal_backend(&mut host, event, ctx) {
+										send(intents, Intent::Git(intent));
+									}
 									send_pty_resize(&mut host, viewport, intents);
 									if !had_overlay && host.overlay.is_some() {
 										open_overlay(terminal, renderer, &mut host, viewport, &mut resize)?;
@@ -1568,10 +1585,11 @@ async fn run_chat(
 							() = deadline(executor, next_frame) => {
 								observe_resize(terminal, &mut viewport, &mut resize, Instant::now())?;
 								host.chat.set_right_inset(host.sidebar.reserved(viewport));
+								start_pending_replay(renderer, &mut host, &mut pending_replay)?;
 								// A retired batch may leave further finalized prefixes
 								// (or replay batches) ready: repaint immediately to
 								// drain them instead of waiting for the next event.
-								next_frame = match paint_host(renderer, &mut host, viewport, true)? {
+								next_frame = match paint_host(renderer, &mut host, viewport, Retirement::Pressure)? {
 									PaintKind::Retired | PaintKind::Deferred => Some(Instant::now()),
 									PaintKind::Presented => chat_deadline(&host.chat),
 								};
@@ -1581,9 +1599,8 @@ async fn run_chat(
 								if !resize.is_some_and(|state| state.settled(now)) { continue; }
 								host.chat.set_right_inset(host.sidebar.reserved(viewport));
 								// A settled width change leaves native scrollback rows
-								// wrapped at the old width; refresh them per the
-								// configured mode by reopening the committed prefix so
-								// ordered retirement replays it at the new width.
+								// wrapped at the old width; refresh them through a
+								// separate replay cursor without changing commit state.
 								if viewport.width != settled_width {
 									settled_width = viewport.width;
 									let mode = if resize_scrollback == ResizeScrollback::Rebuild
@@ -1595,15 +1612,11 @@ async fn run_chat(
 									} else {
 										resize_scrollback
 									};
-									if mode != ResizeScrollback::Preserve && host.overlay.is_none() {
-										host.chat.reset_retirement();
-										if mode == ResizeScrollback::Rebuild {
-											renderer.reset_history()?;
-										}
-									}
+									pending_replay = (mode != ResizeScrollback::Preserve).then_some(mode);
 								}
 								resize = None;
-								next_frame = match paint_host(renderer, &mut host, viewport, true)? {
+								start_pending_replay(renderer, &mut host, &mut pending_replay)?;
+								next_frame = match paint_host(renderer, &mut host, viewport, Retirement::Pressure)? {
 									PaintKind::Retired | PaintKind::Deferred => Some(now),
 									PaintKind::Presented => chat_deadline(&host.chat),
 								};
@@ -1613,9 +1626,15 @@ async fn run_chat(
 	if host.overlay.take().is_some() {
 		close_overlay(terminal, renderer, &mut host, viewport, &mut resize)?;
 	}
+	start_pending_replay(renderer, &mut host, &mut pending_replay)?;
 	if requested_exit == HostExit::Quit {
 		host.chat.cancel_active("Host closed");
-		paint_host(renderer, &mut host, viewport, true)?;
+		loop {
+			match paint_host(renderer, &mut host, viewport, Retirement::Flush)? {
+				PaintKind::Retired | PaintKind::Deferred => {},
+				PaintKind::Presented => break,
+			}
+		}
 	}
 	renderer.repaint("", Frame::new(viewport), viewport.height, &[])?;
 	Ok(host_outcome(&host, requested_exit))
@@ -1625,23 +1644,44 @@ fn host_outcome(host: &ChatHost, exit: HostExit) -> HostOutcome {
 	HostOutcome { exit, draft: Str::from(host.chat.composer_text()) }
 }
 
-fn apply_terminal_backend(host: &mut ChatHost, event: BackendEvent, ctx: &UiContext) {
+fn apply_terminal_backend(
+	host: &mut ChatHost,
+	event: BackendEvent,
+	ctx: &UiContext,
+) -> Option<GitIntent> {
 	match event {
 		BackendEvent::HistoryRewind { user_index, text } => {
 			let _ = host.chat.rewind_user(user_index, text.as_str());
 			host.suppress_history_replay = true;
+			None
 		},
 		BackendEvent::HistoryReplayFinished => {
 			host.suppress_history_replay = false;
+			None
 		},
-		BackendEvent::HistoryCleared => host.chat.clear_history(),
-		_ if host.suppress_history_replay => {},
+		BackendEvent::HistoryCleared => {
+			host.chat.clear_history();
+			None
+		},
+		_ if host.suppress_history_replay => None,
 		event => apply_backend(host, event, ctx),
 	}
 }
 
-fn apply_backend(host: &mut ChatHost, event: BackendEvent, ctx: &UiContext) {
+fn apply_backend(host: &mut ChatHost, event: BackendEvent, ctx: &UiContext) -> Option<GitIntent> {
 	match event {
+		BackendEvent::OpenGitWorkbench(snapshot) => {
+			let mut workbench = GitWorkbench::open(snapshot, ctx);
+			let intent = workbench.initial_intent();
+			host.overlay = Some(Overlay::Git(workbench));
+			return intent;
+		},
+		BackendEvent::Git(update) => {
+			return match host.overlay.as_mut() {
+				Some(Overlay::Git(workbench)) => workbench.apply(update),
+				_ => None,
+			};
+		},
 		BackendEvent::OpenGuidedGoal => {
 			host.overlay = Some(Overlay::GuidedGoal(GuidedGoalInterview::open(ctx)));
 		},
@@ -1771,6 +1811,7 @@ fn apply_backend(host: &mut ChatHost, event: BackendEvent, ctx: &UiContext) {
 			let _ = host.chat.apply_backend_event(event);
 		},
 	}
+	None
 }
 fn open_autoqa_consent(host: &mut ChatHost, request: ConsentRequest, ctx: &UiContext) {
 	let consent = AutoQaConsent::new(request);
@@ -1879,6 +1920,7 @@ fn apply_overlay_event(
 ) -> Option<HostExit> {
 	match event {
 		OverlayEvent::Consumed => {},
+		OverlayEvent::Git(intent) => send(intents, Intent::Git(intent)),
 		OverlayEvent::GoalComplete { objective, token_budget } => {
 			send(intents, Intent::SetGoal { objective, token_budget });
 			host.overlay = None;
@@ -1907,6 +1949,9 @@ fn apply_overlay_event(
 		OverlayEvent::Close => {
 			if matches!(host.overlay, Some(Overlay::Extensions(_))) {
 				send(intents, Intent::CloseExtensionInspector);
+			}
+			if matches!(host.overlay, Some(Overlay::Git(_))) {
+				send(intents, Intent::Git(GitIntent::Close));
 			}
 			host.overlay = None;
 		},
@@ -2165,21 +2210,54 @@ enum PaintKind {
 	Deferred,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Retirement {
+	Disabled,
+	Pressure,
+	Flush,
+}
+
+fn start_pending_replay<W: Write>(
+	renderer: &mut Renderer<W>,
+	host: &mut ChatHost,
+	pending: &mut Option<ResizeScrollback>,
+) -> io::Result<()> {
+	if host.overlay.is_some() {
+		return Ok(());
+	}
+	let Some(mode) = pending.take() else {
+		return Ok(());
+	};
+	if mode == ResizeScrollback::Rebuild {
+		renderer.reset_history()?;
+	}
+	host.chat.begin_replay();
+	Ok(())
+}
+
 fn paint_host<W: Write>(
 	renderer: &mut Renderer<W>,
 	host: &mut ChatHost,
 	viewport: Size,
-	allow_retirement: bool,
+	retirement: Retirement,
 ) -> io::Result<PaintKind> {
-	let geometry_gate = allow_retirement
-		&& host.overlay.is_none()
-		&& renderer.retire_requires_present(viewport.width, viewport.height);
-	let batch = if allow_retirement && host.overlay.is_none() && !geometry_gate {
-		host.chat.retirement_batch(viewport)
-	} else {
+	let may_retire = retirement != Retirement::Disabled && host.overlay.is_none();
+	let geometry_gate =
+		may_retire && renderer.retire_requires_present(viewport.width, viewport.height);
+	let batch = if geometry_gate {
 		None
+	} else {
+		match retirement {
+			Retirement::Disabled => None,
+			Retirement::Pressure if host.overlay.is_none() => host.chat.retirement_batch(viewport),
+			Retirement::Flush if host.overlay.is_none() => host.chat.flush_retirement_batch(viewport),
+			Retirement::Pressure | Retirement::Flush => None,
+		}
 	};
-	let rendered = host.chat.render(viewport);
+	let rendered = match batch.as_ref() {
+		Some(batch) => host.chat.render_after_retirement(viewport, batch),
+		None => host.chat.render(viewport),
+	};
 	let mut layers = rail_layers(&mut host.sidebar, viewport);
 	if let Some(overlay) = host.overlay.as_mut() {
 		layers.push(overlay.layer(viewport));
@@ -2197,9 +2275,8 @@ fn paint_host<W: Write>(
 			PaintKind::Presented
 		});
 	};
-	let upto = batch.range.end;
 	renderer.retire(&batch.frame, rendered.frame, viewport.height, &layers)?;
-	host.chat.mark_committed(upto);
+	host.chat.mark_retired(&batch);
 	Ok(PaintKind::Retired)
 }
 
@@ -2208,9 +2285,8 @@ fn open_overlay(
 	renderer: &mut Renderer<TtyOut>,
 	host: &mut ChatHost,
 	viewport: Size,
-	resize: &mut Option<ResizeState>,
+	_resize: &mut Option<ResizeState>,
 ) -> io::Result<()> {
-	*resize = None;
 	let alt_enter = terminal.stage_alt_enter(AltScreenUse::Interactive);
 	let rendered = host.chat.render(viewport);
 	let mut layers = rail_layers(&mut host.sidebar, viewport);
@@ -2231,9 +2307,8 @@ fn close_overlay(
 	renderer: &mut Renderer<TtyOut>,
 	host: &mut ChatHost,
 	viewport: Size,
-	resize: &mut Option<ResizeState>,
+	_resize: &mut Option<ResizeState>,
 ) -> io::Result<()> {
-	*resize = None;
 	let rendered = host.chat.render(viewport);
 	let layers = rail_layers(&mut host.sidebar, viewport);
 	let alt_exit = terminal.stage_alt_leave().unwrap_or("");
@@ -2269,8 +2344,8 @@ mod tests {
 	use omp_tui::{Frame, Key, Renderer, Size, UiContext};
 
 	use super::{
-		ChatHost, Duration, HostExit, HostOptions, Instant, Overlay, PaintKind, ResizeState,
-		RetainedChat, RetainedChatEffect, paint_host,
+		ChatHost, Duration, HostExit, HostOptions, Instant, Overlay, PaintKind, ResizeScrollback,
+		ResizeState, RetainedChat, RetainedChatEffect, Retirement, paint_host, start_pending_replay,
 	};
 	use crate::{BackendEvent, Chat, HistoryInspector, Intent, ModelRow};
 
@@ -2381,7 +2456,7 @@ mod tests {
 		let mut renderer = Renderer::new(Vec::new());
 
 		assert_eq!(
-			paint_host(&mut renderer, &mut host, viewport, false).unwrap(),
+			paint_host(&mut renderer, &mut host, viewport, Retirement::Disabled).unwrap(),
 			PaintKind::Presented
 		);
 		assert!(host.chat.retirement_batch(viewport).is_some());
@@ -2393,13 +2468,19 @@ mod tests {
 		let ctx = UiContext::default();
 		let mut host = finalized_host(&ctx, viewport);
 		let mut renderer = Renderer::new(Vec::new());
-		paint_host(&mut renderer, &mut host, viewport, false).unwrap();
+		paint_host(&mut renderer, &mut host, viewport, Retirement::Disabled).unwrap();
 
 		// Retirement scrolls relative to the painted viewport, so a geometry
 		// change presents once before the pending batch retires.
 		let resized = Size::new(60, 8);
-		assert_eq!(paint_host(&mut renderer, &mut host, resized, true).unwrap(), PaintKind::Deferred);
-		assert_eq!(paint_host(&mut renderer, &mut host, resized, true).unwrap(), PaintKind::Retired);
+		assert_eq!(
+			paint_host(&mut renderer, &mut host, resized, Retirement::Pressure).unwrap(),
+			PaintKind::Deferred
+		);
+		assert_eq!(
+			paint_host(&mut renderer, &mut host, resized, Retirement::Pressure).unwrap(),
+			PaintKind::Retired
+		);
 	}
 
 	#[test]
@@ -2408,13 +2489,60 @@ mod tests {
 		let ctx = UiContext::default();
 		let mut host = finalized_host(&ctx, viewport);
 		let mut renderer = Renderer::new(Vec::new());
-		paint_host(&mut renderer, &mut host, viewport, false).unwrap();
+		paint_host(&mut renderer, &mut host, viewport, Retirement::Disabled).unwrap();
 
-		assert_eq!(paint_host(&mut renderer, &mut host, viewport, true).unwrap(), PaintKind::Retired);
+		assert_eq!(
+			paint_host(&mut renderer, &mut host, viewport, Retirement::Pressure).unwrap(),
+			PaintKind::Retired
+		);
 		assert!(host.chat.retirement_batch(viewport).is_none());
 		assert_eq!(
-			paint_host(&mut renderer, &mut host, viewport, true).unwrap(),
+			paint_host(&mut renderer, &mut host, viewport, Retirement::Pressure).unwrap(),
 			PaintKind::Presented
+		);
+	}
+
+	#[test]
+	fn flush_retires_a_finalized_tail_without_pressure() {
+		let viewport = Size::new(40, 20);
+		let ctx = UiContext::default();
+		let mut chat = Chat::new(&ctx);
+		chat.push_notice("fits in the viewport");
+		let mut host = ChatHost::new(chat, &ctx, viewport, Vec::new(), 0, false);
+		let mut renderer = Renderer::new(Vec::new());
+		paint_host(&mut renderer, &mut host, viewport, Retirement::Disabled).unwrap();
+
+		assert_eq!(
+			paint_host(&mut renderer, &mut host, viewport, Retirement::Pressure).unwrap(),
+			PaintKind::Presented
+		);
+		assert_eq!(
+			paint_host(&mut renderer, &mut host, viewport, Retirement::Flush).unwrap(),
+			PaintKind::Retired
+		);
+	}
+
+	#[test]
+	fn replay_request_survives_an_overlay() {
+		let viewport = Size::new(40, 20);
+		let ctx = UiContext::default();
+		let mut chat = Chat::new(&ctx);
+		chat.push_notice("committed row");
+		let mut host = ChatHost::new(chat, &ctx, viewport, Vec::new(), 0, false);
+		let mut renderer = Renderer::new(Vec::new());
+		paint_host(&mut renderer, &mut host, viewport, Retirement::Disabled).unwrap();
+		paint_host(&mut renderer, &mut host, viewport, Retirement::Flush).unwrap();
+		host.overlay = Some(Overlay::History(HistoryInspector::open(Frame::new(viewport))));
+		let mut pending = Some(ResizeScrollback::Append);
+
+		start_pending_replay(&mut renderer, &mut host, &mut pending).unwrap();
+		assert_eq!(pending, Some(ResizeScrollback::Append));
+		host.overlay = None;
+		start_pending_replay(&mut renderer, &mut host, &mut pending).unwrap();
+		assert_eq!(pending, None);
+		assert_eq!(
+			paint_host(&mut renderer, &mut host, viewport, Retirement::Pressure).unwrap(),
+			PaintKind::Retired
 		);
 	}
 
@@ -2424,17 +2552,20 @@ mod tests {
 		let ctx = UiContext::default();
 		let mut host = finalized_host(&ctx, viewport);
 		let mut renderer = Renderer::new(Vec::new());
-		paint_host(&mut renderer, &mut host, viewport, false).unwrap();
+		paint_host(&mut renderer, &mut host, viewport, Retirement::Disabled).unwrap();
 		host.overlay = Some(Overlay::History(HistoryInspector::open(Frame::new(viewport))));
 
 		assert_eq!(
-			paint_host(&mut renderer, &mut host, viewport, true).unwrap(),
+			paint_host(&mut renderer, &mut host, viewport, Retirement::Pressure).unwrap(),
 			PaintKind::Presented
 		);
 		assert!(host.chat.retirement_batch(viewport).is_some());
 
 		host.overlay = None;
-		assert_eq!(paint_host(&mut renderer, &mut host, viewport, true).unwrap(), PaintKind::Retired);
+		assert_eq!(
+			paint_host(&mut renderer, &mut host, viewport, Retirement::Pressure).unwrap(),
+			PaintKind::Retired
+		);
 		assert!(host.chat.retirement_batch(viewport).is_none());
 	}
 
@@ -2468,11 +2599,11 @@ mod tests {
 		let mut host = finalized_host(&ctx, viewport);
 		let control = WriteControl::default();
 		let mut renderer = Renderer::new(SwitchWriter(control.clone()));
-		paint_host(&mut renderer, &mut host, viewport, false).unwrap();
+		paint_host(&mut renderer, &mut host, viewport, Retirement::Disabled).unwrap();
 		control.fail.set(true);
 		let writes_before = control.writes.get();
 
-		let error = paint_host(&mut renderer, &mut host, viewport, true)
+		let error = paint_host(&mut renderer, &mut host, viewport, Retirement::Pressure)
 			.expect_err("retirement write failure must escape the host coordinator");
 
 		assert_eq!(error.kind(), io::ErrorKind::Other);

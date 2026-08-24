@@ -129,6 +129,7 @@ impl ModelPicker {
 			| UiEvent::Submit
 			| UiEvent::Pressed(_)
 			| UiEvent::Copied(_)
+			| UiEvent::DiffAction { .. }
 			| UiEvent::Changed { .. }
 			| UiEvent::Highlighted { .. }
 			| UiEvent::Filtered { .. } => PickerEvent::Consumed,

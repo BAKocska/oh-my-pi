@@ -246,7 +246,8 @@ impl AskDialog {
 			| UiEvent::Filtered { .. }
 			| UiEvent::Highlighted { .. }
 			| UiEvent::Pressed(_)
-			| UiEvent::Copied(_) => AskDialogEvent::Consumed,
+			| UiEvent::Copied(_)
+			| UiEvent::DiffAction { .. } => AskDialogEvent::Consumed,
 		}
 	}
 }

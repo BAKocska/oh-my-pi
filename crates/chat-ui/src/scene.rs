@@ -256,6 +256,30 @@ pub struct RetirementBatch {
 	pub range: Range<u64>,
 	/// Width-dependent rendering of immutable final snapshots.
 	pub frame: Frame,
+	kind:      RetirementKind,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RetirementKind {
+	Commit,
+	Replay,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Replay {
+	cursor: u64,
+	end:    u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RetirementPolicy {
+	Pressure,
+	Flush,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AdmissionMode {
+	Allow,
+	Defer,
 }
 
 /// Protocol placements used by [`Bands`] without allocating a per-frame
@@ -608,7 +632,6 @@ impl ToolView {
 }
 
 struct ToolEntry {
-	name:     Str,
 	label:    Str,
 	ok:       bool,
 	expanded: bool,
@@ -872,21 +895,21 @@ fn activity_waveform_label(waveform: &ActivityWaveform, charset: Charset) -> Str
 }
 
 struct StatusLabels {
-	model:    Str,
-	activity: Option<Str>,
-	git:      Option<Str>,
-	context:  Option<(Str, bool)>,
-	velocity: Option<Str>,
-	cwd:      Option<Str>,
-	slots:    SmallVec<Str, 5>,
-	hooks:    Option<Str>,
-	tasks:    Option<Str>,
-	collab:   Option<Str>,
-	account:  Option<Str>,
-	queued:   Option<Str>,
-	jobs:     Option<Str>,
-	attempt:  Option<Str>,
-	dropped:  Option<Str>,
+	model:     Str,
+	activity:  Option<Str>,
+	git:       Option<Str>,
+	context:   Option<(Str, bool)>,
+	velocity:  Option<Str>,
+	cwd:       Option<Str>,
+	resources: SmallVec<Str, 5>,
+	hooks:     Option<Str>,
+	tasks:     Option<Str>,
+	collab:    Option<Str>,
+	account:   Option<Str>,
+	queued:    Option<Str>,
+	jobs:      Option<Str>,
+	attempt:   Option<Str>,
+	dropped:   Option<Str>,
 }
 
 impl StatusLabels {
@@ -932,13 +955,13 @@ impl StatusLabels {
 				.cwd
 				.as_ref()
 				.map(|cwd| fmts_mut!("cwd {cwd}").freeze()),
-			slots: facts
-				.visible_slots
+			resources: facts
+				.visible_resources
 				.iter()
-				.map(|slot| {
-					let mut label = fmts_mut!("{} {}", slot.slot, slot.holder);
-					if slot.queue_depth > 0 {
-						let _ = write!(label, " +{}", slot.queue_depth);
+				.map(|resource| {
+					let mut label = fmts_mut!("{} {}", resource.resource, resource.owner);
+					if resource.queue_depth > 0 {
+						let _ = write!(label, " +{}", resource.queue_depth);
 					}
 					label.freeze()
 				})
@@ -982,7 +1005,7 @@ impl StatusLabels {
 				*text = separated(text, separator, charset);
 			}
 		}
-		for label in &mut self.slots {
+		for label in &mut self.resources {
 			*label = separated(label, separator, charset);
 		}
 		if let Some((text, _)) = &mut self.context {
@@ -1156,7 +1179,7 @@ impl ChatStatus {
 			}
 		}
 		if facts.layout != StatusLayout::Minimal {
-			for label in &work.labels.slots {
+			for label in &work.labels.resources {
 				status = status.segment(
 					Segment::new()
 						.label(label.clone())
@@ -1268,7 +1291,7 @@ impl ChatStatus {
 			|| facts.git.is_some()
 			|| facts.tokens_per_second.is_some()
 			|| facts.cwd.is_some()
-			|| !facts.visible_slots.is_empty()
+			|| !facts.visible_resources.is_empty()
 			|| facts.hooks > 0
 			|| facts.tasks > 0
 			|| facts.collab_peers > 0
@@ -1455,6 +1478,7 @@ pub struct Chat {
 	work:                    Rc<RefCell<WorkState>>,
 	session_title:           Str,
 	blocks:                  Blocks,
+	replay:                  Option<Replay>,
 	/// Finalized semantic snapshots by ordinal. Snapshots at or past the
 	/// commit frontier are settled (viewport-resident); earlier ones are
 	/// retained so a display replay can re-retire them at a new width.
@@ -1521,6 +1545,7 @@ impl Chat {
 			work,
 			session_title: Str::default(),
 			blocks: Blocks::new(),
+			replay: None,
 			entries: BTreeMap::new(),
 			last_viewport: Size::new(0, 0),
 			last_editor_height: 0,
@@ -2083,7 +2108,6 @@ impl Chat {
 		{
 			let tool = self.live_tools.remove(index);
 			let ordinal = tool.ordinal;
-			let name = tool.name.clone();
 			let width = tool.view.width;
 			let images = tool.images.clone();
 			let icon = if ok {
@@ -2093,7 +2117,6 @@ impl Chat {
 			};
 			let label = fmts_mut!("{icon} {}@{} · {}", tool.name, tool.rev, tool.title).freeze();
 			let entry = ToolEntry {
-				name,
 				label,
 				ok,
 				expanded: true,
@@ -2425,14 +2448,10 @@ impl Chat {
 					})
 			});
 		let matched = selected.is_some();
-		if let Some(selected) = selected {
-			for (_, entry) in self.entries.range_mut(selected..) {
-				*entry = Entry::Notice { text: Str::default(), error: false };
-			}
-		} else {
-			for entry in self.entries.values_mut() {
-				*entry = Entry::Notice { text: Str::default(), error: false };
-			}
+		let frontier = BlockOrdinal(self.blocks.frontier());
+		let start = selected.map_or(frontier, |selected| selected.max(frontier));
+		for (_, entry) in self.entries.range_mut(start..) {
+			*entry = Entry::Notice { text: Str::default(), error: false };
 		}
 		self.cancel_active("cancelled by history rewind");
 		self.pinned_error = None;
@@ -2463,11 +2482,12 @@ impl Chat {
 	/// Drops every uncommitted snapshot, clears live state, and appends a
 	/// finalized history-cleared divider. Native history is unaffected.
 	pub fn clear_history(&mut self) {
-		for entry in self.entries.values_mut() {
+		let frontier = BlockOrdinal(self.blocks.frontier());
+		for (_, entry) in self.entries.range_mut(frontier..) {
 			*entry = Entry::Notice { text: Str::default(), error: false };
 		}
 		self.cancel_active("cancelled because history was cleared");
-		for entry in self.entries.values_mut() {
+		for (_, entry) in self.entries.range_mut(frontier..) {
 			*entry = Entry::Notice { text: Str::default(), error: false };
 		}
 		self.retained_frames = RetainedFrames::new();
@@ -2553,6 +2573,8 @@ impl Chat {
 				}
 			},
 			event @ (BackendEvent::ApprovalPending(_)
+			| BackendEvent::OpenGitWorkbench(_)
+			| BackendEvent::Git(_)
 			| BackendEvent::AutoQaConsent(_)
 			| BackendEvent::HistoryInspect { .. }
 			| BackendEvent::OpenGuidedGoal
@@ -2588,6 +2610,25 @@ impl Chat {
 	/// Renders one exactly viewport-sized, history-neutral frame.
 	pub fn render(&mut self, viewport: Size) -> ViewportFrame<'_> {
 		self.render_at(viewport, self.started_at.elapsed())
+	}
+
+	/// Renders the viewport that must remain after `batch` succeeds without
+	/// advancing the real commit frontier before the terminal write.
+	pub fn render_after_retirement(
+		&mut self,
+		viewport: Size,
+		batch: &RetirementBatch,
+	) -> ViewportFrame<'_> {
+		let frontier = match batch.kind {
+			RetirementKind::Commit => batch.range.end,
+			RetirementKind::Replay => self.blocks.frontier(),
+		};
+		self.render_at_with_frontier(
+			viewport,
+			self.started_at.elapsed(),
+			frontier,
+			AdmissionMode::Defer,
+		)
 	}
 
 	/// Returns the delay until the composer's next requested animation frame.
@@ -2733,6 +2774,17 @@ impl Chat {
 	}
 
 	fn render_at(&mut self, viewport: Size, elapsed: Duration) -> ViewportFrame<'_> {
+		let frontier = self.blocks.frontier();
+		self.render_at_with_frontier(viewport, elapsed, frontier, AdmissionMode::Allow)
+	}
+
+	fn render_at_with_frontier(
+		&mut self,
+		viewport: Size,
+		elapsed: Duration,
+		frontier: u64,
+		admission: AdmissionMode,
+	) -> ViewportFrame<'_> {
 		self.last_viewport = viewport;
 		if self.frame.size() != viewport {
 			self.frame = Frame::new(viewport);
@@ -2761,7 +2813,6 @@ impl Chat {
 		// current width every frame (so resizes reflow and theme changes
 		// restyle them), until ordered retirement moves them into native
 		// history under capacity pressure.
-		let frontier = self.blocks.frontier();
 		let mut settled = SmallVec::<(BlockOrdinal, u16), 8>::new();
 		for (ordinal, entry) in self.entries.range_mut(BlockOrdinal(frontier)..) {
 			if self.hide_thinking && matches!(entry, Entry::Thinking(_)) {
@@ -2801,17 +2852,21 @@ impl Chat {
 				},
 			));
 		}
-		// Merged one-visible-row allocation across settled snapshots and live
-		// cards: within capacity everything renders whole; under pressure every
-		// block keeps one row and surplus flows to the newest blocks first.
+		// Merged allocation across settled snapshots and live cards: within
+		// capacity everything renders whole; pressure gives newest blocks the
+		// available rows, reserving one summary row when some must be hidden.
 		let mut merged = SmallVec::<(BlockOrdinal, u16, bool), 16>::new();
 		for (ordinal, height) in &settled {
 			merged.push((*ordinal, *height, true));
 		}
 		for ((ordinal, painted), (_, wanted)) in sampled.iter().zip(natural.iter()) {
-			merged.push((*ordinal, (*painted).max(*wanted), false));
+			if self.blocks.phase(*ordinal) == Some(crate::BlockPhase::Active) {
+				merged.push((*ordinal, (*painted).max(*wanted), false));
+			}
 		}
 		merged.sort_unstable_by_key(|(ordinal, ..)| *ordinal);
+		let layout_overflow = merged.len() > usize::from(h_live);
+		let summary_rows = u16::from(layout_overflow && h_live > 0);
 		let mut allocs = SmallVec::<u16, 16>::new();
 		let wanted_total: u32 = merged
 			.iter()
@@ -2821,7 +2876,7 @@ impl Chat {
 			allocs.extend(merged.iter().map(|(_, desired, _)| *desired));
 		} else {
 			allocs.resize(merged.len(), 0);
-			let mut budget = h_live;
+			let mut budget = h_live.saturating_sub(summary_rows);
 			for alloc in allocs.iter_mut().rev() {
 				if budget == 0 {
 					break;
@@ -2847,23 +2902,34 @@ impl Chat {
 			.filter(|((.., is_settled), _)| *is_settled)
 			.map(|(_, alloc)| u32::from(*alloc))
 			.sum();
-		let tick_budget =
-			u16::try_from(u32::from(h_live).saturating_sub(settled_rows)).unwrap_or(u16::MAX);
-		let plan = self.blocks.tick(
-			tick_budget,
-			|ordinal| {
-				sampled
-					.iter()
-					.find(|(candidate, _)| *candidate == ordinal)
-					.map_or(0, |(_, height)| *height)
+		let tick_budget = u16::try_from(
+			u32::from(h_live)
+				.saturating_sub(u32::from(summary_rows))
+				.saturating_sub(settled_rows),
+		)
+		.unwrap_or(u16::MAX);
+		let sampled_height = |ordinal| {
+			sampled
+				.iter()
+				.find(|(candidate, _)| *candidate == ordinal)
+				.map_or(0, |(_, height)| *height)
+		};
+		let natural_height = |ordinal| {
+			natural
+				.iter()
+				.find(|(candidate, _)| *candidate == ordinal)
+				.map_or(1, |(_, height)| *height)
+		};
+		let plan = match admission {
+			AdmissionMode::Allow => self
+				.blocks
+				.tick(tick_budget, sampled_height, natural_height),
+			AdmissionMode::Defer => {
+				self
+					.blocks
+					.tick_without_admission(tick_budget, sampled_height, natural_height)
 			},
-			|ordinal| {
-				natural
-					.iter()
-					.find(|(candidate, _)| *candidate == ordinal)
-					.map_or(1, |(_, height)| *height)
-			},
-		);
+		};
 		let transition = if self.reduced_motion {
 			Duration::ZERO
 		} else {
@@ -2943,6 +3009,7 @@ impl Chat {
 					.find(|tool| tool.ordinal == *ordinal)
 					.map_or(0, |tool| tool.card_ui.height())
 			};
+			allocation = allocation.min(*alloc);
 			if !*is_settled
 				&& let Some(visible) = visible
 				&& !visible.contains(ordinal)
@@ -2967,15 +3034,14 @@ impl Chat {
 			}
 			y = y.saturating_add(allocation);
 		}
-		if let Some(overflow) = plan.overflow
-			&& overflow.hidden > 0
-			&& h_live > 0
-		{
+		if layout_overflow && summary_rows > 0 {
+			let hidden = allocs.iter().filter(|allocation| **allocation == 0).count();
 			let summary_y = h_live.saturating_sub(1);
-			self
-				.frame
-				.fill(Rect::new(0, summary_y, content_width, 1), panel_style(self.ctx.theme));
-			let label = sf!("+{} active", overflow.hidden);
+			self.frame.fill(
+				Rect::new(0, summary_y, content_width, summary_rows),
+				panel_style(self.ctx.theme),
+			);
+			let label = sf!("+{hidden} blocks");
 			draw_line(&mut self.frame, 1, summary_y, content_width.saturating_sub(2), &[Span::new(
 				&label,
 				ink(self.ctx.theme.muted).bold(),
@@ -3019,7 +3085,9 @@ impl Chat {
 				draw_line(
 					&mut self.frame,
 					1,
-					chrome_y.saturating_add(u16::try_from(offset).unwrap_or(u16::MAX)).saturating_add(1),
+					chrome_y
+						.saturating_add(u16::try_from(offset).unwrap_or(u16::MAX))
+						.saturating_add(1),
 					content_width.saturating_sub(2),
 					&[Span::new(line.as_str(), ink(self.ctx.theme.muted))],
 				);
@@ -3099,15 +3167,28 @@ impl Chat {
 		}
 	}
 
-	/// Renders the shortest finalized prefix that must retire for the live
-	/// tail to fit the viewport's transcript capacity.
-	///
-	/// While the screen has room — and fewer than [`MAX_LIVE_BLOCKS`] blocks
-	/// are live — nothing retires: settled snapshots keep reflowing in the
-	/// mutable viewport. Retirement stops at the first unfinished block. A
-	/// zero-height viewport (headless export) retires the complete finalized
-	/// prefix.
+	/// Renders the next pressure-required finalized prefix or pending replay.
 	pub fn retirement_batch(&mut self, viewport: Size) -> Option<RetirementBatch> {
+		self.retirement_batch_with(viewport, RetirementPolicy::Pressure)
+	}
+
+	/// Renders the complete eligible prefix for graceful shutdown.
+	pub fn flush_retirement_batch(&mut self, viewport: Size) -> Option<RetirementBatch> {
+		self.retirement_batch_with(viewport, RetirementPolicy::Flush)
+	}
+
+	fn retirement_batch_with(
+		&mut self,
+		viewport: Size,
+		policy: RetirementPolicy,
+	) -> Option<RetirementBatch> {
+		if let Some(replay) = self.replay {
+			return Some(self.render_retirement_batch(
+				replay.cursor..replay.end,
+				viewport.width.max(1),
+				RetirementKind::Replay,
+			));
+		}
 		let eligible = self.blocks.retirement_batch()?;
 		let elapsed = self.started_at.elapsed();
 		let h_live = self.chrome_layout(viewport, elapsed).h_live;
@@ -3150,16 +3231,22 @@ impl Chat {
 		}
 
 		let live_count = self.blocks.live_count();
-		if total <= u32::from(h_live) && live_count < MAX_LIVE_BLOCKS {
+		if policy == RetirementPolicy::Pressure
+			&& total <= u32::from(h_live)
+			&& live_count < MAX_LIVE_BLOCKS
+		{
 			return None;
 		}
-		// Shortest eligible prefix whose removal fits both bounds; under
-		// sustained overflow the complete eligible prefix retires.
+		// Pressure retires the shortest sufficient prefix; Flush takes every
+		// currently eligible head so graceful shutdown can drain in one batch.
 		let mut end = eligible.start;
 		let mut freed = 0_u32;
 		for height in &prefix {
 			let taken = end - eligible.start;
-			if total - freed <= u32::from(h_live) && live_count - taken < MAX_LIVE_BLOCKS {
+			if policy == RetirementPolicy::Pressure
+				&& total - freed <= u32::from(h_live)
+				&& live_count - taken < MAX_LIVE_BLOCKS
+			{
 				break;
 			}
 			freed += height;
@@ -3169,45 +3256,38 @@ impl Chat {
 			return None;
 		}
 		let range = eligible.start..end;
-		let width = viewport.width.max(1);
-		for ordinal in range.clone() {
-			if let Some(entry) = self.entries.get_mut(&BlockOrdinal(ordinal))
+		Some(self.render_retirement_batch(range, viewport.width.max(1), RetirementKind::Commit))
+	}
+
+	fn render_retirement_batch(
+		&mut self,
+		range: Range<u64>,
+		width: u16,
+		kind: RetirementKind,
+	) -> RetirementBatch {
+		let start = range.start;
+		let mut end = start;
+		let mut frame_height = 0_u32;
+		for ordinal in range {
+			let entry_height = if let Some(entry) = self.entries.get_mut(&BlockOrdinal(ordinal))
 				&& !(self.hide_thinking && matches!(entry, Entry::Thinking(_)))
 			{
 				Self::resize_entry(entry, width, &self.ctx);
+				u32::from(Self::entry_height(entry, width))
+			} else {
+				0
+			};
+			if end > start && frame_height + entry_height > u32::from(u16::MAX) {
+				break;
 			}
+			frame_height += entry_height;
+			end = ordinal + 1;
 		}
-		let mut height = 0_u16;
-		let mut previous_read = false;
-		for ordinal in range.clone() {
-			let entry = self.entries.get(&BlockOrdinal(ordinal));
-			let is_read = matches!(entry, Some(Entry::Tool(tool)) if tool.name.as_str() == "read");
-			if is_read && !previous_read {
-				let count = range
-					.clone()
-					.skip_while(|candidate| *candidate != ordinal)
-					.take_while(|candidate| {
-						matches!(
-							self.entries.get(&BlockOrdinal(*candidate)),
-							Some(Entry::Tool(tool)) if tool.name.as_str() == "read"
-						)
-					})
-					.count();
-				if count >= 2 {
-					height = height.saturating_add(1);
-				}
-			}
-			if let Some(entry) = entry
-				&& !(self.hide_thinking && matches!(entry, Entry::Thinking(_)))
-			{
-				height = height.saturating_add(Self::entry_height(entry, width));
-			}
-			previous_read = is_read;
-		}
+		let range = start..end;
+		let height = u16::try_from(frame_height).expect("retirement frame height is capped");
 		let mut frame = Frame::new(Size::new(width, height));
 		frame.fill(Rect::new(0, 0, width, height), base_style(self.ctx.theme));
 		let mut y = 0_u16;
-		let mut previous_read = false;
 		for ordinal in range.clone() {
 			let Some(entry) = self.entries.get(&BlockOrdinal(ordinal)) else {
 				continue;
@@ -3215,48 +3295,36 @@ impl Chat {
 			if self.hide_thinking && matches!(entry, Entry::Thinking(_)) {
 				continue;
 			}
-			let is_read = matches!(entry, Entry::Tool(tool) if tool.name.as_str() == "read");
-			if is_read && !previous_read {
-				let count = range
-					.clone()
-					.skip_while(|candidate| *candidate != ordinal)
-					.take_while(|candidate| {
-						matches!(
-							self.entries.get(&BlockOrdinal(*candidate)),
-							Some(Entry::Tool(tool)) if tool.name.as_str() == "read"
-						)
-					})
-					.count();
-				if count >= 2 {
-					let label = read_group_label(count);
-					draw_line(&mut frame, 1, y, width.saturating_sub(2), &[Span::new(
-						&label,
-						ink(self.ctx.theme.muted).bold(),
-					)]);
-					y = y.saturating_add(1);
-				}
-			}
 			y = y.saturating_add(Self::draw_entry(&mut frame, entry, y, width, &self.ctx));
-			previous_read = is_read;
 		}
-		Some(RetirementBatch { range, frame })
+		RetirementBatch { range, frame, kind }
 	}
 
-	/// Advances the retirement frontier.
-	///
-	/// Committed snapshots are retained so a display replay
-	/// ([`Chat::reset_retirement`]) can re-render the complete finalized
-	/// transcript at a new width.
-	pub fn mark_committed(&mut self, upto: u64) {
-		self.blocks.mark_committed(upto);
-	}
-
-	/// Reopens the committed prefix so the finalized transcript replays
-	/// through ordered retirement, e.g. after a settled resize or a
-	/// destructive display reset.
-	pub fn reset_retirement(&mut self) {
-		self.blocks.reset_retirement();
+	/// Starts a complete replay of the immutable committed prefix without
+	/// changing block phases or the logical commit frontier.
+	pub fn begin_replay(&mut self) {
+		let end = self.blocks.frontier();
+		self.replay = (end > 0).then_some(Replay { cursor: 0, end });
 		self.bump_live();
+	}
+
+	/// Acknowledges one successful commit or replay batch.
+	pub fn mark_retired(&mut self, batch: &RetirementBatch) {
+		match batch.kind {
+			RetirementKind::Commit => self.blocks.mark_committed(batch.range.end),
+			RetirementKind::Replay => {
+				let replay = self
+					.replay
+					.as_mut()
+					.expect("replay batch requires replay state");
+				debug_assert_eq!(batch.range.start, replay.cursor);
+				debug_assert!(batch.range.end <= replay.end);
+				replay.cursor = batch.range.end;
+				if replay.cursor == replay.end {
+					self.replay = None;
+				}
+			},
+		}
 	}
 
 	fn enqueue_final(&mut self, entry: Entry) -> BlockOrdinal {
@@ -3895,10 +3963,6 @@ fn explicit_line_count(text: &str) -> u16 {
 	u16::try_from(text.lines().count().max(1)).unwrap_or(u16::MAX)
 }
 
-fn read_group_label(count: usize) -> Str {
-	fmts_mut!("Read {count} files").freeze()
-}
-
 fn agent_label(agent: &AgentRow, charset: Charset) -> Str {
 	let mut label = StrMut::with_capacity(64);
 	for _ in 0..agent.depth.min(4) {
@@ -3982,6 +4046,7 @@ mod tests {
 	use std::{env, fs, process};
 
 	use super::*;
+	use crate::BlockPhase;
 
 	fn ctx() -> UiContext {
 		UiContext::default()
@@ -4007,6 +4072,23 @@ mod tests {
 			assert_eq!(chat.render(viewport).frame.size(), viewport);
 		}
 	}
+	#[test]
+	fn resource_status_names_the_owner_and_fifo_queue_depth() {
+		let facts = StatusFacts {
+			model: sf!("Fable 5"),
+			visible_resources: std::sync::Arc::from([crate::VisibleResourceFacts {
+				resource:    sf!("mode"),
+				owner:       sf!("plan"),
+				queue_depth: 2,
+			}]),
+			..StatusFacts::default()
+		};
+
+		let labels = StatusLabels::new(&facts, Charset::Ascii);
+		assert_eq!(labels.resources.len(), 1);
+		assert_eq!(labels.resources[0].as_str(), "mode plan +2");
+	}
+
 	#[test]
 	fn thinking_replaces_the_model_icon_without_rendering_a_level_label() {
 		let ctx = UiContext { charset: Charset::NerdFont, ..UiContext::default() };
@@ -4082,12 +4164,15 @@ mod tests {
 
 		chat.begin_assistant("retry");
 
-		assert_eq!(
-			chat.blocks.phase(BlockOrdinal(0)),
-			Some(BlockPhase::FinalizedPending),
-		);
+		assert_eq!(chat.blocks.phase(BlockOrdinal(0)), Some(BlockPhase::FinalizedPending),);
 		assert!(!chat.entries.contains_key(&BlockOrdinal(0)));
-		assert_eq!(chat.live_assistant.as_ref().map(|message| message.id.as_str()), Some("retry"));
+		assert_eq!(
+			chat
+				.live_assistant
+				.as_ref()
+				.map(|message| message.id.as_str()),
+			Some("retry")
+		);
 	}
 
 	#[test]
@@ -4115,26 +4200,24 @@ mod tests {
 	}
 
 	#[test]
-	fn consecutive_reads_group_until_another_transcript_entry() {
+	fn replay_renders_the_same_committed_rows() {
 		let mut chat = Chat::new(&ctx());
 		for id in ["a", "b"] {
 			chat.tool_started(id, "read", "1", id);
 			chat.tool_finished(id, true, id.into());
 		}
+		let viewport = Size::new(40, 0);
 		let batch = chat
-			.retirement_batch(Size::new(40, 0))
+			.retirement_batch(viewport)
 			.expect("queued finals retire");
-		assert!(frame_text(&batch.frame).contains("Read 2 files"));
-		chat.mark_committed(batch.range.end);
-		chat.tool_started("shell", "bash", "1", "shell");
-		chat.tool_finished("shell", true, "done".into());
-		chat.tool_started("c", "read", "1", "c");
-		chat.tool_finished("c", true, "c".into());
-		let batch = chat
-			.retirement_batch(Size::new(40, 0))
-			.expect("next finals retire");
-		assert_eq!(frame_text(&batch.frame).matches("Read 1 files").count(), 0);
-		assert!(frame_text(&batch.frame).contains("c"));
+		let committed = frame_text(&batch.frame);
+		chat.mark_retired(&batch);
+
+		chat.begin_replay();
+		let replay = chat
+			.retirement_batch(viewport)
+			.expect("committed rows replay");
+		assert_eq!(frame_text(&replay.frame), committed);
 	}
 
 	#[test]
@@ -4270,8 +4353,24 @@ mod tests {
 		let tight = Size::new(40, 7);
 		let batch = chat.retirement_batch(tight).expect("pressure retires");
 		assert_eq!(batch.range.start, 0);
-		chat.mark_committed(batch.range.end);
+		chat.mark_retired(&batch);
 		assert!(chat.retirement_batch(tight).is_none());
+	}
+
+	#[test]
+	fn retirement_projects_the_post_commit_viewport_before_acknowledgement() {
+		let mut chat = Chat::new(&ctx());
+		chat.push_notice("head\nhead\nhead\nhead");
+		chat.push_notice("newly visible");
+		let viewport = Size::new(40, 7);
+		let batch = chat
+			.retirement_batch(viewport)
+			.expect("pressure retires head");
+		assert_eq!(batch.range, 0..1);
+
+		let projected = frame_text(chat.render_after_retirement(viewport, &batch).frame);
+		assert!(!projected.contains("head"), "{projected}");
+		assert!(projected.contains("newly visible"), "{projected}");
 	}
 
 	#[test]
@@ -4297,20 +4396,40 @@ mod tests {
 	}
 
 	#[test]
-	fn reset_retirement_reoffers_the_committed_prefix() {
+	fn replay_reoffers_committed_rows_without_rewinding_the_frontier() {
 		let mut chat = Chat::new(&ctx());
 		chat.push_notice("replayed row");
 		let drained = Size::new(40, 0);
 		let batch = chat.retirement_batch(drained).expect("initial retire");
-		chat.mark_committed(batch.range.end);
+		chat.mark_retired(&batch);
+		let frontier = chat.blocks.frontier();
 		assert!(chat.retirement_batch(drained).is_none());
 
-		chat.reset_retirement();
+		chat.begin_replay();
+		assert_eq!(chat.blocks.frontier(), frontier);
 		let replay = chat.retirement_batch(drained).expect("replay retire");
-		assert_eq!(replay.range.start, 0);
+		assert_eq!(replay.range, 0..frontier);
 		assert!(frame_text(&replay.frame).contains("replayed row"));
-		chat.mark_committed(replay.range.end);
+		chat.mark_retired(&replay);
+		assert_eq!(chat.blocks.frontier(), frontier);
 		assert!(chat.retirement_batch(drained).is_none());
+	}
+
+	#[test]
+	fn clear_history_does_not_mutate_committed_replay_rows() {
+		let mut chat = Chat::new(&ctx());
+		chat.push_notice("immutable committed row");
+		let drained = Size::new(40, 0);
+		let batch = chat.retirement_batch(drained).expect("initial retire");
+		chat.mark_retired(&batch);
+
+		chat.clear_history();
+		chat.begin_replay();
+		let replay = chat
+			.retirement_batch(drained)
+			.expect("committed row replays");
+		assert!(frame_text(&replay.frame).contains("immutable committed row"));
+		assert!(!frame_text(&replay.frame).contains("history cleared"));
 	}
 
 	#[test]
@@ -4362,7 +4481,39 @@ mod tests {
 		}
 		settle(&mut chat, Size::new(30, 10));
 		let rendered = chat.render_at(Size::new(30, 5), Duration::from_millis(500));
-		assert!(frame_text(rendered.frame).contains("active"));
+		assert!(frame_text(rendered.frame).contains("blocks"));
+	}
+
+	#[test]
+	fn queued_demand_does_not_displace_the_only_active_row() {
+		let mut chat = Chat::new(&ctx());
+		let viewport = Size::new(30, 5);
+		chat.tool_started("active", "read", "1", "active row");
+		let _ = chat.render_at(viewport, Duration::from_millis(100));
+		chat.tool_started("queued", "read", "1", "queued row");
+		let rendered = chat.render_at(viewport, Duration::from_millis(200));
+		let text = frame_text(rendered.frame);
+
+		assert_eq!(chat.blocks.phase(BlockOrdinal(0)), Some(crate::BlockPhase::Active));
+		assert_eq!(chat.blocks.phase(BlockOrdinal(1)), Some(crate::BlockPhase::Queued));
+		assert!(text.contains("active row"), "{text}");
+		assert!(!text.contains("blocks"), "{text}");
+	}
+
+	#[test]
+	fn queued_only_demand_admits_without_painting_a_summary() {
+		let mut chat = Chat::new(&ctx());
+		let viewport = Size::new(30, 5);
+		chat.tool_started("first", "read", "1", "first row");
+		chat.tool_started("second", "read", "1", "second row");
+		let first = frame_text(chat.render_at(viewport, Duration::from_millis(100)).frame);
+
+		assert_eq!(chat.blocks.phase(BlockOrdinal(0)), Some(crate::BlockPhase::Active));
+		assert_eq!(chat.blocks.phase(BlockOrdinal(1)), Some(crate::BlockPhase::Queued));
+		assert!(!first.contains("blocks"), "{first}");
+		let second = frame_text(chat.render_at(viewport, Duration::from_millis(200)).frame);
+		assert!(second.contains("first row"), "{second}");
+		assert!(!second.contains("blocks"), "{second}");
 	}
 
 	#[test]

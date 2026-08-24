@@ -14,10 +14,11 @@ pub mod autoqa;
 pub mod blocks;
 pub mod completion;
 pub mod debug_selector;
+pub mod extension_inspector;
 pub mod frame;
+pub mod git;
 pub mod gradient;
 pub mod host;
-pub mod extension_inspector;
 pub mod inspector;
 pub mod log_viewer;
 pub mod modes;
@@ -48,6 +49,10 @@ pub use extension_inspector::{
 	ExtensionCatalogSource, ExtensionDetail, ExtensionDisposition, ExtensionInspector,
 	ExtensionInspectorEvent, ExtensionKind, ExtensionOrigin, ExtensionRow, ExtensionSnapshot,
 	LiveToolView, McpCatalogEntry, McpHealth, McpLiveSnapshot, McpToolView,
+};
+pub use git::{
+	GitArea, GitChangeKind, GitCommitInfo, GitFileContents, GitFileRow, GitIntent, GitPatchOp,
+	GitSnapshot, GitUpdate, GitWorkbench, GitWorkbenchEvent,
 };
 pub use gradient::{EditorGradient, EditorHighlight, GradientStop};
 pub use image_overlay::{ImageOverlay, ImageOverlayEvent};
@@ -277,15 +282,14 @@ impl Default for ActivityWaveform {
 	}
 }
 
-/// Complete host-supplied status snapshot.
-/// One visible campaign-slot holder projected by the backend.
+/// One visible resource owner projected by the backend.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct VisibleSlotFacts {
-	/// Canonical slot name.
-	pub slot:        Str,
-	/// Campaign declaration currently holding the slot.
-	pub holder:      Str,
-	/// Durable FIFO tickets waiting behind the holder.
+pub struct VisibleResourceFacts {
+	/// Canonical resource name.
+	pub resource:    Str,
+	/// Regime currently owning the resource.
+	pub owner:       Str,
+	/// Durable FIFO activations waiting behind the owner.
 	pub queue_depth: usize,
 }
 
@@ -316,8 +320,8 @@ pub struct StatusFacts {
 	pub advisor_cost_nanos:     u64,
 	/// Number of queued user submissions.
 	pub queued:                 usize,
-	/// Campaign slots whose declarations opt into user-facing status.
-	pub visible_slots:          Arc<[VisibleSlotFacts]>,
+	/// Resources whose owning regimes opt into user-facing status.
+	pub visible_resources:      Arc<[VisibleResourceFacts]>,
 	/// Number of active background jobs.
 	pub jobs:                   usize,
 	/// Current retry attempt.
@@ -439,6 +443,8 @@ pub enum ApprovalAction {
 /// Outbound intent for the host to forward to its backend.
 #[derive(Clone)]
 pub enum Intent {
+	/// Forward one interactive Git workbench request.
+	Git(GitIntent),
 	/// Submit composer text and staged attachments.
 	Submit {
 		/// User-authored composer text.
@@ -620,6 +626,10 @@ pub struct RewindTargetRow {
 /// Inbound mutation emitted by a backend.
 #[derive(Clone)]
 pub enum BackendEvent {
+	/// Open the fullscreen Git workbench over one repository snapshot.
+	OpenGitWorkbench(GitSnapshot),
+	/// Apply one update to the open Git workbench.
+	Git(GitUpdate),
 	/// Replay a user message from durable history.
 	/// Open the retained guided-goal interview.
 	OpenGuidedGoal,
@@ -795,9 +805,11 @@ pub enum BackendEvent {
 	SlashCommands(Vec<omp_tui::Command>),
 	/// Request the live agent hierarchy overlay.
 	OpenAgentTree,
-	/// Open the retained extension inspector over one immutable catalog generation.
+	/// Open the retained extension inspector over one immutable catalog
+	/// generation.
 	OpenExtensionInspector(ExtensionSnapshot),
-	/// Atomically replace the declared extension catalog while preserving the overlay.
+	/// Atomically replace the declared extension catalog while preserving the
+	/// overlay.
 	ExtensionSnapshotUpdated(ExtensionSnapshot),
 	/// Merge one live MCP server generation into the open extension inspector.
 	ExtensionMcpUpdated(McpLiveSnapshot),

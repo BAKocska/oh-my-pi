@@ -184,7 +184,8 @@ impl CommandPalette {
 			| UiEvent::Submit
 			| UiEvent::Highlighted { .. }
 			| UiEvent::Pressed(_)
-			| UiEvent::Copied(_) => PaletteEvent::Consumed,
+			| UiEvent::Copied(_)
+			| UiEvent::DiffAction { .. } => PaletteEvent::Consumed,
 		}
 	}
 }

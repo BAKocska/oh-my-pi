@@ -168,7 +168,8 @@ impl ProviderPicker {
 			| UiEvent::Changed { .. }
 			| UiEvent::Filtered { .. }
 			| UiEvent::Highlighted { .. }
-			| UiEvent::Copied(_) => PickerEvent::Consumed,
+			| UiEvent::Copied(_)
+			| UiEvent::DiffAction { .. } => PickerEvent::Consumed,
 		}
 	}
 }
