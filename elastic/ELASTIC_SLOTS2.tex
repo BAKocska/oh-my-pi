@@ -1,0 +1,2041 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1.05in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{mathtools}
+\usepackage{lmodern}
+\usepackage[T1]{fontenc}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{microtype}
+\usepackage{xcolor}
+\usepackage[colorlinks=true,linkcolor=blue!45!black,citecolor=blue!45!black,urlcolor=blue!45!black]{hyperref}
+
+% ---------------------------------------------------------------------------
+% Notation macros
+% ---------------------------------------------------------------------------
+\newcommand{\seq}[1]{\langle #1\rangle}
+\newcommand{\emptyseq}{\seq{\,}}
+\newcommand{\len}[1]{\lvert #1\rvert}
+\newcommand{\pre}{\sqsubseteq}                 % prefix order on sequences
+\newcommand{\cat}{\mathbin{\cdot}}             % sequence concatenation
+\newcommand{\Cat}{\bigodot}                    % iterated concatenation
+\newcommand{\Blocks}{\mathcal{B}}
+\newcommand{\Snap}{\mathbb{S}}
+\newcommand{\Wd}{\mathbb{W}}
+\newcommand{\Src}{\mathbb{Q}}
+\newcommand{\NoFinal}{\bot}
+\newcommand{\Undecl}{\bot}
+\newcommand{\PhRow}{\boxdot}                   % placeholder row
+\newcommand{\BlRow}{\square}                   % blank row
+\newcommand{\OvRow}{\boxplus}                  % overflow-summary row
+\newcommand{\Bcell}{\beta}                     % blank cell (0,\BlRow)
+\newcommand{\Ocell}{\omega_{\OvRow}}
+\newcommand{\Mutable}{\mathsf{Mutable}}
+\newcommand{\AppendOnly}{\mathsf{AppendOnly}}
+\newcommand{\Absent}{\mathsf{Absent}}
+\newcommand{\Queued}{\mathsf{Queued}}
+\newcommand{\Active}{\mathsf{Active}}
+\newcommand{\Finalized}{\mathsf{Finalized}}
+\newcommand{\Committed}{\mathsf{Committed}}
+\newcommand{\wide}{\mathsf{wide}}
+\newcommand{\narrow}{\mathsf{narrow}}
+\newcommand{\Preserve}{\mathsf{Preserve}}
+\newcommand{\AppendPol}{\mathsf{Append}}
+\newcommand{\Rebuild}{\mathsf{Rebuild}}
+\newcommand{\None}{\mathsf{None}}
+\newcommand{\srcApp}{\mathsf{Append}}
+\newcommand{\srcRet}{\mathsf{Retire}}
+\newcommand{\srcRep}{\mathsf{Replay}}
+\newcommand{\srcRsz}{\mathsf{Resize}}
+\newcommand{\srcFail}{\mathsf{FailedWrite}}
+\newcommand{\srcExit}{\mathsf{Exit}}
+\newcommand{\stRun}{\mathsf{Running}}
+\newcommand{\stGrace}{\mathsf{Graceful}}
+\newcommand{\stDetach}{\mathsf{Detach}}
+\newcommand{\stWF}{\mathsf{WriteFailure}}
+\newcommand{\ren}[1]{\rho_{#1}}
+\newcommand{\tg}{\mathrm{tag}}
+\newcommand{\ntg}{\mathrm{ntag}}
+\newcommand{\Un}{U}
+\newcommand{\pres}{\mathrm{pres}}
+\newcommand{\vis}{\mathrm{vis}}
+\newcommand{\ovf}{\mathrm{ovf}}
+\newcommand{\newer}{\mathrm{newer}}
+\newcommand{\AOK}{\mathcal{A}}
+\newcommand{\Canon}{\kappa}
+\newcommand{\Press}{\mathrm{press}}
+\newcommand{\Req}{\mathrm{req}}
+\newcommand{\PH}{\mathrm{ph}}
+\newcommand{\Repl}{\mathrm{rep}}
+\newcommand{\RRows}{\mathcal{R}}
+\newcommand{\Room}{\mathrm{room}}
+\newcommand{\Ledger}{L}
+\newcommand{\Native}{P}
+\newcommand{\Scr}{Q}
+\newcommand{\rmode}{m_{\mathrm{r}}}
+\newcommand{\rcur}{\ell_{\mathrm{r}}}
+\newcommand{\rend}{u_{\mathrm{r}}}
+\newcommand{\rpart}{p_{\mathrm{r}}}
+\newcommand{\rprep}{\mathit{prep}}
+\newcommand{\rcut}{\mathit{cut}}
+\newcommand{\flush}{\mathit{flush}}
+\newcommand{\shut}{\mathit{shut}}
+\newcommand{\run}{\mathit{run}}
+\newcommand{\stopr}{\mathit{stop}}
+\newcommand{\created}{\gamma}
+\newcommand{\MaxLive}{\Lambda}
+\newcommand{\MaxRes}{R_{\max}}
+\newcommand{\Lmax}{L_{\max}}
+\newcommand{\Fmax}{K_{\max}}
+\newcommand{\ps}{\mathrm{pv}}
+\newcommand{\pc}{\mathrm{cell}}
+\DeclareMathOperator{\Res}{Res}
+\DeclareMathOperator{\dm}{dm}
+\DeclareMathOperator{\last}{last}
+\newcommand{\act}[1]{\text{\normalfont\scshape #1}}
+\newcommand{\tla}[1]{\texttt{#1}}
+\newcommand{\stt}{\Vdash}
+\emergencystretch=1.5em
+
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{corollary}[theorem]{Corollary}
+\newtheorem{proposition}[theorem]{Proposition}
+\theoremstyle{definition}
+\newtheorem{definition}[theorem]{Definition}
+\newtheorem{assumption}[theorem]{Assumption}
+\newtheorem{convention}[theorem]{Convention}
+\theoremstyle{remark}
+\newtheorem{remark}[theorem]{Remark}
+
+\title{\textbf{Elastic Speculative Slots:}\\
+A Formally Verified Protocol for In-Order Retirement and\\
+Natural Streaming of Concurrent Blocks in a Terminal Viewport}
+\author{Formal Methods Group, Oh My Pi}
+\date{August 24, 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Interactive terminal applications increasingly multiplex \emph{speculative}
+output blocks---streaming model tokens, concurrent build steps, live
+spinners---inside a bounded live viewport, while the terminal's own scrollback
+demands an immutable, append-only commitment discipline. We present
+\emph{Elastic Speculative Slots}, a rendering protocol that reconciles these
+constraints through a decoupled three-layer contract: mutable semantic block
+state, an exactly-once logical history ledger, and the physical native
+scrollback of the host terminal. The protocol admits blocks in order, presents
+them in elastically allocated slots under a strict reservation invariant with
+graceful overflow summarization and zero-height degradation, streams
+append-only blocks line-by-line under row pressure, retires finalized blocks
+in order under pressure or flush, and survives width/height resizes via three
+policies ($\Preserve$, $\AppendPol$, $\Rebuild$) with a bottom-first,
+single-write synchronous replay that is tearing-free by construction. Partial
+terminal write failures are fail-stop: the native scrollback receives a prefix
+of immutable rows and the commit frontier never advances, precluding
+duplicated or reordered retirement. We formalize the protocol as a guarded
+transition system, prove a global inductive safety theorem (exact ledger
+content, capacity exactness, overflow forcing, final-snapshot immutability,
+epoch-scoped native monotonicity, resize logical-neutrality, fail-stop
+safety), prove physical realizability on a standard scrolling terminal via a
+generic streaming lemma, and establish conditional progress theorems under
+weak fairness, including a precise delineation of when pressure-driven
+retirement is guaranteed. Every definition and transition corresponds
+one-to-one to the mechanically checked TLA\textsuperscript{+} specification
+\texttt{ElasticSlots.tla}; TLC exhaustively verified ten invariants and ten
+temporal properties over three boundary configurations totaling
+$272{,}860$ distinct states with no violations.
+\end{abstract}
+
+\tableofcontents
+
+% ===========================================================================
+\section{Introduction}\label{sec:intro}
+% ===========================================================================
+
+A terminal emulator is a stateful streaming device. Its scrollback is a
+line-buffered, append-only log: once a row scrolls off the top of the visible
+screen it is frozen in the user's history and cannot be revised. Modern
+command-line applications, however, produce output that is intrinsically
+\emph{speculative} while it is being produced---a language-model response
+being streamed token by token, a package build whose progress bar rewrites
+itself, a test runner whose live summary shrinks and grows. Such applications
+must therefore maintain a bounded \emph{live viewport} in which content may be
+repainted arbitrarily, and a disciplined boundary across which content is
+\emph{retired} into scrollback exactly once, in order, and never again
+touched.
+
+This paper gives a complete formal treatment of one such discipline, the
+\emph{Elastic Speculative Slots} protocol, exactly as specified in the
+TLA\textsuperscript{+} module \texttt{ElasticSlots.tla}. The protocol rests on
+a decoupled three-layer contract:
+
+\begin{enumerate}
+\item \emph{Semantic application state.} A monotonically ordered family of
+  blocks $1,\dots,N$, each carrying a speculative snapshot (its \emph{want})
+  and, upon finalization, an immutable \emph{final} snapshot.
+\item \emph{Logical history ledger.} A width-independent, exactly-once,
+  in-order sequence of committed semantic rows, extended only at its end, plus
+  the stable emitted prefix of at most one active append-only head block.
+\item \emph{Physical native history.} The rows actually scrolled into the
+  terminal's scrollback, each tagged with the \emph{proof source} that emitted
+  it ($\srcApp$, $\srcRet$, $\srcRep$, $\srcRsz$, $\srcFail$, $\srcExit$) and
+  the width at which it was rendered.
+\end{enumerate}
+
+The layers are related by invariants, not by identity: the ledger is a pure
+function of the commit frontier and the final snapshots; the native history is
+an epoch-scoped, append-only physical realization whose rows are always
+attributable to committed content, to the stable head prefix, or to explicitly
+tagged resize/exit/failure events. Resizes may re-render the entire native
+display ($\Rebuild$) without perturbing the ledger by even one row.
+
+\paragraph{Contributions.}
+\begin{enumerate}
+\item A precise mathematical model of the protocol state, its live-viewport
+  geometry (elastic slot allocation, reservation dominance, shrink bridges,
+  overflow summarization, zero-height degradation), and its dual history
+  ledgers (\S\ref{sec:model}).
+\item A guarded-command transition system covering the full lifecycle:
+  admission, speculation, allocation, natural append-only streaming,
+  finalization, pressure- and flush-driven retirement, three resize policies
+  with bottom-first synchronous replay, write-failure fail-stop, and graceful
+  and detached shutdown (\S\ref{sec:protocol}), together with a conformance
+  table of required and forbidden implementation effects.
+\item Full proofs of: exact capacity and overflow forcing
+  (Theorem~\ref{thm:capacity}); reservation dominance and bridge termination
+  (Lemma~\ref{lem:bridge}); stable-head emission and ledger monotonicity
+  (Lemma~\ref{lem:head}); a generic streaming-realization lemma connecting
+  abstract native appends to concrete VT scroll mechanics
+  (Lemma~\ref{lem:stream}); the bottom-first synchronous replay invariant
+  (Lemma~\ref{lem:replay}); a global inductive safety theorem
+  (Theorem~\ref{thm:safety}); and conditional progress theorems under weak
+  fairness (\S\ref{sec:liveness}), including an explicit counterexample
+  delimiting when pure row pressure does \emph{not} force retirement.
+\item A one-to-one mapping from the mathematics to the mechanically checked
+  actions, invariants, and temporal properties of \texttt{ElasticSlots.tla},
+  with exhaustive TLC model-checking results over three boundary
+  configurations (\S\ref{sec:tlc}).
+\end{enumerate}
+
+% ===========================================================================
+\section{System Model and Formal Definitions}\label{sec:model}
+% ===========================================================================
+
+\subsection{Preliminaries}
+
+$\mathbb{N}$ denotes the naturals including $0$; for $k\in\mathbb{N}$ we write
+$[k]=\{1,\dots,k\}$ (so $[0]=\emptyset$). For a set $X$, $X^{*}$ is the set of
+finite sequences over $X$; $\emptyseq$ is the empty sequence; $\len{s}$ is the
+length of $s$; $s[j]$ is the $j$-th element ($1$-indexed); and
+\[
+  s[l..u] \;=\; \seq{s[l],s[l{+}1],\dots,s[u]},
+  \qquad\text{with } s[l..u]=\emptyseq \text{ whenever } l>u .
+\]
+Concatenation is written $s\cat t$, iterated concatenation
+$\Cat_{j=l}^{u} s_j = s_l \cat s_{l+1}\cat\cdots\cat s_u$ (empty when $l>u$),
+and $x^{k}$ denotes the sequence consisting of $k$ copies of $x$. The
+\emph{prefix order} is
+\[
+  s \pre t \;\iff\; \len{s}\le\len{t} \;\wedge\; \forall j\in[\len{s}]:\,
+  s[j]=t[j].
+\]
+$\last(s)=s[\len{s}]$ for nonempty $s$. All proofs use only these elementary
+operations.
+
+\subsection{Parameters and alphabets}
+
+\begin{assumption}[Protocol parameters]\label{ass:params}
+The protocol is parameterized by
+\begin{itemize}
+\item $N\in\mathbb{N}\setminus\{0\}$, the number of block identities,
+  $\Blocks=[N]$;
+\item $H\in\mathbb{N}\setminus\{0\}$, the maximum transcript (viewport)
+  height;
+\item $\MaxRes\in\mathbb{N}$, a bound on the number of resize events;
+\item $\MaxLive\in\mathbb{N}\setminus\{0\}$, the uncommitted-block pressure
+  threshold;
+\item a finite nonempty \emph{row alphabet} $\Sigma$ and a finite
+  \emph{snapshot universe} $\Snap\subseteq\Sigma^{*}$ with
+  $\emptyseq\in\Snap$, containing at least one snapshot of length $1$ and one
+  of length $>1$;
+\item pairwise-distinct symbols
+  $\NoFinal,\PhRow,\BlRow,\OvRow\notin\Sigma$ (respectively: ``no final
+  snapshot'', the placeholder row, the blank row, and the overflow-summary
+  row).
+\end{itemize}
+We write $\Lmax=\max\{\len{s}:s\in\Snap\}$ and
+$\Fmax = 2N\Lmax$, an upper bound on the physical length of any single write
+batch (the factor $2$ arises from narrow-width rendering,
+Definition~\ref{def:render}).
+\end{assumption}
+
+\begin{definition}[Widths and rendering]\label{def:render}
+The width domain is $\Wd=\{\wide,\narrow\}$. The \emph{width rendering
+function} $\ren{\omega}:\Sigma^{*}\to\Sigma^{*}$ is
+\[
+  \ren{\wide}(s)=s,
+  \qquad
+  \ren{\narrow}(\emptyseq)=\emptyseq,
+  \qquad
+  \ren{\narrow}(\seq{x}\cat s)=\seq{x,x}\cat\ren{\narrow}(s).
+\]
+\end{definition}
+
+$\ren{\narrow}$ doubles every semantic row: it is the two-point abstraction of
+soft-wrap reflow, in which a semantic row may occupy a different number of
+physical terminal rows at different widths. All that the proofs use is that
+$\ren{\omega}$ is prefix-monotone and length-homogeneous:
+
+\begin{proposition}\label{prop:render}
+For all $s,t\in\Sigma^{*}$ and $\omega\in\Wd$:
+(i)~$\len{\ren{\omega}(s)}=\delta_\omega\len{s}$ with $\delta_\wide=1$,
+$\delta_\narrow=2$;
+(ii)~$s\pre t \Rightarrow \ren{\omega}(s)\pre\ren{\omega}(t)$;
+(iii)~$\ren{\omega}(s\cat t)=\ren{\omega}(s)\cat\ren{\omega}(t)$.
+\end{proposition}
+\begin{proof}
+Immediate induction on $\len{s}$ from Definition~\ref{def:render}.
+\end{proof}
+
+\begin{definition}[Cells, ledger rows, native rows]\label{def:cells}
+Let $\Gamma=\Sigma\cup\{\PhRow,\BlRow,\OvRow\}$ be the \emph{cell alphabet}
+and $\Src=\{\srcApp,\srcRet,\srcRep,\srcRsz,\srcFail,\srcExit\}$ the
+\emph{source alphabet}. Then:
+\begin{itemize}
+\item a \emph{cell} is a pair $(o,x)\in(\{0\}\cup\Blocks)\times\Gamma$
+  (owner~$0$ marks non-block chrome); the \emph{blank cell} is
+  $\Bcell=(0,\BlRow)$ and the \emph{overflow cell} is $\Ocell=(0,\OvRow)$;
+\item a \emph{ledger row} is a pair $(i,x)\in\Blocks\times\Sigma$;
+\item a \emph{native row} is a quadruple
+  $(q,o,x,\omega)\in\Src\times(\{0\}\cup\Blocks)\times\Gamma\times\Wd$.
+\end{itemize}
+For $i\in\Blocks$ and $s\in\Sigma^{*}$ define the tagging operators
+\[
+  \tg_i(s) = \seq{(i,s[1]),\dots,(i,s[\len{s}])},
+\]
+and, with $r=\ren{\omega}(s)$,
+\[
+  \ntg^{q}_{\omega}(i,s)
+    = \seq{(q,i,r[1],\omega),\dots,(q,i,r[\len{r}],\omega)},
+\]
+and for a cell sequence $u$ the lift
+$\ntg^{q}_{\omega}(u)=\seq{(q,o_1,x_1,\omega),\dots}$ where $u[j]=(o_j,x_j)$.
+\end{definition}
+
+Note the asymmetry, which is fundamental: \emph{ledger} rows are semantic and
+width-independent; \emph{native} rows are physically rendered at a definite
+width and carry a provenance source.
+
+\subsection{Protocol state}\label{sec:state}
+
+\begin{definition}[State space]\label{def:state}
+A \emph{protocol state} is a tuple with the components of
+Table~\ref{tab:state}. We refer to components by their symbols; a primed
+symbol denotes the value in the successor state of a transition.
+\end{definition}
+
+\begin{table}[htbp]
+\centering\footnotesize
+\begin{tabular}{@{}lllp{5.9cm}@{}}
+\toprule
+Symbol & TLA\textsuperscript{+} & Type & Meaning \\
+\midrule
+$c$ & \tla{c} & $0..N$ & commit frontier: blocks $1..c$ are committed \\
+$\varphi$ & \tla{phase} & $\Blocks\to\Phi$ & lifecycle phase;
+  $\Phi=\{\Absent,\Queued,\Active,$ $\Finalized,\Committed\}$ \\
+$\mu$ & \tla{mode} & $\Blocks\to\mathbb{M}$ &
+  presentation contract; $\mathbb{M}=\{\Undecl,\Mutable,$
+  $\AppendOnly\}$ \\
+$w$ & \tla{want} & $\Blocks\to\Snap$ & speculative snapshot \\
+$f$ & \tla{final} & $\Blocks\to\Snap\cup\{\NoFinal\}$ & immutable final
+  snapshot \\
+$e$ & \tla{emitted} & $\Blocks\to 0..\Lmax$ & stable emitted prefix length
+  (append-only head) \\
+$\alpha$ & \tla{alloc} & $\Blocks\to 0..H$ & painted slot allocation
+  (rows) \\
+$\tau$ & \tla{target} & $\Blocks\to 0..H$ & requested slot allocation \\
+$\Ledger$ & \tla{history} & $(\Blocks\times\Sigma)^{*}$ & logical history
+  ledger \\
+$\Native$ & \tla{native} & native rows$^{*}$ & physical native scrollback
+  (current epoch) \\
+$\omega$ & \tla{width} & $\Wd$ & terminal width class \\
+$h$ & \tla{height} & $0..H$ & live transcript height \\
+$\nu$ & \tla{resizes} & $0..\MaxRes$ & resize counter \\
+$\varepsilon$ & \tla{epoch} & $0..\MaxRes$ & display epoch \\
+$\rmode$ & \tla{replayMode} & $\{\None,\AppendPol,\Rebuild\}$ & pending
+  replay policy \\
+$\rcur,\rend$ & \tla{replayCursor}, \tla{replayEnd} & $0..N{+}1$, $0..N$ &
+  replay window $[\rcur..\rend]$ over committed blocks \\
+$\rpart$ & \tla{replayPartial} & $0..\Lmax$ & replayed stable-head prefix
+  length \\
+$\rprep$ & \tla{replayPrepared} & $\mathbb{B}$ & replay frame prepared \\
+$\rcut$ & \tla{replayCut} & $0..\Fmax$ & rows that must scroll during replay \\
+$\flush$ & \tla{flush} & $\mathbb{B}$ & explicit retirement request \\
+$\shut$ & \tla{shutdown} & $\mathbb{B}$ & graceful shutdown initiated \\
+$\run$ & \tla{running} & $\mathbb{B}$ & host live \\
+$\stopr$ & \tla{stopReason} & $\mathbb{T}$ &
+  termination cause; $\mathbb{T}=\{\stRun,\stGrace,$
+  $\stDetach,\stWF\}$ \\
+\bottomrule
+\end{tabular}
+\caption{Protocol state components and their counterparts in
+\texttt{ElasticSlots.tla}.}
+\label{tab:state}
+\end{table}
+
+\begin{definition}[Initial state]\label{def:init}
+The initial state has $c=0$; $\varphi_i=\Absent$, $\mu_i=\Undecl$,
+$w_i=\emptyseq$, $f_i=\NoFinal$, $e_i=\alpha_i=\tau_i=0$ for all $i$;
+$\Ledger=\Native=\emptyseq$; $\omega=\wide$; $h=H$; $\nu=\varepsilon=0$;
+$\rmode=\None$, $\rcur=\rend=\rpart=\rcut=0$, $\rprep=\mathrm{false}$;
+$\flush=\shut=\mathrm{false}$; $\run=\mathrm{true}$; $\stopr=\stRun$.
+\end{definition}
+
+\begin{definition}[Derived quantities]\label{def:derived}
+In any state:
+\begin{align*}
+\created &= \bigl|\{\,i\in\Blocks : \varphi_i\ne\Absent\,\}\bigr|
+  &&\text{(created count)}\\
+\Un_i(s) &= \begin{cases}
+  s[\,e_i{+}1\,..\,\len{s}\,] & \text{if } \mu_i=\AppendOnly\\
+  s & \text{otherwise}
+\end{cases}
+  &&\text{(unemitted suffix)}\\
+\Repl &\;\iff\; \rmode\ne\None &&\text{(replay pending).}
+\end{align*}
+\end{definition}
+
+The lifecycle invariant (Theorem~\ref{thm:safety}) guarantees that the created
+blocks are exactly $[\created]$ and that they are partitioned as
+$1..c$ committed, $c{+}1..\created$ live (queued, active, or finalized),
+$\created{+}1..N$ absent. We freely use this shape below.
+
+\subsection{Presentation contracts}
+
+Every created block carries one of two contracts, fixed at creation:
+
+\begin{itemize}
+\item $\Mutable$: while $\varphi_i\in\{\Queued,\Active\}$ the snapshot $w_i$
+  may be replaced by \emph{any} member of $\Snap$; the block's viewport slot
+  is repainted in place. No row of a mutable block may reach scrollback before
+  the whole block retires.
+\item $\AppendOnly$: the snapshot evolves only by prefix extension
+  ($w_i\pre w_i'$). Consequently an ever-growing \emph{stable prefix} exists,
+  and while the block is the \emph{head} (the first uncommitted block,
+  $i=c{+}1$) its stable rows may scroll naturally, line by line, into
+  scrollback ahead of finalization---this is the streaming affordance.
+\end{itemize}
+
+\subsection{The two histories}\label{sec:histories}
+
+\begin{definition}[Committed ledger and stable head]\label{def:ledger}
+For $k\in 0..N$ define the \emph{committed ledger}
+\[
+  C(k) \;=\; \Cat_{j=1}^{k}\, \tg_j(f_j).
+\]
+The \emph{partial-head predicate} is
+\[
+  \PH \;\iff\;
+  c<\created \,\wedge\, \mu_{c+1}=\AppendOnly \,\wedge\,
+  \varphi_{c+1}\in\{\Active,\Finalized\} \,\wedge\, e_{c+1}>0,
+\]
+and the corresponding \emph{active head} prefix is
+\[
+  A(c) \;=\;
+  \begin{cases}
+    \tg_{c+1}\bigl(w_{c+1}[1..e_{c+1}]\bigr) & \text{if } \PH\\
+    \emptyseq & \text{otherwise.}
+  \end{cases}
+\]
+\end{definition}
+
+The central ledger invariant, proved inductive in
+Theorem~\ref{thm:safety}, is the \emph{exactness equation}
+\begin{equation}\label{eq:ech}
+  \Ledger \;=\; C(c)\cat A(c).
+\end{equation}
+The logical history is thus never an independent data structure: it is at all
+times \emph{exactly} the committed finals in block order followed by the
+stable emitted prefix of the single append-only head, with no duplication,
+omission, or reordering. The physical history $\Native$, by contrast, is an
+epoch-scoped append-only realization: within a display epoch it only grows at
+the end; the $\Rebuild$ resize policy resets it to $\emptyseq$ and increments
+$\varepsilon$.
+
+\subsection{Live geometry}\label{sec:geometry}
+
+Throughout this subsection fix the ambient tuple
+$(\varphi,f,e,\omega,h)$; all geometric operators are functions of it (the
+TLA\textsuperscript{+} operators take these as explicit parameters, which is
+essential for stating transition guards over \emph{successor} values).
+
+\begin{definition}[Presentation]\label{def:presented}
+Block $i$ is \emph{presented}, written $\pres(i)$, iff
+\[
+  \varphi_i=\Active
+  \;\vee\;
+  \bigl(\varphi_i=\Finalized \wedge
+        \len{\ren{\omega}(\Un_i(f_i))}>0\bigr).
+\]
+Let $\pi=\bigl|\{i:\pres(i)\}\bigr|$ be the presented count. The viewport
+\emph{overflows}, written $\ovf$, iff $\pi>h$; the \emph{summary row count} is
+\[
+  \sigma \;=\; \begin{cases} 1 & \text{if } h>0 \wedge \ovf\\
+                             0 & \text{otherwise.}\end{cases}
+\]
+With $\newer(i)=\bigl|\{\,j>i : \pres(j)\,\}\bigr|$, block $i$ is
+\emph{visible}, written $\vis(i)$, iff
+\[
+  \pres(i) \;\wedge\;
+  \bigl(\ovf \Rightarrow h>0 \wedge \newer(i)<h-1\bigr).
+\]
+\end{definition}
+
+Under overflow, visibility privileges recency: only the $h-1$ presented blocks
+with the largest indices remain visible, and one row is sacrificed to a
+summary marker $\OvRow$ standing for everything older.
+
+\begin{definition}[Allocation admissibility]\label{def:aok}
+Allocation vectors $\alpha,\tau\in(0..H)^{\Blocks}$ are \emph{admissible},
+written $\AOK(\alpha,\tau)$ (with the ambient tuple implicit), iff
+\begin{enumerate}
+\item for every $i$ with $\vis(i)$: if $\varphi_i=\Active$ then
+  $\alpha_i\in 1..H$ and $\tau_i\in 1..H$; otherwise ($\varphi_i=\Finalized$)
+  $\alpha_i\in 1..H$ and $\tau_i=\alpha_i$;
+\item for every $i$ with $\neg\vis(i)$: $\alpha_i=\tau_i=0$;
+\item the \emph{reservation invariant} holds:
+\begin{equation}\label{eq:reservation}
+  \Res(\alpha,\tau)+\sigma \;\le\; h,
+  \qquad\text{where}\quad
+  \Res(\alpha,\tau)=\sum_{i=1}^{N}\max(\alpha_i,\tau_i).
+\end{equation}
+\end{enumerate}
+The \emph{canonical allocation} is
+$\Canon = \bigl(i\mapsto \text{if } \vis(i) \text{ then } 1
+\text{ else } 0\bigr)$.
+\end{definition}
+
+The reservation invariant charges every block for the \emph{maximum} of its
+painted and requested heights: growth is admitted only if the grown extent is
+already reserved, and a shrinking block retains its old reservation until the
+shrink is actually painted. This is what makes concurrent elastic animation
+safe (Lemma~\ref{lem:bridge}).
+
+\begin{definition}[Row demand and pressure]\label{def:pressure}
+The \emph{row demand} of block $i$ and the total demand are
+\[
+  \dm(i)=\begin{cases}
+    \max\bigl(1,\len{\ren{\omega}(\Un_i(w_i))}\bigr)
+      & \varphi_i\in\{\Queued,\Active\}\\
+    \len{\ren{\omega}(\Un_i(f_i))}
+      & \varphi_i=\Finalized\\
+    0 & \text{otherwise,}
+  \end{cases}
+  \qquad
+  D=\sum_{i=1}^{N}\dm(i).
+\]
+Then \emph{row pressure} is $D>h$; \emph{pressure} is
+$\Press \iff D>h \vee \created-c\ge\MaxLive$; and \emph{retirement is
+requested} iff $\Req \iff \flush\vee\Press$.
+\end{definition}
+
+\begin{definition}[Screen layout]\label{def:screen}
+The \emph{preview source} and \emph{preview cell} of block $i$ are
+\[
+  \ps(i)=\begin{cases}\Un_i(w_i)&\varphi_i=\Active\\ \Un_i(f_i)&
+  \text{otherwise,}\end{cases}
+  \qquad
+  \pc(i)=\begin{cases}
+    \bigl(i,\;\last(\ren{\omega}(\ps(i)))\bigr)
+      & \ren{\omega}(\ps(i))\ne\emptyseq\\
+    (i,\PhRow) & \text{otherwise.}
+  \end{cases}
+\]
+With $A_{\Sigma}=\sum_i \alpha_i$, the \emph{screen} is the cell sequence
+\begin{equation}\label{eq:screen}
+  \Scr \;=\; \Bcell^{\,h-A_{\Sigma}-\sigma}
+  \;\cat\; \Ocell^{\,\sigma}
+  \;\cat\; \Cat_{i=1}^{N} \pc(i)^{\alpha_i}.
+\end{equation}
+\end{definition}
+
+The model abstracts a slot's visual content to $\alpha_i$ copies of a
+representative cell carrying the owner and the last rendered unemitted row; a
+conforming implementation displays the $\alpha_i$-row tail window of
+$\ren{\omega}(\ps(i))$ (padded with the placeholder when empty). Blank rows
+sit at the top, then the overflow marker if any, then the slots in ascending
+block order---the newest block is adjacent to the cursor at the bottom.
+Well-definedness of \eqref{eq:screen} (in particular that $\alpha_i>0$ implies
+$\ps(i)$ is a genuine snapshot and the exponent of $\Bcell$ is nonnegative) is
+part of Theorem~\ref{thm:capacity}.
+
+\subsection{Replay geometry}\label{sec:replaygeo}
+
+\begin{definition}[Replay frame]\label{def:replayrows}
+When $\Repl$ holds, the \emph{replay frame} is
+\[
+  \RRows \;=\;
+  \Bigl(\Cat_{j=\rcur}^{\rend} \ntg^{\srcRep}_{\omega}(j,f_j)\Bigr)
+  \;\cat\;
+  \ntg^{\srcRep}_{\omega}\bigl(\rend{+}1,\; w_{\rend+1}[1..\rpart]\bigr),
+\]
+(the second factor being empty when $\rpart=0$), and $\RRows=\emptyseq$
+otherwise. The \emph{replay room} and \emph{required cut} are
+\[
+  \Room=\bigl|\{\,j\in[h] : \Scr[j]=\Bcell\,\}\bigr|,
+  \qquad
+  \rcut^{*}=\max\bigl(0,\;\len{\RRows}-\Room\bigr).
+\]
+When $\rprep$ holds, the \emph{prepared tail} is
+$\RRows[\rcut{+}1\,..\,\len{\RRows}]$.
+\end{definition}
+
+The replay frame re-renders, at the \emph{current} width, all committed finals
+in the window $[\rcur..\rend]$ (invariantly $\rcur=1$, $\rend\le c$) plus the
+already-emitted stable prefix of the head. The cut $\rcut^{*}$ is the exact
+number of frame rows that cannot fit in the blank region of the viewport and
+must therefore scroll into native history.
+
+% ===========================================================================
+\section{The Rendering Protocol as a Transition System}\label{sec:protocol}
+% ===========================================================================
+
+\begin{convention}\label{conv:trans}
+Each transition below is a guarded command over the state of
+Definition~\ref{def:state}. A transition may fire only when its guard holds;
+its effect lists the components it changes; \emph{all unmentioned components
+are unchanged}. Every guard implicitly conjoins $\run$. Derived operators
+($\vis$, $\sigma$, $\Canon$, $\AOK$, $\Scr$, \dots) evaluated in the effect of
+a transition are evaluated at the \emph{successor} values of their arguments;
+where a guard constrains a successor configuration we make the substitution
+explicit. Substitution into a function is written
+$\varphi[i\mapsto p]$.
+\end{convention}
+
+\subsection{Admission and speculation}
+
+\paragraph{\act{Create}$(m)$, $m\in\{\Mutable,\AppendOnly\}$.}
+\emph{Guard:} $\neg\shut \wedge \created<N$.
+\emph{Effect:}
+\[
+  \varphi_{\created+1}':=\Queued,\qquad \mu_{\created+1}':=m.
+\]
+Blocks are created contiguously in index order; the index order is the
+commitment order.
+
+\paragraph{\act{Admit}$(i)$.}
+\emph{Guard:} $\neg\shut \wedge \varphi_i=\Queued \wedge
+\forall j<i:\varphi_j\ne\Queued$, and with
+$\varphi^{\dagger}=\varphi[i\mapsto\Active]$,
+$\alpha^{\dagger}=\alpha[i\mapsto 1]$, $\tau^{\dagger}=\tau[i\mapsto 1]$:
+\[
+  \neg\ovf(\varphi^{\dagger},f,e,\omega,h)
+  \;\wedge\;
+  \AOK(\alpha^{\dagger},\tau^{\dagger})
+  \text{ at } (\varphi^{\dagger},f,e,\omega,h).
+\]
+\emph{Effect:} $\varphi':=\varphi^{\dagger}$, $\alpha':=\alpha^{\dagger}$,
+$\tau':=\tau^{\dagger}$.
+Admission is FIFO (no earlier block is still queued) and \emph{denied} rather
+than summarized when it would overflow the viewport: overflow may arise only
+from finalization of queued blocks or from resize, never from admission.
+
+\paragraph{\act{Update}$(i,s)$, $s\in\Snap$.}
+\emph{Guard:} $\neg\shut \wedge \varphi_i\in\{\Queued,\Active\} \wedge
+(\mu_i=\Mutable \vee w_i\pre s) \wedge s\ne w_i$.
+\emph{Effect:} $w_i':=s$.
+This is the only transition by which speculation evolves; the prefix guard is
+the entirety of the append-only contract.
+
+\subsection{Elastic allocation}
+
+\paragraph{\act{RequestAllocation}$(\tau^{\dagger})$,
+$\tau^{\dagger}\in(0..H)^{\Blocks}$.}
+\emph{Guard:} $\neg\shut \wedge \AOK(\alpha,\tau^{\dagger}) \wedge
+\tau^{\dagger}\ne\tau$.
+\emph{Effect:} $\tau':=\tau^{\dagger}$.
+Targets may change only if the joint reservation
+\eqref{eq:reservation} of the \emph{current} paint and the \emph{new} request
+still fits.
+
+\begin{definition}[Shrink bridge]\label{def:bridge}
+The \emph{bridge function} $B:(0..H)^2\to 0..H$ is
+\[
+  B(a,t)=\begin{cases}
+    t & a<t \quad\text{(growth is immediate)}\\
+    2 & a>2 \wedge t=1 \quad\text{(deep shrink bridges through 2)}\\
+    t & \text{otherwise.}
+  \end{cases}
+\]
+\end{definition}
+
+\paragraph{\act{ApplyAllocation}$(i)$.}
+\emph{Guard:} $\neg\shut \wedge \varphi_i=\Active \wedge \alpha_i\ne\tau_i
+\wedge \AOK(\alpha[i\mapsto B(\alpha_i,\tau_i)],\tau)$.
+\emph{Effect:} $\alpha_i':=B(\alpha_i,\tau_i)$.
+A slot collapsing from $k>2$ rows to $1$ paints an intermediate $2$-row frame,
+preserving animation stability (the user perceives a contraction, not a
+snap); Lemma~\ref{lem:bridge} shows the bridge terminates and never violates
+the reservation.
+
+\subsection{Finalization}
+
+\paragraph{\act{FinalizeActive}$(i,s)$, $s\in\Snap$.}
+\emph{Guard:} $\neg\shut \wedge \varphi_i=\Active \wedge
+(\mu_i=\Mutable \vee w_i\pre s)$.
+\emph{Effect:}
+\[
+  \varphi_i':=\Finalized,\quad w_i':=s,\quad f_i':=s,\quad
+  \alpha':=\tau':=\Canon \text{ at } (\varphi',f',e,\omega,h).
+\]
+
+\paragraph{\act{FinalizeQueued}$(i,s)$, $s\in\Snap$.}
+Identical, with guard $\varphi_i=\Queued$: a queued block may complete without
+ever being admitted to a live slot (e.g.\ a task that finished before any
+viewport space became available). Finalization freezes the semantic value
+($f_i$ is never rewritten; Theorem~\ref{thm:actions}) and collapses \emph{all}
+allocations to canonical single-row slots---finalized content no longer
+animates.
+
+\subsection{Natural streaming of the append-only head}
+
+\paragraph{\act{AppendStable}.}
+\emph{Guard:}
+\[
+  \neg\shut \wedge \neg\Repl \wedge c<\created \wedge
+  \mu_{c+1}=\AppendOnly \wedge \varphi_{c+1}\in\{\Active,\Finalized\}
+  \wedge D>h \wedge e_{c+1}<\len{w_{c+1}}.
+\]
+\emph{Effect:} with $n=e_{c+1}+1$,
+\[
+  \Ledger' := \Ledger\cat\seq{(c{+}1,\,w_{c+1}[n])},\qquad
+  \Native' := \Native\cat\ntg^{\srcApp}_{\omega}
+      \bigl(c{+}1,\,w_{c+1}[n..n]\bigr),
+\]
+\[
+  e_{c+1}' := n,\qquad
+  \alpha':=\tau':=\Canon \text{ at } (\varphi,f,e',\omega,h).
+\]
+One stable row of the head scrolls naturally into both histories. The
+transition is enabled only under \emph{row} pressure: while the viewport has
+room, stable rows stay live (and remain revisable in presentation, though not
+in value). Only the head block ever streams: this preserves in-order
+retirement.
+
+\paragraph{\act{CompleteAppendOnly}.}
+\emph{Guard:} $\neg\Repl \wedge c<\created \wedge \mu_{c+1}=\AppendOnly
+\wedge \varphi_{c+1}=\Finalized \wedge e_{c+1}=\len{f_{c+1}}$.
+\emph{Effect:}
+\[
+  c':=c+1,\quad \varphi_{c+1}':=\Committed,\quad e_{c+1}':=0,\quad
+  \alpha':=\tau':=\Canon.
+\]
+When the head has streamed its entire final snapshot, commitment is pure
+bookkeeping---no write occurs, because every row is already in both
+histories. Note the guard deliberately omits $\neg\shut$: draining the head
+must remain possible during graceful shutdown.
+
+\subsection{Retirement}
+
+\paragraph{\act{BeginFlush}.}
+\emph{Guard:} $\neg\flush$. \emph{Effect:} $\flush':=\mathrm{true}$. The flag
+is never reset.
+
+\begin{definition}[Retirement batch]\label{def:retbatch}
+For $b\in(c{+}1)..N$ with $\varphi_j=\Finalized$ for all $j\in c{+}1..b$, the
+\emph{logical} and \emph{physical retirement rows} are
+\[
+  F_{\log}(b) = \tg_{c+1}\bigl(f_{c+1}[\,e_{c+1}{+}1..\len{f_{c+1}}\,]\bigr)
+    \cat \Cat_{j=c+2}^{b}\tg_j(f_j),
+\]
+\[
+  F^{q}_{\mathrm{phys}}(b) =
+    \ntg^{q}_{\omega}\bigl(c{+}1,\,
+      f_{c+1}[\,e_{c+1}{+}1..\len{f_{c+1}}\,]\bigr)
+    \cat \Cat_{j=c+2}^{b}\ntg^{q}_{\omega}(j,f_j),
+  \qquad q\in\{\srcRet,\srcFail\}.
+\]
+\end{definition}
+
+The first (head) block contributes only its \emph{unemitted} suffix---rows
+already streamed by \act{AppendStable} are never re-emitted.
+
+\paragraph{\act{RetireSuccess}$(b)$.}
+\emph{Guard:} $\neg\Repl \wedge b\in(c{+}1)..N \wedge
+\bigl(\forall j\in c{+}1..b:\varphi_j=\Finalized\bigr) \wedge \Req$.
+\emph{Effect:}
+\[
+  \Ledger' := \Ledger\cat F_{\log}(b),\qquad
+  \Native' := \Native\cat F^{\srcRet}_{\mathrm{phys}}(b),
+\]
+\[
+  c' := b,\qquad
+  \varphi_j' := \Committed \text{ and } e_j' := 0 \text{ for } j\le b,\qquad
+  \alpha':=\tau':=\Canon .
+\]
+Retirement advances the frontier across a \emph{contiguous finalized prefix}
+and is permitted only under demand ($\Req$): pressure (row demand exceeding
+the viewport, or too many uncommitted blocks) or an explicit flush.
+Section~\ref{sec:realization} shows the physical effect is realized by a
+single streamed write.
+
+\paragraph{\act{RetireFailure}$(b,k)$.}
+\emph{Guard:} as \act{RetireSuccess}$(b)$, plus
+$k\in 0..\len{F^{\srcFail}_{\mathrm{phys}}(b)}$.
+\emph{Effect:}
+\[
+  \Native' := \Native\cat F^{\srcFail}_{\mathrm{phys}}(b)[1..k],\qquad
+  \run':=\mathrm{false},\qquad \stopr':=\stWF .
+\]
+$\Ledger$, $c$, $\varphi$, $e$ are \emph{unchanged}: a partial terminal write
+deposits an arbitrary prefix of immutable finalized/stable rows into native
+scrollback, tagged $\srcFail$, and the host halts. Because the frontier did
+not advance, no retry can duplicate rows and no later block can overtake the
+failed batch---failure is fail-stop, not fail-retry
+(Theorem~\ref{thm:actions}).
+
+\subsection{Resize and synchronous bottom-first replay}
+
+\paragraph{\act{Resize}$(\omega^{\dagger},h^{\dagger},p,k)$,
+$\omega^{\dagger}\in\Wd$, $h^{\dagger}\in 0..H$,
+$p\in\{\Preserve,\AppendPol,\Rebuild\}$, $k\in 0..\len{\Scr}$.}
+\emph{Guard:} $\neg\shut \wedge \nu<\MaxRes \wedge
+(\omega^{\dagger}\ne\omega \vee h^{\dagger}\ne h)$.
+\emph{Effect:} let
+\[
+  p^{\dagger} = \begin{cases} p & \omega^{\dagger}\ne\omega\\
+                              \Preserve & \text{otherwise,}\end{cases}
+  \qquad
+  \mathit{begin} \iff p^{\dagger}\ne\Preserve \wedge (c>0 \vee \PH),
+\]
+and set
+\begin{align*}
+  \omega' &:= \omega^{\dagger}, \quad h' := h^{\dagger}, \quad \nu':=\nu+1,
+  \quad \alpha':=\tau':=\Canon \text{ at } (\varphi,f,e,\omega',h'),\\
+  \Native' &:= \begin{cases}
+      \emptyseq & p^{\dagger}=\Rebuild\\
+      \Native\cat\ntg^{\srcRsz}_{\omega}(\Scr[1..k]) & \text{otherwise,}
+    \end{cases}
+  \qquad
+  \varepsilon' := \begin{cases}\varepsilon+1 & p^{\dagger}=\Rebuild\\
+                               \varepsilon & \text{otherwise,}\end{cases}\\
+  (\rmode',\rcur',\rend',\rpart') &:=
+    \begin{cases}
+      \bigl(p^{\dagger},\,1,\,c,\;
+        \text{if } \PH \text{ then } e_{c+1} \text{ else } 0\bigr)
+        & \mathit{begin}\\
+      (\rmode,\rcur,\rend,\rpart) & \neg\mathit{begin}\wedge\Repl\\
+      (\None,0,0,0) & \text{otherwise,}
+    \end{cases}\\
+  \rprep' &:= \mathrm{false},\qquad \rcut':=0 .
+\end{align*}
+Height-only resizes are always $\Preserve$. The parameter $k$ captures
+\emph{emulator-induced push}: when the host terminal itself scrolls up to $k$
+top viewport rows into its scrollback during the resize (e.g.\ on height
+shrink), those rows are recorded in $\Native$ tagged $\srcRsz$---the logical
+ledger is untouched (Theorem~\ref{thm:actions},
+\emph{resize logical-neutrality}). Under $\AppendPol$, committed history is
+re-rendered at the new width and appended; under $\Rebuild$, the display epoch
+is reset and native history is reconstructed from scratch. A resize arriving
+\emph{during} an unfinished replay preserves the replay window but invalidates
+any prepared frame.
+
+\paragraph{\act{PrepareReplay}.}
+\emph{Guard:} $\Repl \wedge \neg\rprep$.
+\emph{Effect:} $\rprep':=\mathrm{true}$, $\rcut':=\rcut^{*}$.
+Preparation samples the current viewport, computes the replay frame $\RRows$,
+and splits it at the required cut: the tail
+$\RRows[\rcut^{*}{+}1..]$ will be painted \emph{bottom-first} into the blank
+region (no scroll, no history effect), and only the prefix
+$\RRows[1..\rcut^{*}]$ will scroll.
+
+\paragraph{\act{ReplaySynchronousSuccess}.}
+\emph{Guard:} $\Repl \wedge \rprep$.
+\emph{Effect:}
+\[
+  \Native' := \Native\cat\RRows[1..\rcut],\qquad
+  (\rmode',\rcur',\rend',\rpart',\rprep',\rcut') :=
+  (\None,0,0,0,\mathrm{false},0).
+\]
+
+\paragraph{\act{ReplaySynchronousFailure}$(k)$, $k\in 0..\rcut$.}
+\emph{Guard:} $\Repl \wedge \rprep$.
+\emph{Effect:} $\Native':=\Native\cat\RRows[1..k]$,
+$\run':=\mathrm{false}$, $\stopr':=\stWF$.
+
+\subsection{Shutdown}
+
+\paragraph{\act{BeginGracefulShutdown}.}
+\emph{Guard:} $\neg\shut$.
+\emph{Effect:} for every $i$ with $\varphi_i\ne\Absent$,
+\[
+  \varphi_i' := \begin{cases}\Committed & i\le c\\ \Finalized &
+  \text{otherwise,}\end{cases}
+  \qquad
+  f_i' := \begin{cases}f_i & i\le c \vee \varphi_i=\Finalized\\
+                       w_i & \text{otherwise,}\end{cases}
+\]
+\[
+  \alpha':=\tau':=\Canon \text{ at } (\varphi',f',e,\omega,h),
+  \qquad \flush':=\mathrm{true},\qquad \shut':=\mathrm{true}.
+\]
+All queued and active work is frozen at its current speculation ($f:=w$) and
+the pipeline is put under permanent flush; the remaining trajectory can only
+drain (stream the head, commit, replay) and exit.
+
+\paragraph{\act{GracefulExit}$(k)$, $k\in\{0,1\}$.}
+\emph{Guard:} $\shut \wedge \neg\Repl \wedge c=\created \wedge
+(k=0 \vee h>0)$.
+\emph{Effect:} $\run':=\mathrm{false}$, $\stopr':=\stGrace$, and if $k=1$,
+$\Native':=\Native\cat\ntg^{\srcExit}_{\omega}(\seq{\Scr[1]})$.
+Exit is permitted only after every created block has committed and any replay
+has drained; the optional single pushed row (tagged $\srcExit$) models the
+final scroll that blanks the viewport and restores the shell prompt.
+
+\paragraph{\act{DetachExit}$(k)$, $k\in\{0,1\}$.}
+\emph{Guard:} $\neg\shut \wedge (k=0 \vee h>0)$.
+\emph{Effect:} as \act{GracefulExit} with $\stopr':=\stDetach$. Detachment
+abandons uncommitted work without emitting it; the exactness equation
+\eqref{eq:ech} guarantees the ledger holds precisely the committed content at
+the instant of detachment.
+
+\subsection{Scheduler gate and fairness}\label{sec:next}
+
+\begin{definition}[Next-state relation and specification]\label{def:spec}
+Let $\mathcal{T}$ be the set of all transitions above except the two replay
+writes. The next-state relation is the \emph{gated} disjunction
+\[
+  \mathrm{Next} \;\equiv\;
+  \begin{cases}
+    \act{ReplaySynchronousSuccess} \vee
+    \exists k:\act{ReplaySynchronousFailure}(k)
+      & \rprep\\[2pt]
+    \bigvee_{T\in\mathcal{T}} \exists\,\text{params}: T
+      & \neg\rprep .
+  \end{cases}
+\]
+The specification is
+\[
+  \begin{aligned}
+  \mathrm{Spec} \;\equiv\;
+  \mathrm{Init} \wedge \Box[\mathrm{Next}]_{\mathit{vars}}
+  &\wedge \mathrm{WF}(\act{RetireSuccess}^{\exists})
+  \wedge \mathrm{WF}(\act{PrepareReplay})\\
+  &\wedge \mathrm{WF}(\act{ReplaySynchronousSuccess})
+  \wedge \mathrm{WF}(\act{AppendStable})\\
+  &\wedge \mathrm{WF}(\act{CompleteAppendOnly}),
+  \end{aligned}
+\]
+where $\act{RetireSuccess}^{\exists}=\exists b:\act{RetireSuccess}(b)$ and
+$\mathrm{WF}$ is weak fairness: an action that is eventually forever enabled
+is taken infinitely often.
+\end{definition}
+
+The gate is the formal content of the word \emph{synchronous}: once a replay
+frame is prepared, \emph{no} other transition---no update, no allocation, no
+repaint-inducing step---may interleave before the single buffered write
+completes or fails. Section~\ref{sec:replayproof} shows this gate is
+load-bearing: the prepared-frame invariant $\rcut=\rcut^{*}$ would not be
+stable without it.
+
+\subsection{Conformance summary}\label{sec:conformance}
+
+Table~\ref{tab:conformance} summarizes, per transition, the physical effects
+a conforming implementation \emph{must} produce and those it \emph{must not}
+produce. ``Repaint only'' means: the implementation may rewrite the $h$ live
+viewport rows in place but must not cause any row to enter scrollback and
+must not touch the ledger.
+
+\begin{table}[htbp]
+\centering\footnotesize
+\begin{tabular}{@{}>{\raggedright\arraybackslash}p{4.35cm}
+                 >{\raggedright\arraybackslash}p{4.95cm}
+                 >{\raggedright\arraybackslash}p{4.95cm}@{}}
+\toprule
+Transition & Required effect & Forbidden effect \\
+\midrule
+\act{Create}, \act{Update},
+\act{RequestAllocation}, \act{BeginFlush},
+\act{BeginGracefulShutdown}
+  & repaint only (viewport may re-layout)
+  & any scrollback emission; any ledger append; frontier motion \\
+\addlinespace
+\act{Admit}
+  & repaint only; new $1$-row slot appears at bottom
+  & admission that overflows the viewport; slot for a non-FIFO block \\
+\addlinespace
+\act{ApplyAllocation}
+  & repaint at bridged height $B(\alpha_i,\tau_i)$
+  & exceeding the joint reservation \eqref{eq:reservation}; shrinking
+    $k{>}2\to 1$ without the $2$-row frame \\
+\addlinespace
+\act{FinalizeActive}, \act{FinalizeQueued}
+  & repaint only; all slots collapse to canonical $1$-row previews
+  & scrollback emission; any later mutation of $f_i$ \\
+\addlinespace
+\act{AppendStable}
+  & scroll exactly $\len{\ren{\omega}(\seq{w_{c+1}[n]})}$ rows carrying the
+    next stable head row; ledger append of that row
+  & streaming any block other than the head $c{+}1$; skipping or reordering
+    rows; streaming without row pressure \\
+\addlinespace
+\act{CompleteAppendOnly}
+  & bookkeeping only (frontier $+1$)
+  & re-emission of already-streamed rows \\
+\addlinespace
+\act{RetireSuccess}$(b)$
+  & one streamed write $T=F^{\srcRet}_{\mathrm{phys}}(b)\cat\Scr'$
+    scrolling exactly $\len{F^{\srcRet}_{\mathrm{phys}}(b)}$ rows
+    (Cor.~\ref{cor:retire})
+  & retiring a non-contiguous or non-finalized range; re-emitting the emitted
+    head prefix; retiring without $\Req$ \\
+\addlinespace
+\act{RetireFailure}
+  & halt; native holds a prefix of the $\srcFail$-tagged batch
+  & advancing $c$; mutating the ledger; retrying the write \\
+\addlinespace
+\act{Resize} ($\Preserve$)
+  & record emulator-pushed rows (tagged $\srcRsz$); recanonicalize layout
+  & replaying; mutating ledger, frontier, modes, wants, finals, or emitted
+    counts \\
+\act{Resize} ($\AppendPol$)
+  & as $\Preserve$, then schedule replay of $C(c)$ + head prefix at new width
+  & same \\
+\act{Resize} ($\Rebuild$)
+  & clear display epoch ($\Native:=\emptyseq$, $\varepsilon{+}1$), schedule
+    replay
+  & same \\
+\addlinespace
+\act{PrepareReplay} + \act{ReplaySynchronousSuccess}
+  & paint tail $\RRows[\rcut^{*}{+}1..]$ into blank rows bottom-first
+    (no scroll), then \emph{one} synchronous buffered write scrolling exactly
+    $\rcut^{*}$ rows
+  & interleaving any repaint between preparation and the write; multi-frame
+    incremental replay; scrolling more or fewer than $\rcut^{*}$ rows \\
+\addlinespace
+\act{ReplaySynchronousFailure}
+  & halt; native holds a prefix of $\RRows[1..\rcut]$
+  & continuing after a partial write \\
+\addlinespace
+\act{GracefulExit}, \act{DetachExit}
+  & optionally scroll the single top viewport row; restore terminal state
+  & emitting speculative content of uncommitted blocks; exiting gracefully
+    with $c<\created$ or during replay \\
+\bottomrule
+\end{tabular}
+\caption{Conformance obligations per transition.}
+\label{tab:conformance}
+\end{table}
+
+% ===========================================================================
+\section{Formal Theorems and Proofs}\label{sec:theorems}
+% ===========================================================================
+
+\subsection{Invariant catalogue}\label{sec:invariants}
+
+\begin{definition}[State invariants]\label{def:inv}
+Define the following predicates on states.
+\begin{itemize}
+\item \textbf{(T)} \emph{Typing}: every component lies in its range of
+  Table~\ref{tab:state}.
+\item \textbf{(LS)} \emph{Lifecycle shape}: $c\le\created$;
+  and for every $i\in\Blocks$,
+  \[
+    \varphi_i\in\begin{cases}
+      \{\Committed\} & i\le c\\
+      \{\Queued,\Active,\Finalized\} & c<i\le\created\\
+      \{\Absent\} & i>\created,
+    \end{cases}
+    \qquad
+    \mu_i\ne\Undecl \iff i\le\created .
+  \]
+\item \textbf{(SD)} \emph{Snapshot discipline}: if
+  $\varphi_i\in\{\Finalized,\Committed\}$ then $f_i\in\Snap$ and $f_i=w_i$;
+  otherwise $f_i=\NoFinal$.
+\item \textbf{(ED)} \emph{Emission discipline}: for all $i$,
+  $e_i\le\len{w_i}$; $\mu_i\ne\AppendOnly \Rightarrow e_i=0$; and
+  $e_i>0 \Rightarrow i=c{+}1 \wedge \varphi_i\in\{\Active,\Finalized\}$.
+\item \textbf{(CAP)} \emph{Capacity}: $\AOK(\alpha,\tau)$ at
+  $(\varphi,f,e,\omega,h)$.
+\item \textbf{(ECH)} \emph{Exact committed history}: equation \eqref{eq:ech},
+  $\Ledger=C(c)\cat A(c)$.
+\item \textbf{(RS)} \emph{Replay shape}: if $\rmode=\None$ then
+  $\rcur=\rend=\rpart=\rcut=0$ and $\neg\rprep$; if $\rmode\ne\None$ then
+  $\rcur=1$, $\rend\in 0..c$, $\rpart\le\Lmax$, and: if $\rprep$ then
+  $\rcut=\rcut^{*}$ and
+  $\len{\RRows[\rcut{+}1..\len{\RRows}]}\le\Room$, else $\rcut=0$.
+\item \textbf{(NSS)} \emph{Native source safety}: for every native row
+  $(q,o,x,\upsilon)$ in $\Native$:
+  \begin{itemize}
+  \item $q=\srcRet \Rightarrow o\in[c] \wedge \varphi_o=\Committed$;
+  \item $q\in\{\srcApp,\srcRep\} \Rightarrow o\in\Blocks \wedge
+    \bigl(o\in[c] \vee (o=c{+}1 \wedge \mu_o=\AppendOnly)\bigr)$;
+  \item $q=\srcFail \Rightarrow \stopr=\stWF$;
+  \item $q=\srcExit \Rightarrow \neg\run$.
+  \end{itemize}
+\end{itemize}
+Let $J \equiv \mathrm{T}\wedge\mathrm{LS}\wedge\mathrm{SD}\wedge\mathrm{ED}
+\wedge\mathrm{CAP}\wedge\mathrm{ECH}\wedge\mathrm{RS}\wedge\mathrm{NSS}$.
+\end{definition}
+
+Two further invariants---\emph{no premature history} (NPH) and \emph{screen
+capacity} (SC)---are checked independently by TLC but are derivable from $J$;
+we prove them as Corollaries~\ref{cor:nph} and~\ref{cor:sc}.
+
+\subsection{Exact capacity and overflow bounds}
+
+\begin{theorem}[Exact capacity and overflow forcing]\label{thm:capacity}
+Let a state satisfy \textup{CAP} and \textup{SD}. Then:
+\begin{enumerate}
+\item[(i)] \textbf{Exactness.} $\Scr$ is well defined, $\len{\Scr}=h$, block
+  $i$ owns exactly $\alpha_i$ cells of $\Scr$, exactly $\sigma$ cells equal
+  $\Ocell$, and exactly $h-\sum_i\alpha_i-\sigma\ge 0$ cells equal $\Bcell$.
+\item[(ii)] \textbf{Zero-height degradation.} If $h=0$ then $\alpha_i=\tau_i=0$
+  for all $i$, $\sigma=0$, and $\Scr=\emptyseq$; every transition remains
+  well defined.
+\item[(iii)] \textbf{Overflow forcing.} If $\ovf$ and $h>0$, then the visible
+  blocks are exactly the $h-1$ presented blocks of largest index, and
+  necessarily $\alpha_i=\tau_i=1$ for each of them, $\sigma=1$, and $\Scr$
+  contains no blank cell: the layout is \emph{forced} to
+  $\Scr=\seq{\Ocell}\cat\pc(i_{h-1})\cat\cdots\cat\pc(i_{1})$ where
+  $i_{1}>\cdots>i_{h-1}$ enumerate the visible blocks in decreasing order.
+\end{enumerate}
+\end{theorem}
+
+\begin{proof}
+\emph{(i).} Let $A_{\Sigma}=\sum_i\alpha_i$. Since
+$\alpha_i\le\max(\alpha_i,\tau_i)$ pointwise, \eqref{eq:reservation} gives
+$A_{\Sigma}\le\Res(\alpha,\tau)\le h-\sigma$, so the blank exponent
+$h-A_{\Sigma}-\sigma$ in \eqref{eq:screen} is a natural number. The three
+factors of \eqref{eq:screen} contribute $h-A_{\Sigma}-\sigma$, $\sigma$, and
+$\sum_i\alpha_i$ cells respectively, totalling $h$. Ownership: the slot factor
+$\pc(i)^{\alpha_i}$ contributes exactly $\alpha_i$ cells with owner $i$, and
+blank/overflow cells carry owner $0\notin\Blocks$. Well-definedness of
+$\pc(i)$ for $\alpha_i>0$: by CAP clause~2, $\alpha_i>0$ implies $\vis(i)$,
+hence $\pres(i)$, hence $\varphi_i\in\{\Active,\Finalized\}$; if
+$\varphi_i=\Active$ then $\ps(i)=\Un_i(w_i)$ with $w_i\in\Snap$; if
+$\varphi_i=\Finalized$ then by SD $f_i\in\Snap$, so $\ps(i)=\Un_i(f_i)$ is a
+genuine row sequence. The placeholder branch covers an empty rendering.
+
+\emph{(ii).} Let $h=0$. If $\pi=0$ no block is presented, so no block is
+visible and CAP clause~2 zeroes all $\alpha,\tau$. If $\pi>0$ then
+$\pi>0=h$, i.e.\ $\ovf$; visibility then requires $h>0$, which fails, so again
+no block is visible and all allocations are zero; moreover $\sigma=0$ by its
+$h>0$ guard. Hence $\Scr=\Bcell^{0}\cat\emptyseq\cat\emptyseq=\emptyseq$.
+Every transition guard and effect refers to $\Scr$, $\Room$, and allocation
+predicates that are all well defined at $h=0$ (in particular
+\act{GracefulExit}/\act{DetachExit} require $k=0$ when $h=0$, and
+$\Room=0$ makes any replay scroll its entire frame, $\rcut^{*}=\len{\RRows}$).
+
+\emph{(iii).} Assume $\ovf$ and $h>0$, so $\pi>h\ge 1$ and $\sigma=1$. List
+the presented blocks in decreasing index order $i_1>i_2>\cdots>i_\pi$; then
+$\newer(i_k)=k-1$, so $\vis(i_k)\iff k-1<h-1 \iff k\le h-1$. Since
+$\pi\ge h+1>h-1$, exactly $h-1$ blocks are visible, namely
+$i_1,\dots,i_{h-1}$. By CAP clause~1 each visible block has
+$\max(\alpha_i,\tau_i)\ge\alpha_i\ge 1$; summing,
+$\Res(\alpha,\tau)\ge h-1$, while \eqref{eq:reservation} gives
+$\Res(\alpha,\tau)\le h-\sigma=h-1$. Hence every visible block has
+$\max(\alpha_i,\tau_i)=1$, so $\alpha_i=1$ and $\tau_i\le 1$; for active
+visible blocks CAP requires $\tau_i\ge 1$, and for finalized visible blocks
+$\tau_i=\alpha_i=1$. Thus $\alpha_i=\tau_i=1$ on the visible set and $0$
+elsewhere; $A_{\Sigma}=h-1$; the blank exponent is $h-(h-1)-1=0$; and
+\eqref{eq:screen} degenerates to the stated forced layout, the slots appearing
+in ascending block order, i.e.\ the reversed enumeration.
+\end{proof}
+
+\begin{corollary}[Canonical admissibility]\label{cor:canon}
+For every ambient tuple $(\varphi,f,e,\omega,h)$ (with \textup{SD} for
+well-definedness), $\AOK(\Canon,\Canon)$ holds.
+\end{corollary}
+
+\begin{proof}
+Clauses 1--2 of Definition~\ref{def:aok} hold by construction of $\Canon$,
+provided $1\le H$ whenever some block is visible; visibility of any block
+implies $h\ge 1$ (if $\neg\ovf$ then $1\le\pi\le h$; if $\ovf$ then
+visibility itself demands $h>0$), and $h\le H$. For
+\eqref{eq:reservation}: $\Res(\Canon,\Canon)=|\{i:\vis(i)\}|$. If $h=0$ this
+is $0=h-\sigma$ by Theorem~\ref{thm:capacity}(ii). If $\ovf$ and $h>0$ it is
+$h-1=h-\sigma$ by (iii). If $\neg\ovf$ every presented block is visible, so
+the count is $\pi\le h=h-\sigma$.
+\end{proof}
+
+Corollary~\ref{cor:canon} is used ubiquitously below: every transition that
+recanonicalizes ($\alpha':=\tau':=\Canon$) re-establishes CAP unconditionally,
+at whatever successor tuple it evaluates $\Canon$.
+
+\subsection{Reservation dominance and bridge termination}
+
+\begin{lemma}[Reservation dominance; bridge termination]\label{lem:bridge}
+Let $a\ne t$ with $a,t\in 0..H$ and let $B$ be the bridge function of
+Definition~\ref{def:bridge}. Then:
+\begin{enumerate}
+\item[(i)] \emph{Dominance:} $\max(B(a,t),t)\le\max(a,t)$; consequently an
+  \act{ApplyAllocation} step never increases any summand of
+  $\Res(\alpha,\tau)$, and the reservation invariant \eqref{eq:reservation}
+  is preserved verbatim (the ambient tuple, hence $\sigma$ and $h$, is
+  unchanged by the step).
+\item[(ii)] \emph{Positivity:} if $t\ge 1$ then $B(a,t)\ge 1$; hence an active
+  visible block never transits through a $0$-height frame.
+\item[(iii)] \emph{Termination:} for fixed $t$, the iteration
+  $a_0=a$, $a_{n+1}=B(a_n,t)$ reaches $t$ in at most two steps, and each step
+  strictly changes the allocation. Precisely: if $a<t$ or $t\ge 2$ or
+  $a\le 2$, one step suffices; if $a>2$ and $t=1$, the trajectory is
+  $a\to 2\to 1$.
+\end{enumerate}
+\end{lemma}
+
+\begin{proof}
+\emph{(i).} Case $a<t$ (growth): $B=t$ and $\max(t,t)=t=\max(a,t)$. Case
+$a>t$: if $a>2\wedge t=1$ then $B=2$ and $\max(2,1)=2<a=\max(a,t)$ since
+$a\ge 3$; otherwise $B=t$ and $\max(t,t)=t<a=\max(a,t)$. In all cases the
+per-block reservation summand does not increase; all other summands are
+untouched, and $\sigma,h$ depend only on $(\varphi,f,e,\omega,h)$, which
+\act{ApplyAllocation} leaves unchanged.
+
+\emph{(ii).} If $a<t$ then $B=t\ge 1$; otherwise $B\in\{t,2\}$ and both are
+$\ge 1$ when $t\ge 1$.
+
+\emph{(iii).} If $a<t$: $B(a,t)=t$, one step. If $a>t$ and
+$\neg(a>2\wedge t=1)$: $B(a,t)=t$, one step. If $a>2$ and $t=1$:
+$B(a,1)=2\ne a$ (as $a\ge 3$), then $B(2,1)$ falls in the ``otherwise'' branch
+(since $2\not>2$) giving $1$. Each step changes $\alpha_i$: the guard
+$\alpha_i\ne\tau_i$ excludes stuttering, and $B(a,t)\ne a$ in every case above.
+\end{proof}
+
+\begin{remark}
+Dominance is exactly why \act{RequestAllocation} charges
+$\max(\alpha_i,\tau^{\dagger}_i)$ at request time: once a target is admitted,
+\emph{every} frame of the bridge animation---including the stabilizing
+$2$-row frame of a deep shrink---is guaranteed to fit without re-negotiation,
+regardless of how apply steps of distinct blocks interleave.
+\end{remark}
+
+\subsection{Stable-head emission and ledger monotonicity}
+
+\begin{lemma}[Stable-head emission]\label{lem:head}
+Assume $J$. Then:
+\begin{enumerate}
+\item[(i)] \emph{Prefix immutability.} For every transition and every
+  $i\in\Blocks$, if $e_i>0$ then $w_i'[1..e_i]=w_i[1..e_i]$ whenever
+  $e_i'\ge e_i$; and the only transitions with $e_i'<e_i$
+  (\act{CompleteAppendOnly}, \act{RetireSuccess}) commit block $i$ in the same
+  step.
+\item[(ii)] \emph{Exactness preservation by streaming.} \act{AppendStable}
+  preserves \textup{ECH}: $\Ledger'=C(c)\cat A'(c)$.
+\item[(iii)] \emph{No re-emission.} Across any behavior, each position of each
+  block's final snapshot contributes at most one ledger row and at most one
+  batch of $\srcApp$/$\srcRet$ native rows: rows emitted by
+  \act{AppendStable} are excluded from the block's retirement batch
+  (Definition~\ref{def:retbatch} slices from $e_{c+1}{+}1$), and after
+  commitment $e_i=0$ with block $i$ never again the head.
+\item[(iv)] \emph{Ledger monotonicity.} Every transition satisfies
+  $\Ledger\pre\Ledger'$.
+\end{enumerate}
+\end{lemma}
+
+\begin{proof}
+\emph{(i).} By ED, $e_i>0$ implies $\mu_i=\AppendOnly$, $i=c{+}1$, and
+$\varphi_i\in\{\Active,\Finalized\}$. The transitions that modify $w_i$ are
+\act{Update} and the two finalizations, each guarded (for
+$\mu_i=\AppendOnly$) by $w_i\pre s$ with $w_i':=s$; a prefix extension
+preserves every position $\le e_i\le\len{w_i}$. No other transition writes
+$w$. The transitions that decrease $e_i$ are exactly
+\act{CompleteAppendOnly} and \act{RetireSuccess}, both of which set
+$\varphi_i'=\Committed$ for the affected block(s).
+
+\emph{(ii).} The guard gives $e_{c+1}<\len{w_{c+1}}$ and, writing
+$n=e_{c+1}+1$,
+\[
+  \Ledger' = \Ledger\cat\seq{(c{+}1,w_{c+1}[n])}
+           = C(c)\cat A(c)\cat\seq{(c{+}1,w_{c+1}[n])}
+           = C(c)\cat\tg_{c+1}\bigl(w_{c+1}[1..n]\bigr),
+\]
+using ECH for the middle equality and, for the last, that
+$A(c)=\tg_{c+1}(w_{c+1}[1..e_{c+1}])$ when $e_{c+1}>0$ and
+$A(c)=\emptyseq$ when $e_{c+1}=0$ (in either case the concatenation is the
+tagged prefix of length $n$). In the successor, $e_{c+1}'=n>0$, and $\mu$,
+$\varphi_{c+1}$, $c$, $\created$ are unchanged, so $\PH'$ holds and
+$A'(c)=\tg_{c+1}(w_{c+1}[1..n])$. Hence $\Ledger'=C(c)\cat A'(c)$.
+
+\emph{(iii).} A row of block $i$ enters $\Ledger$ either via
+\act{AppendStable} at position $e_i{+}1$ (incrementing $e_i$) or via
+\act{RetireSuccess}, whose logical batch for the head starts at position
+$e_{c+1}{+}1$ and covers later blocks in full---blocks $j>c{+}1$ have $e_j=0$
+by ED. By ECH the ledger is at all times \emph{equal} to
+$C(c)\cat A(c)$, in which position $p$ of block $i$ occurs at most once;
+monotonicity of $c$ and of $e_{c+1}$ between commits (part (i)) makes the
+occurrence permanent. The same slicing governs the physical batches.
+
+\emph{(iv).} Only \act{AppendStable} and \act{RetireSuccess} write $\Ledger$,
+both by right-concatenation.
+\end{proof}
+
+\subsection{Generic terminal streaming realization}\label{sec:realization}
+
+We now connect the abstract effect ``append $F$ to $\Native$ and repaint the
+viewport as $\Scr'$'' to the concrete mechanics of a scrolling terminal.
+
+\begin{definition}[Abstract scrolling terminal]\label{def:terminal}
+A \emph{terminal} of height $h\ge 0$ is a pair $(S,V)$ with $S$ a row
+sequence (scrollback) and $V$ a row sequence of length $h$ (viewport). The
+\emph{print} operation writes a row sequence $T$ starting at viewport row
+$r_0\in[h]\cup\{h{+}1\}$ (when $h=0$, $r_0=1$ and every written row scrolls):
+rows are written top-to-bottom at consecutive positions; writing at a
+position $r\le h$ replaces $V[r]$; when the cursor would advance past row
+$h$, the terminal \emph{scrolls}: $S:=S\cat\seq{V[1]}$,
+$V:=V[2..h]\cat\seq{\BlRow}$, and the cursor stays at row $h$.
+\end{definition}
+
+\begin{lemma}[Streaming realization]\label{lem:stream}
+Let $(S,V)$ be a terminal of height $h$, let $F$ be any row sequence and $Q$
+any row sequence with $\len{Q}=h$, and let $T=F\cat Q$, $k=\len{F}$. Printing
+$T$ from row $r_0=1$ when $k\ge 1$, or overwriting rows $1..h$ when $k=0$,
+yields the terminal $(S\cat F,\;Q)$: the scrollback is extended by exactly
+$F$, in order, and the final viewport equals $Q$. No row of the pre-state
+viewport $V$ enters $S$.
+\end{lemma}
+
+\begin{proof}
+For $k=0$ the print rewrites $V[1..h]:=Q$ with no cursor overflow; $S$ is
+unchanged and $S\cat F=S$.
+
+For $k\ge 1$ we prove by induction on $j\in 0..k$ the invariant: after
+writing the first $h+j$ rows of $T$,
+\[
+  S_j=S\cat T[1..j], \qquad V_j=T[j{+}1\,..\,j{+}h].
+\]
+\emph{Base $j=0$}: the first $h$ writes fill rows $1..h$ with $T[1..h]$
+without overflow, so $S_0=S$ and $V_0=T[1..h]$. \emph{Step}: to write row
+$h{+}j{+}1$ of $T$ the cursor advances past row $h$; the terminal scrolls,
+moving $V_j[1]=T[j{+}1]$ into scrollback and shifting, then the write places
+$T[h{+}j{+}1]$ at row $h$:
+\[
+  \begin{aligned}
+  S_{j+1}&=S_j\cat\seq{T[j{+}1]}=S\cat T[1..j{+}1],\\
+  V_{j+1}&=T[j{+}2\,..\,j{+}h]\cat\seq{T[h{+}j{+}1]}
+         =T[(j{+}1){+}1\,..\,(j{+}1){+}h].
+  \end{aligned}
+\]
+At $j=k$: $S_k=S\cat T[1..k]=S\cat F$ and
+$V_k=T[k{+}1..k{+}h]=Q$. Rows scrolled out are exactly $T[1..k]=F$; every row
+of the old viewport is overwritten in the base phase before any scroll, so
+none reaches $S$. When $h=0$, $T=F$, every write scrolls, and the claim is
+the base-free instance of the same induction.
+\end{proof}
+
+\begin{corollary}[Retirement realization]\label{cor:retire}
+\act{RetireSuccess}$(b)$ is realized on a terminal displaying $\Scr$ by a
+single streamed write of
+$T=F^{\srcRet}_{\mathrm{phys}}(b)\cat\Scr'$ (rows taken as the row components
+of the tagged sequences), scrolling exactly
+$\len{F^{\srcRet}_{\mathrm{phys}}(b)}$ times; likewise \act{AppendStable} with
+$F=\ren{\omega}(\seq{w_{c+1}[n]})$ ($1$ or $2$ physical rows), and
+\act{GracefulExit}/\act{DetachExit} with $k=1$ and $F=\seq{\Scr[1]}$ followed
+by a blanked viewport. In each case the scrollback extension equals, row for
+row and in order, the native rows appended by the transition, and no
+speculative viewport content leaks into scrollback.
+\end{corollary}
+
+\begin{proof}
+Instantiate Lemma~\ref{lem:stream} with $Q=\Scr'$, which has length $h$ by
+Theorem~\ref{thm:capacity}(i) applied in the successor state (CAP holds there
+by Corollary~\ref{cor:canon}). The transition's native append is by
+definition the tagged image of $F$. The final claim is the lemma's ``no row of
+$V$ enters $S$''.
+\end{proof}
+
+\begin{remark}[Fail-stop realization]
+\act{RetireFailure}$(b,k)$ is the same write interrupted after $k$ physical
+rows: by Lemma~\ref{lem:stream}'s induction, after $\min(k,\dots)$ writes the
+scrollback extension is exactly a \emph{prefix} of
+$F^{\srcFail}_{\mathrm{phys}}(b)$---never a row of $\Scr'$, never out of
+order. Because the abstract transition does not advance $c$ or touch
+$\Ledger$, and $\run'=\mathrm{false}$ disables every subsequent transition
+(Theorem~\ref{thm:actions}(vii)), the physical scrollback ends with a clean,
+attributable, immutable prefix of finalized content.
+\end{remark}
+
+\subsection{Bottom-first synchronous replay}\label{sec:replayproof}
+
+\begin{lemma}[Bottom-first synchronous replay invariant]\label{lem:replay}
+Assume $J$ and $\Repl$. Then:
+\begin{enumerate}
+\item[(i)] \emph{Split correctness.} After \act{PrepareReplay},
+  $\rcut=\rcut^{*}$ and the prepared tail satisfies
+  $\len{\RRows[\rcut{+}1..\len{\RRows}]}=\min(\len{\RRows},\Room)\le\Room$.
+\item[(ii)] \emph{History-neutral tail paint.} Painting the prepared tail
+  into the blank region of $\Scr$ (bottom-anchored, by absolute cursor
+  addressing) writes only rows at viewport positions occupied by $\Bcell$
+  cells and causes no scroll; hence it extends neither $\Native$ nor
+  $\Ledger$.
+\item[(iii)] \emph{Single-write scroll exactness.} The subsequent synchronous
+  buffered write is the streaming realization
+  (Lemma~\ref{lem:stream}) of $F=\RRows[1..\rcut]$ with final viewport the
+  replay-completed frame; it scrolls exactly $\rcut$ rows, and the native
+  extension is exactly $\RRows[1..\rcut]$---as specified by
+  \act{ReplaySynchronousSuccess}.
+\item[(iv)] \emph{Gate necessity and atomicity.} Between \act{PrepareReplay}
+  and the write, the scheduler gate of Definition~\ref{def:spec} admits no
+  other transition; this is necessary: absent the gate, an interleaved
+  \act{Admit}, \act{Update}, \act{FinalizeQueued}, or allocation step can
+  change $\Room$ or $\len{\RRows}$ and falsify $\rcut=\rcut^{*}$, so the
+  invariant \textup{RS} is stable only under the gate. Consequently at most
+  one frame is ever presented per replay: no multi-frame flicker and no torn
+  intermediate state is observable.
+\item[(v)] \emph{Failure safety.} \act{ReplaySynchronousFailure}$(k)$ leaves
+  scrollback extended by the prefix $\RRows[1..k]$, $k\le\rcut$, of
+  re-rendered \emph{committed} rows (and stable head prefix); the ledger and
+  frontier are untouched and the host halts.
+\end{enumerate}
+\end{lemma}
+
+\begin{proof}
+\emph{(i).} \act{PrepareReplay} sets $\rcut':=\rcut^{*}$ by definition. Then
+\[
+  \len{\RRows}-\rcut^{*}
+  =\len{\RRows}-\max(0,\len{\RRows}-\Room)
+  =\min(\len{\RRows},\Room)\le\Room .
+\]
+
+\emph{(ii).} By (i) the tail occupies at most $\Room$ rows and $\Room$ counts
+exactly the $\Bcell$ positions of $\Scr$
+(Theorem~\ref{thm:capacity}(i) makes this count well defined and the blank
+block contiguous at the top of $\Scr$, positions
+$1..\,h-A_{\Sigma}-\sigma$). Writing $\le\Room$ rows at absolute positions
+within $[1..h]$ never advances the cursor past row $h$, so by
+Definition~\ref{def:terminal} no scroll occurs and $S$ is unchanged. The
+transition \act{PrepareReplay} indeed changes neither $\Native$ nor
+$\Ledger$.
+
+\emph{(iii).} Instantiate Lemma~\ref{lem:stream} with $F=\RRows[1..\rcut]$
+and $Q$ the post-replay physical frame (the $h$-row image containing the
+painted tail and the live slots). The scrollback extension is exactly
+$F$, matching the abstract effect
+$\Native':=\Native\cat\RRows[1..\rcut]$ of \act{ReplaySynchronousSuccess};
+$\Ledger$, $c$, $w$, $f$, $e$ are unchanged, so replay is logically neutral.
+
+\emph{(iv).} By Definition~\ref{def:spec}, when $\rprep$ holds the next-state
+relation is the disjunction of the two replay writes only. For necessity,
+observe that $\rcut^{*}$ is a function of $\len{\RRows}$ and $\Room$;
+$\Room$ is a function of $\alpha$ and $\sigma$, both of which are changed by
+\act{Admit} (new $1$-row slot), \act{ApplyAllocation}, \act{FinalizeQueued}
+(possible new presented block, possibly overflow), and \act{Update} on the
+head can change $\len{\RRows}$ via $w_{\rend+1}$\,---\,so RS's clause
+$\rprep\Rightarrow\rcut=\rcut^{*}$ would not be preserved by those steps.
+Physically, the gate is the statement that the implementation assembles the
+remainder $F\cat Q$ into one buffer and issues it as one synchronous write:
+no repaint can be scheduled between preparation and completion, so the
+display transitions from the pre-replay frame directly to the completed
+frame.
+
+\emph{(v).} Immediate from the transition's definition and
+Lemma~\ref{lem:stream}'s prefix property; NSS's $\srcRep$ clause (proved in
+Theorem~\ref{thm:safety}) attributes every such row to committed content or
+the append-only head.
+\end{proof}
+
+\begin{remark}[Bottom-first order]
+The order---tail first, scroll-write second---is what makes the \emph{visible}
+viewport correct at every instant: the tail paint (ii) fills blank rows that
+carry no information, and the single write (iii) atomically supplies the
+scrolled prefix and the final frame. Painting top-first (prefix before tail)
+would either require $\rcut$ speculative scrolls before the tail exists on
+screen (tearing: transient frames showing history without its continuation)
+or force multi-frame incremental replay (flicker). The model's gate plus
+split renders both failure modes unrepresentable.
+\end{remark}
+
+\subsection{Global inductive safety}\label{sec:safety}
+
+\begin{theorem}[Global inductive safety]\label{thm:safety}
+$J$ (Definition~\ref{def:inv}) is an inductive invariant of
+$\mathrm{Spec}$: the initial state satisfies $J$, and every transition of
+Section~\ref{sec:protocol}, fired in any state satisfying $J$, yields a state
+satisfying $J$. Hence $\mathrm{Spec}\models\Box J$.
+\end{theorem}
+
+\begin{proof}
+\emph{Initiality.} In the state of Definition~\ref{def:init}: T holds by
+inspection; LS with $c=\created=0$; SD with all phases $\Absent$ and
+$f\equiv\NoFinal$; ED with $e\equiv 0$; CAP because no block is presented, so
+$\Canon\equiv 0=\alpha=\tau$ and $\Res+\sigma=0\le H=h$
+(Corollary~\ref{cor:canon}); ECH because
+$\Ledger=\emptyseq=C(0)\cat A(0)$ ($\PH$ fails at $c=\created$); RS by the
+$\None$ clause; NSS vacuously ($\Native=\emptyseq$).
+
+\emph{Preservation.} Fix a state satisfying $J$ and a transition. We argue
+each conjunct; components not written by the transition preserve the
+corresponding clauses trivially, so we treat only the writers.
+
+\textbf{T.} All effects assign values within the declared ranges:
+phases/modes from their alphabets; $e_{c+1}'=e_{c+1}+1\le\len{w_{c+1}}\le
+\Lmax$ in \act{AppendStable} (guard); $\alpha',\tau'$ from guards or
+$\Canon\in\{0,1\}^{\Blocks}$; $c'=b\le N$; $\nu'\le\MaxRes$ (guard) and
+$\varepsilon'\le\nu'\le\MaxRes$ (an epoch increment occurs only within a
+resize); $\rcut'=\rcut^{*}\le\len{\RRows}\le
+2\bigl(c\,\Lmax+\Lmax\bigr)\le 2N\Lmax=\Fmax$ using
+Proposition~\ref{prop:render}(i); ledger/native rows are constructed by
+$\tg$/$\ntg$ over their row types.
+
+\textbf{LS.} \act{Create} sets $\varphi_{\created+1}$ from $\Absent$ to
+$\Queued$ with a mode, extending the created range contiguously by one; the
+bands shift accordingly. \act{Admit}, \act{Update}, the finalizations, and
+\act{BeginGracefulShutdown} keep every touched block inside the band
+prescribed for its index: indices $\le c$ are untouched or (shutdown) set to
+$\Committed$, indices in $(c..\created]$ move within
+$\{\Queued,\Active,\Finalized\}$. \act{CompleteAppendOnly} and
+\act{RetireSuccess}$(b)$ set $\varphi_j'=\Committed$ exactly for
+$j\le c'\in\{c{+}1,b\}$ and leave later blocks in place; $c'\le\created$
+because the guard requires those blocks finalized, hence created. No
+transition unsets a mode or reverts a phase.
+
+\textbf{SD.} Writers of $f$: the finalizations set $f_i'=s=w_i'$ with
+$\varphi_i'=\Finalized$ (and by LS the block was not finalized/committed
+before, so no frozen final is overwritten); \act{BeginGracefulShutdown} sets
+$f_i'=w_i$ exactly for blocks moving $\Queued/\Active\to\Finalized$
+(for which $w$ is unchanged, giving $f_i'=w_i'$) and preserves $f_i$ for
+already finalized/committed blocks, where SD gave $f_i=w_i$ and $w$ is
+unchanged. Writers of $w$ with a frozen final: none---\act{Update} requires
+$\varphi_i\in\{\Queued,\Active\}$ (so $f_i=\NoFinal$), and the finalizations
+set both together. Commitment (\act{CompleteAppendOnly},
+\act{RetireSuccess}) changes phases $\Finalized\to\Committed$ with $f,w$
+untouched.
+
+\textbf{ED.} Writers of $e$: \act{AppendStable} increments $e_{c+1}$ within
+$\len{w_{c+1}}$ (guard), for a block with $\mu=\AppendOnly$,
+$\varphi\in\{\Active,\Finalized\}$, index $c{+}1$, and leaves $c$ fixed;
+\act{CompleteAppendOnly} and \act{RetireSuccess} zero $e_j$ for all $j\le c'$
+while advancing $c$---by ED any $i$ with $e_i>0$ satisfied $i=c{+}1\le c'$,
+so no positive $e$ survives at an index $\ne c'{+}1$; indices $>c'$ retain
+$e=0$. Writers of $w$: for $\mu_i=\AppendOnly$ the prefix guards give
+$\len{w_i'}\ge\len{w_i}\ge e_i$; for $\mu_i=\Mutable$, ED gives $e_i=0$.
+Writers of $\varphi$ at an index with $e_i>0$: only
+\act{FinalizeActive} ($\Active\to\Finalized$, allowed) and
+\act{BeginGracefulShutdown} (by ED the block with $e_i>0$ has
+$\varphi_i\in\{\Active,\Finalized\}$ and $i=c{+}1>c$, so it moves to
+$\Finalized$, allowed).
+
+\textbf{CAP.} \act{Admit}, \act{RequestAllocation}, and
+\act{ApplyAllocation} carry $\AOK$ at the successor configuration explicitly
+in their guards (for \act{ApplyAllocation} the guard is moreover always
+satisfiable along a bridge by Lemma~\ref{lem:bridge}(i)). \act{Update}
+changes only $w$, on which $\AOK$ does not depend (visibility uses
+$\varphi,f,e,\omega,h$ only). \act{BeginFlush}, \act{PrepareReplay}, the
+replay writes, \act{RetireFailure}, and the exits change none of
+$\alpha,\tau,\varphi,f,e,\omega,h$. Every remaining writer
+(\act{FinalizeActive}, \act{FinalizeQueued}, \act{AppendStable},
+\act{CompleteAppendOnly}, \act{RetireSuccess}, \act{Resize},
+\act{BeginGracefulShutdown}) sets $\alpha'=\tau'=\Canon$ evaluated at its
+successor tuple, and Corollary~\ref{cor:canon} yields $\AOK$ there.
+
+\textbf{ECH.} Writers of any of $\Ledger,c,f,w,e,\varphi,\mu$:
+\begin{itemize}
+\item \act{Create}: $\created'=\created+1$. If $c<\created$, the head block
+  $c{+}1$ is untouched, so $\PH$ and $A(c)$ are unchanged. If $c=\created$,
+  then $\PH$ was false; afterwards $e_{c+1}=0$ (ED), so $\PH'$ is false.
+  Either way $\Ledger'=\Ledger=C(c)\cat A(c)$.
+\item \act{Admit}, \act{ApplyAllocation}, \act{RequestAllocation},
+
+  \act{BeginFlush}, \act{Resize}, \act{PrepareReplay}, the replay writes,
+  failures, exits: none of $\Ledger,c,f,w,e$ change, and $\PH$ depends only
+  on $(c,\created,\mu_{c+1},\varphi_{c+1},e_{c+1})$; \act{Admit} can change
+  $\varphi_{c+1}$ only $\Queued\to\Active$, which affects $\PH$ only when
+  $e_{c+1}>0$, impossible for a queued block by ED.
+\item \act{Update}$(i,s)$: only $w_i$ changes. If $i\ne c{+}1$ or $\PH$
+  fails with $e_{c+1}=0$, $A(c)$ is unaffected. If $i=c{+}1$ and
+  $e_{c+1}>0$, ED forces $\mu_i=\AppendOnly$, the guard gives $w_i\pre s$,
+  hence $s[1..e_i]=w_i[1..e_i]$ and $A'(c)=A(c)$.
+\item Finalizations: $f_i$ is set for $i>c$, so $C(c)$ is unchanged; $w_i$
+  extends by prefix in the append-only case (as above) and $e_i=0$ in the
+  mutable case; $\varphi_i'=\Finalized$ keeps
+  $\PH$'s phase disjunct satisfied when $i=c{+}1$.
+\item \act{AppendStable}: Lemma~\ref{lem:head}(ii).
+\item \act{CompleteAppendOnly}: the guard gives $e_{c+1}=\len{f_{c+1}}$ and
+  SD gives $f_{c+1}=w_{c+1}$, so
+  $A(c)=\tg_{c+1}(w_{c+1}[1..e_{c+1}])=\tg_{c+1}(f_{c+1})$ (also when
+  $\len{f_{c+1}}=0$, both sides empty). Hence
+  $\Ledger=C(c)\cat\tg_{c+1}(f_{c+1})=C(c{+}1)=C(c')$. In the successor,
+  every $e'_j=0$ for $j\le c'$ and ED excludes $e_{c'+1}>0$ (only index
+  $c{+}1$ could be positive), so $\PH'$ fails and $A'(c')=\emptyseq$.
+\item \act{RetireSuccess}$(b)$: all blocks $c{+}1..b$ are finalized, so
+  SD gives $f_j=w_j$ on the range. If $e_{c+1}>0$ then
+  $A(c)\cat\tg_{c+1}(f_{c+1}[e_{c+1}{+}1..])=\tg_{c+1}(f_{c+1})$; if
+  $e_{c+1}=0$ then $A(c)=\emptyseq$ and the head batch is all of
+  $\tg_{c+1}(f_{c+1})$. In both cases
+  \[
+    \Ledger'=C(c)\cat A(c)\cat F_{\log}(b)
+    = C(c)\cat\Cat_{j=c+1}^{b}\tg_j(f_j)=C(b)=C(c').
+  \]
+  As above, all $e'_j$ vanish for $j\le b$ and $e_{b+1}=0$ by ED, so
+  $A'(c')=\emptyseq$.
+\item \act{BeginGracefulShutdown}: $\Ledger,c,w,e$ unchanged; $f_j$ for
+  $j\le c$ unchanged, so $C(c)$ unchanged; if $\PH$ held, the head's phase
+  moves $\Active\mapsto\Finalized$ or stays $\Finalized$, so $\PH'$ holds
+  and $A$ is unchanged ($w,e$ fixed); if $\PH$ failed, it fails after
+  (a positive $e_{c+1}$ cannot appear).
+\end{itemize}
+
+\textbf{RS.} \act{Resize}: in the $\mathit{begin}$ case it establishes the
+$\Repl$ clause directly ($\rcur'=1$, $\rend'=c\in 0..c$,
+$\rpart'\le\Lmax$ by T, $\rprep'$ false, $\rcut'=0$); continuing an existing
+replay it preserves the window (still $\rend\le c$ since $c$ is unchanged)
+and resets $\rprep,\rcut$ to the unprepared shape; otherwise it writes the
+$\None$ shape. \act{PrepareReplay} establishes the prepared clause:
+$\rcut'=\rcut^{*}$ and the tail bound by Lemma~\ref{lem:replay}(i).
+\emph{Stability of the prepared clause}: by the scheduler gate
+(Definition~\ref{def:spec}) the only transitions from a prepared state are
+the two replay writes; success restores the $\None$ shape and failure
+freezes the system, so no step can invalidate $\rcut=\rcut^{*}$
+(Lemma~\ref{lem:replay}(iv)). While unprepared and replaying, transitions
+other than \act{Resize}/\act{PrepareReplay} leave the replay components
+untouched, and all $c$-advancing transitions
+(\act{CompleteAppendOnly}, \act{RetireSuccess}) are disabled by their
+$\neg\Repl$ guards, preserving $\rend\le c$.
+
+\textbf{NSS.} New native rows, by transition: \act{AppendStable} appends
+$\srcApp$ rows with owner $c{+}1$ and $\mu_{c+1}=\AppendOnly$ (guard);
+\act{RetireSuccess}$(b)$ appends $\srcRet$ rows with owners in
+$c{+}1..b\subseteq[c']$, all committed in the successor;
+\act{Resize} appends $\srcRsz$ rows (no NSS obligation) or clears $\Native$
+(vacuous); the replay writes append $\srcRep$ rows whose owners lie in
+$[\rend]\cup\{\rend{+}1\}$ with $\rend\le c$ and, when $\rpart>0$, owner
+$\rend{+}1=c{+}1$ with $\mu_{c+1}=\AppendOnly$---the latter because
+$\rpart>0$ was set at a resize at which $\PH$ held, $\mu$ is immutable after
+creation, and $c$ cannot advance while $\Repl$ holds, so the identity
+$\rend=c$ persists from that resize; \act{RetireFailure} and
+\act{ReplaySynchronousFailure} append $\srcFail$- and $\srcRep$-tagged rows
+respectively while setting $\stopr'=\stWF$ and $\run'=\mathrm{false}$; the
+exits append $\srcExit$ rows while setting $\run'=\mathrm{false}$.
+Old rows: the clauses for $\srcRet$, $\srcApp$, $\srcRep$ mention $c$,
+$\varphi$, $\mu$, all of which evolve monotonically in the required
+direction---$c$ never decreases, committed blocks stay committed, modes are
+immutable, and an owner $o=c{+}1$ of an $\srcApp$/$\srcRep$ row moves into
+$[c']$ whenever the frontier passes it. The $\srcFail$/$\srcExit$ clauses
+are preserved because $\stopr$ and $\run$ change only in halting transitions,
+after which (Theorem~\ref{thm:actions}(vii)) the state is frozen.
+\end{proof}
+
+\begin{corollary}[No premature native or ledger rows]\label{cor:nph}
+In every reachable state, every ledger row is owned either by a committed
+block $o\in[c]$ (with $\varphi_o=\Committed$) or, when $\PH$ holds, by the
+head $c{+}1$; and every $\srcApp$/$\srcRet$/$\srcRep$ native row is owned by
+a committed block or by the append-only head. In particular no row of a
+queued, merely-active mutable, or unfinalized non-head block ever reaches
+either history.
+\end{corollary}
+
+\begin{proof}
+By ECH, $\Ledger=C(c)\cat A(c)$: rows of $C(c)$ have owners $j\in[c]$, which
+LS makes committed; rows of $A(c)$ exist only under $\PH$ and carry owner
+$c{+}1$. The native claim is NSS. Both hold in all reachable states by
+Theorem~\ref{thm:safety}.
+\end{proof}
+
+\begin{corollary}[Screen capacity]\label{cor:sc}
+In every reachable state, $\Scr$ is an $h$-row cell sequence in which block
+$i$ owns exactly $\alpha_i$ rows, exactly $\sigma$ rows carry the overflow
+marker, and exactly $h-\sum_i\alpha_i-\sigma$ rows are blank.
+\end{corollary}
+
+\begin{proof}
+Theorem~\ref{thm:capacity}(i) applied under $\Box J$.
+\end{proof}
+
+\begin{theorem}[Action safety]\label{thm:actions}
+Every step of $\mathrm{Spec}$ (including stuttering) satisfies:
+\begin{enumerate}
+\item[(i)] \emph{Ledger monotonicity:} $\Ledger\pre\Ledger'$.
+\item[(ii)] \emph{Epoch-scoped native monotonicity:} either
+  $\varepsilon'=\varepsilon$ and $\Native\pre\Native'$, or
+  $\varepsilon'=\varepsilon+1$ and $\Native'=\emptyseq$.
+\item[(iii)] \emph{Final immutability:} if
+  $\varphi_i\in\{\Finalized,\Committed\}$ then $f_i'=f_i$.
+\item[(iv)] \emph{Append-only monotonicity:} if $\mu_i=\AppendOnly$ and
+  $\varphi_i\in\{\Queued,\Active\}$ then $w_i\pre w_i'$.
+\item[(v)] \emph{Resize logical-neutrality:} if $\omega'\ne\omega$ or
+  $h'\ne h$ then $\Ledger'=\Ledger$, $c'=c$, $\mu'=\mu$, $w'=w$, $f'=f$,
+  $e'=e$.
+\item[(vi)] \emph{Fail-stop:} $\Box(\stopr=\stWF \Rightarrow \neg\run)$.
+\item[(vii)] \emph{Stopped quiescence:} if $\neg\run$ then the step is a
+  stutter (all components unchanged).
+\end{enumerate}
+\end{theorem}
+
+\begin{proof}
+(i) Lemma~\ref{lem:head}(iv); stutters are trivial.
+(ii) The writers of $\Native$ are \act{AppendStable}, \act{RetireSuccess},
+\act{RetireFailure}, \act{Resize}, the replay writes, and the exits; all
+append except \act{Resize} with $p^{\dagger}=\Rebuild$, which simultaneously
+sets $\Native'=\emptyseq$ and $\varepsilon'=\varepsilon+1$; no other
+transition writes $\varepsilon$.
+(iii) The finalizations write $f_i$ only for $\varphi_i\in\{\Active,\Queued\}$;
+\act{BeginGracefulShutdown} preserves $f_i$ whenever
+$i\le c$ or $\varphi_i=\Finalized$, which by LS covers all finalized and
+committed blocks.
+(iv) The writers of $w_i$ are \act{Update} and the finalizations; for
+$\mu_i=\AppendOnly$ each is guarded by $w_i\pre s$.
+(v) Only \act{Resize} writes $\omega$ or $h$, and its effect leaves the six
+listed components untouched.
+(vi) $\stopr$ is set to $\stWF$ only by \act{RetireFailure} and
+\act{ReplaySynchronousFailure}, both of which set $\run'=\mathrm{false}$ in
+the same step; by (vii) no later step changes either component; initially
+$\stopr=\stRun$.
+(vii) Every transition's guard conjoins $\run$; hence from a state with
+$\neg\run$, $\mathrm{Next}$ is disabled and $\Box[\mathrm{Next}]_{vars}$
+permits only stuttering. (Weak fairness of the five named actions is
+vacuous there, since none is enabled.)
+\end{proof}
+
+\begin{remark}[Fail-stop precludes duplication and reordering]
+Combining Theorem~\ref{thm:actions}(vi,vii) with
+Theorem~\ref{thm:safety}: after a partial write failure, $c$ and $\Ledger$
+are exactly what they were before the failed batch, the native scrollback
+ends in a $\srcFail$- or $\srcRep$-tagged \emph{prefix} of immutable
+finalized/stable rows, and no further transition exists. There is thus no
+state from which a retry could re-emit rows, and no interleaving in which a
+younger block's rows precede an older block's in either history.
+\end{remark}
+
+\subsection{Conditional progress and liveness}\label{sec:liveness}
+
+Recall the weak-fairness conjuncts of Definition~\ref{def:spec} and write
+$\leadsto$ for ``leads to''. Define
+\[
+  \mathrm{AllFin} \iff \forall i\in[\created]:
+    \varphi_i\in\{\Finalized,\Committed\},
+  \qquad
+  \mathrm{AllCom} \iff c=\created \wedge \Ledger=C(c).
+\]
+
+\begin{lemma}[Resize exhaustion]\label{lem:resize-exhaust}
+In every behavior of $\mathrm{Spec}$, only finitely many \act{Resize} steps
+occur; after the last one, $\omega$ and $h$ are constant and no new replay
+begins.
+\end{lemma}
+\begin{proof}
+$\nu$ increases by one at each \act{Resize} and at no other step, and
+$\nu\le\MaxRes$ by T. \act{Resize} is the only transition that sets
+$\rmode$ to a non-$\None$ value.
+\end{proof}
+
+\begin{theorem}[Replay termination]\label{thm:replay-live}
+$\mathrm{Spec}\models
+(\Repl \wedge \run) \leadsto (\neg\Repl \vee \neg\run)$.
+\end{theorem}
+
+\begin{proof}
+Assume, toward contradiction, a behavior with a suffix on which
+$\Repl\wedge\run$ holds forever. By Lemma~\ref{lem:resize-exhaust} pass to a
+further suffix with no \act{Resize} steps. On this suffix $\rmode$ can only
+be changed by \act{ReplaySynchronousSuccess} (to $\None$, contradiction) and
+$\run$ only by a halting transition (contradiction), so suppose neither ever
+fires. Two cases on $\rprep$:
+
+If $\rprep$ is false at some state of the suffix, then \act{PrepareReplay} is
+enabled there ($\run\wedge\Repl\wedge\neg\rprep$) and remains enabled at
+every subsequent state until taken: the only transitions that modify
+$\rprep$ or $\rmode$ are \act{Resize} (excluded), \act{PrepareReplay}
+itself, and the replay writes (which require $\rprep$). By
+$\mathrm{WF}(\act{PrepareReplay})$ it is eventually taken, after which
+$\rprep$ holds.
+
+Once $\rprep$ holds, the scheduler gate restricts $\mathrm{Next}$ to the two
+replay writes; the action \act{ReplaySynchronousSuccess} is then enabled
+($\run\wedge\Repl\wedge\rprep$) and stays enabled while neither write fires
+(no other transition can execute). By
+$\mathrm{WF}(\act{ReplaySynchronousSuccess})$, eventually the success fires
+(making $\rmode=\None$) or the failure fires first (making
+$\neg\run$)---either contradicts the assumption.
+\end{proof}
+
+\begin{theorem}[Flush-driven completion]\label{thm:flush-live}
+$\mathrm{Spec}\models
+(\mathrm{AllFin}\wedge\flush\wedge\shut\wedge\run\wedge\neg\Repl)
+\leadsto (\mathrm{AllCom}\vee\neg\run)$.
+\end{theorem}
+
+\begin{proof}
+Let $s_0$ satisfy the antecedent and consider the behavior from $s_0$,
+assuming $\run$ persists (otherwise the consequent holds). Under $\shut$
+(which no transition unsets), the transitions \act{Create}, \act{Admit},
+\act{Update}, \act{RequestAllocation}, \act{ApplyAllocation}, both
+finalizations, \act{AppendStable}, \act{Resize},
+\act{BeginGracefulShutdown}, and \act{DetachExit} are disabled by their
+$\neg\shut$ guards. In particular no new replay can begin
+(only \act{Resize} begins one), so $\neg\Repl$ persists; $\created$ is
+frozen; $\mathrm{AllFin}$ persists (phases only move toward $\Committed$);
+and $\flush$ persists, so $\Req$ holds at every state.
+
+Claim: while $c<\created$, the action
+$\act{RetireSuccess}^{\exists}$ is enabled. Indeed $b=\created$ satisfies
+$b\in(c{+}1)..N$, the range $c{+}1..b$ is finalized
+($\mathrm{AllFin}$, minus committed prefix), $\Req$ holds, and
+$\neg\Repl\wedge\run$ hold. The only enabled non-stuttering transitions from
+such states are \act{RetireSuccess}, \act{RetireFailure},
+\act{CompleteAppendOnly}, \act{BeginFlush} (disabled: $\flush$ already), and
+\act{GracefulExit} (disabled while $c<\created$). If \act{RetireFailure}
+fires, $\neg\run$ and we are done. \act{CompleteAppendOnly} strictly
+increases $c$. Since $\act{RetireSuccess}^{\exists}$ remains enabled at every
+state with $c<\created$, weak fairness guarantees that, unless $c$ reaches
+$\created$ by \act{CompleteAppendOnly} steps first, a
+\act{RetireSuccess}$(b)$ step occurs, which sets $c'=b\ge c+1$. Each
+frontier-advancing step increases $c$ by at least one and $c\le N$, so after
+at most $N$ such steps $c=\created$. At that point $\PH$ fails
+(its conjunct $c<\created$), so by ECH
+$\Ledger=C(c)\cat\emptyseq=C(c)$: exactly $\mathrm{AllCom}$.
+\end{proof}
+
+\begin{theorem}[Pressure-driven retirement]\label{thm:pressure-live}
+Let $i\in\Blocks$. Suppose a reachable state $s$ satisfies
+\[
+  \run \wedge \neg\Repl \wedge c=i{-}1 \wedge \varphi_i=\Finalized
+  \wedge \bigl(\flush \vee \created-c\ge\MaxLive\bigr).
+\]
+Then $\mathrm{Spec}\models$ from $s$, eventually $c\ge i \vee \neg\run$.
+\end{theorem}
+
+\begin{proof}
+Assume $\run$ persists and $c=i{-}1$ persists (otherwise, since $c$ is
+monotone, $c\ge i$ eventually and we are done). Then: $\flush$, once true,
+is stable; and $\created-c$ is nondecreasing while $c$ is fixed
+($\created$ is nondecreasing), so the disjunct that held at $s$ holds
+forever, hence $\Req$ holds forever. $\varphi_i=\Finalized$ persists while
+$c<i$ (a finalized block changes phase only by committing, which forces
+$c\ge i$). By Lemma~\ref{lem:resize-exhaust} and
+Theorem~\ref{thm:replay-live}, eventually a suffix begins on which
+$\neg\Repl$ holds forever. On that suffix
+$\act{RetireSuccess}^{\exists}$ is continuously enabled (witness $b=i$:
+$\mathrm{FinalizedRange}$ is the single block $i$, $\Req$ holds,
+$\neg\Repl\wedge\run$ hold), so by weak fairness some
+\act{RetireSuccess}$(b)$ with $b\ge c+1=i$ fires---contradicting the
+persistence of $c=i{-}1$. (A \act{RetireFailure} instead yields $\neg\run$.)
+\end{proof}
+
+\begin{remark}[Sharpness: row pressure alone does not force retirement]
+\label{rem:sharp}
+Theorem~\ref{thm:pressure-live} conditions on the \emph{persistent} pressure
+disjuncts ($\flush$, or count pressure $\created-c\ge\MaxLive$, which is
+monotone while the frontier is fixed). Pure \emph{row} pressure $D>h$ is not
+persistent and does not suffice in general: with $\MaxLive=4$, $N=3$, a
+finalized head ($f_1=\seq{a}$), an active mutable block~$2$, and a queued
+block~$3$ under $h=1$, we have $D=3>1$; a subsequent \act{Update} shrinking
+$w_2$ and a $\Preserve$ resize to $h'=3$ give $D=3\le 3$, extinguishing
+$\Press$ with $\created-c=3<\MaxLive$ and no flush---after which
+$\act{RetireSuccess}$ is disabled forever and an infinite stutter-fair
+suffix keeps $c=0$. The mechanically checked property
+\tla{QueuedPressureRetirement} (\S\ref{sec:tlc}) adds the hypothesis
+$\exists j:\varphi_j=\Queued$ and is checked at $\MaxLive=2$; there the
+hypothesis \emph{implies} persistent count pressure---a queued block $j$ and
+the finalized head $i$ are distinct uncommitted created blocks, so
+$\created-c\ge 2=\MaxLive$---and the property is an instance of
+Theorem~\ref{thm:pressure-live}. This is the precise sense in which queued
+demand guarantees that older finished work is swept out of the viewport.
+\end{remark}
+
+% ===========================================================================
+\section{Mechanical Verification in TLA\texorpdfstring{\textsuperscript{+}}{+}}
+\label{sec:tlc}
+% ===========================================================================
+
+The entire development of \S\ref{sec:model}--\S\ref{sec:theorems} is a
+faithful mathematical reading of the module \texttt{ElasticSlots.tla}; this
+section records the correspondence and the exhaustive model-checking
+evidence.
+
+\subsection{Transition correspondence}
+
+Table~\ref{tab:actions} maps each transition to its
+TLA\textsuperscript{+} action. The scheduler gate of
+Definition~\ref{def:spec} is the \tla{IF replayPrepared} branch of
+\tla{Next}; the five weak-fairness conjuncts appear verbatim in \tla{Spec}.
+Failure nondeterminism is bounded by
+\tla{MaxFailureRows} $=\Fmax=2N\Lmax$.
+
+\begin{table}[htbp]
+\centering\footnotesize\setlength{\tabcolsep}{3.5pt}
+\begin{tabular}{@{}ll@{\hspace{1em}}ll@{}}
+\toprule
+This paper & TLA\textsuperscript{+} action &
+This paper & TLA\textsuperscript{+} action \\
+\midrule
+\act{Create}$(m)$ & \tla{Create} &
+\act{RetireSuccess}$(b)$ & \tla{RetireSuccess} \\
+\act{Admit}$(i)$ & \tla{Admit} &
+\act{RetireFailure}$(b,k)$ & \tla{RetireFailure} \\
+\act{Update}$(i,s)$ & \tla{Update} &
+\act{Resize}$(\omega^{\dagger},h^{\dagger},p,k)$ & \tla{Resize} \\
+\act{RequestAllocation}$(\tau^{\dagger})$ & \tla{RequestAllocation}
+  & \act{PrepareReplay} & \tla{PrepareReplay} \\
+\act{ApplyAllocation}$(i)$ & \tla{ApplyAllocation} &
+\act{ReplaySynchronousSuccess} & \tla{ReplaySynchronousSuccess} \\
+\act{FinalizeActive}$(i,s)$ & \tla{FinalizeActive} &
+\act{ReplaySynchronousFailure}$(k)$ & \tla{ReplaySynchronousFailure} \\
+\act{FinalizeQueued}$(i,s)$ & \tla{FinalizeQueued} &
+\act{BeginGracefulShutdown} & \tla{BeginGracefulShutdown} \\
+\act{AppendStable} & \tla{AppendStable} &
+\act{GracefulExit}$(k)$ & \tla{GracefulExit} \\
+\act{CompleteAppendOnly} & \tla{CompleteAppendOnly} &
+\act{DetachExit}$(k)$ & \tla{DetachExit} \\
+\act{BeginFlush} & \tla{BeginFlush} & & \\
+\bottomrule
+\end{tabular}
+\caption{Transition-to-action correspondence (TLA\textsuperscript{+}
+parameter lists---\tla{declaration}, \tla{snapshot}, \tla{newTarget},
+\tla{batchEnd}, \tla{count}, \tla{newWidth}, \tla{newHeight},
+\tla{resizePolicy}, \tla{pushed}, \tla{push}---mirror the mathematical
+parameters positionally).}
+\label{tab:actions}
+\end{table}
+
+Likewise for the derived operators: $\ren{\omega}$ is
+\tla{Render}/\tla{DoubleRows}; $\tg$/$\ntg$ are \tla{Tag}/\tla{NativeTag};
+$C(k)$ is \tla{CommittedRows}; $A(c)$ is \tla{PartialHeadRows} (with $\PH$
+as \tla{PartialHeadExists}); $F_{\log},F^{q}_{\mathrm{phys}}$ are
+\tla{RetirementRows}/\tla{NativeRetirementRows}; $\pres,\vis,\sigma$ are
+\tla{Presented}, \tla{VisiblePresented}, \tla{SummaryRows}; $\AOK$ is
+\tla{AllocationStateOK}; $\Canon$ is \tla{CanonicalAllocation}; $B$ is
+\tla{BridgeHeight}; $\dm,D$ are \tla{SnapshotHeight}/\tla{FullRows};
+$\Press,\Req$ are \tla{Pressure}/\tla{RetirementRequested}; $\Scr$ is
+\tla{Screen}; $\RRows,\Room,\rcut^{*}$ are \tla{ReplayRows},
+\tla{ReplayRoom}, \tla{RequiredReplayCut}.
+
+\subsection{Checked invariants and temporal properties}
+
+Table~\ref{tab:props} lists the ten state invariants and ten temporal
+properties in the model-checking configurations, with their counterparts in
+this paper.
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+TLA\textsuperscript{+} name & Kind & This paper \\
+\midrule
+\tla{TypeOK} & invariant & T (Def.~\ref{def:inv}) \\
+\tla{LifecycleShape} & invariant & LS \\
+\tla{SnapshotDiscipline} & invariant & SD \\
+\tla{EmissionDiscipline} & invariant & ED \\
+\tla{Capacity} & invariant & CAP \\
+\tla{ExactCommittedHistory} & invariant & ECH, eq.~\eqref{eq:ech} \\
+\tla{NoPrematureHistory} & invariant & Corollary~\ref{cor:nph} \\
+\tla{ScreenCapacity} & invariant & Corollary~\ref{cor:sc};
+  Theorem~\ref{thm:capacity} \\
+\tla{ReplayShape} & invariant & RS; Lemma~\ref{lem:replay}(i) \\
+\tla{NativeSourceSafety} & invariant & NSS \\
+\midrule
+\tla{HistoryMonotonicity} & action property & Theorem~\ref{thm:actions}(i) \\
+\tla{NativeEpochDiscipline} & action property &
+  Theorem~\ref{thm:actions}(ii) \\
+\tla{FinalImmutability} & action property & Theorem~\ref{thm:actions}(iii) \\
+\tla{AppendOnlyMonotonicity} & action property &
+  Theorem~\ref{thm:actions}(iv) \\
+\tla{ResizeKeepsLogicalHistory} & action property &
+  Theorem~\ref{thm:actions}(v) \\
+\tla{FailedWriteStops} & invariance & Theorem~\ref{thm:actions}(vi) \\
+\tla{StoppedQuiescence} & action property & Theorem~\ref{thm:actions}(vii) \\
+\tla{FlushLiveness} & leads-to & Theorem~\ref{thm:flush-live} \\
+\tla{ReplayLiveness} & leads-to & Theorem~\ref{thm:replay-live} \\
+\tla{QueuedPressureRetirement} & leads-to &
+  Theorem~\ref{thm:pressure-live}, Remark~\ref{rem:sharp} \\
+\bottomrule
+\end{tabular}
+\caption{Checked properties and their counterparts.}
+\label{tab:props}
+\end{table}
+
+\subsection{Configurations and results}
+
+Three boundary configurations were checked exhaustively with TLC
+(version 2026.03.31, OpenJDK~17, Apple~M4~Max, 16 worker threads), all with
+the snapshot universe
+$\Snap=\{\emptyseq,\seq{a},\seq{a,b}\}$ over $\Sigma=\{a,b\}$ (satisfying
+Assumption~\ref{ass:params}) and deadlock checking disabled---terminal
+states (halted hosts) are intended. No invariant violation, no property
+violation, and no liveness counterexample was found in any configuration.
+
+\begin{table}[htbp]
+\centering\footnotesize
+\begin{tabular}{@{}lccc@{}}
+\toprule
+ & \tla{ElasticSlots} & \tla{ElasticSlotsBridges}
+ & \tla{ElasticSlotsResize} \\
+\midrule
+$N$ / $H$ & $2$ / $1$ & $1$ / $3$ & $1$ / $1$ \\
+$\MaxRes$ / $\MaxLive$ & $1$ / $2$ & $0$ / $1$ & $2$ / $1$ \\
+Invariants checked & all $10$ & $7$ & $9$ \\
+Temporal properties & all $10$ & $6$ & $8$ \\
+States generated & $568{,}654$ & $1{,}736$ & $117{,}042$ \\
+Distinct states & $219{,}721$ & $501$ & $52{,}638$ \\
+Graph depth & $18$ & $9$ & $16$ \\
+Liveness branches & $4$ & $1$ & $1$ \\
+Behavior-graph states (liveness) & $878{,}884$ & $501$ & $52{,}638$ \\
+Wall time & $22$\,s & $<1$\,s & $3$\,s \\
+Fingerprint collision prob.\ & $4.4\times 10^{-9}$
+  & $3.4\times 10^{-14}$ & $2.4\times 10^{-10}$ \\
+\bottomrule
+\end{tabular}
+\caption{Exhaustive TLC results (August 24, 2026).}
+\label{tab:tlc}
+\end{table}
+
+\paragraph{Why these boundaries.}
+The main configuration ($N{=}2$, $H{=}1$) maximizes contention: a one-row
+transcript forces the overflow/summary path (Theorem~\ref{thm:capacity}(iii))
+whenever two blocks are presented, exercises zero-height degradation via
+resizes to $h{=}0$, and---with $\MaxLive{=}2$---realizes the persistent count
+pressure of Remark~\ref{rem:sharp}, so that
+\tla{QueuedPressureRetirement} is checked in exactly the regime where
+Theorem~\ref{thm:pressure-live} applies. The bridges configuration
+($H{=}3$, no resizes) admits allocations up to $3$ and therefore drives the
+deep-shrink trajectory $3\to 2\to 1$ of Lemma~\ref{lem:bridge}(iii) together
+with concurrent request/apply interleavings against the reservation
+invariant. The resize configuration ($\MaxRes{=}2$) covers
+resize-during-replay: a second resize arriving before
+\act{ReplaySynchronousSuccess}, which preserves the replay window but resets
+preparation, plus all $\{\Preserve,\AppendPol,\Rebuild\}\times$
+width/height combinations, epoch resets, and emulator-push capture. Failure
+nondeterminism (\act{RetireFailure}, \act{ReplaySynchronousFailure} at every
+prefix length up to $\Fmax$) and both exits are enabled in all three
+configurations.
+
+\paragraph{Division of labor.}
+TLC establishes the theorems of this paper---for the checked
+instances---directly on the specification text, including the inductive
+stability arguments of Theorem~\ref{thm:safety} whose case analyses are most
+error-prone by hand (notably the interaction of RS with the scheduler gate,
+and NSS across frontier motion). The hand proofs above are stated for all
+parameter values of Assumption~\ref{ass:params} and identify \emph{why} each
+invariant is stable, which the model checker does not; where a checked
+property is parameter-sensitive we have said so explicitly
+(Remark~\ref{rem:sharp}). The two artifacts are kept in lock-step by the
+correspondence of Tables~\ref{tab:actions} and~\ref{tab:props}.
+
+% ===========================================================================
+\section{Conclusion}\label{sec:conclusion}
+% ===========================================================================
+
+Elastic Speculative Slots reconciles speculative, concurrent, elastically
+animated live output with the unforgiving append-only nature of terminal
+scrollback by decoupling three layers---semantic blocks, an exactly-once
+logical ledger, and epoch-scoped physical native history---and by making
+every crossing between layers an explicit, provable transition. The
+reservation invariant makes concurrent slot animation compositional
+(Lemma~\ref{lem:bridge}); the exactness equation $\Ledger=C(c)\cat A(c)$
+reduces the entire logical history to two monotone quantities, the frontier
+and the head's emitted prefix (Lemma~\ref{lem:head},
+Theorem~\ref{thm:safety}); the streaming lemma shows that every abstract
+history append is one cursor discipline away from a real VT
+(Lemma~\ref{lem:stream}); and the prepared-frame gate turns ``resize replay
+without tearing'' from a rendering aspiration into an inductive invariant
+(Lemma~\ref{lem:replay}). Failure is fail-stop by construction: a torn write
+leaves a tagged, immutable, attributable prefix and a frontier that never
+lies. Under weak fairness the protocol drains: replays terminate, flushes
+complete, and pressure---when persistent---sweeps finished work into
+history exactly once and exactly in order
+(Theorems~\ref{thm:replay-live}--\ref{thm:pressure-live}). All of it is
+checked, state by state, against \texttt{ElasticSlots.tla}.
+
+\end{document}

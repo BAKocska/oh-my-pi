@@ -1,0 +1,791 @@
+\documentclass[11pt]{article}
+
+\usepackage{amsmath,amssymb,amsthm,mathtools}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage[margin=1in]{geometry}
+\usepackage[hidelinks]{hyperref}
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{corollary}[theorem]{Corollary}
+\newtheorem{proposition}[theorem]{Proposition}
+\theoremstyle{definition}
+\newtheorem{definition}[theorem]{Definition}
+\newtheorem{assumption}[theorem]{Assumption}
+
+\newcommand{\N}{\mathbb{N}}
+\newcommand{\Rows}{\mathcal{R}}
+\newcommand{\Blocks}{\mathcal{B}}
+\newcommand{\seq}[1]{#1^{*}}
+\newcommand{\len}[1]{\lvert #1\rvert}
+\newcommand{\cat}{\mathbin{\cdot}}
+\newcommand{\prefixof}{\preceq}
+\newcommand{\History}{\mathit{history}}
+\newcommand{\Native}{\mathit{native}}
+\newcommand{\Screen}{\mathit{screen}}
+\newcommand{\Want}{\mathit{want}}
+\newcommand{\Final}{\mathit{final}}
+\newcommand{\alloc}{\mathit{sample}}
+\newcommand{\target}{\mathit{target}}
+\newcommand{\Width}{\mathit{width}}
+\newcommand{\Height}{\mathit{height}}
+\newcommand{\Active}{\mathsf{Active}}
+\newcommand{\Finalized}{\mathsf{Finalized}}
+\newcommand{\Committed}{\mathsf{Committed}}
+\newcommand{\Queued}{\mathsf{Queued}}
+\newcommand{\blank}{\bot}
+
+\title{Elastic Speculative Slots with In-Order Retirement\\
+\large A Source-Aligned Model, Rendering Protocol, and Mechanical Proof}
+\author{}
+\date{August 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This document specifies a terminal rendering protocol for an ordered collection
+of concurrently updating blocks.  Semantic output remains authoritative in
+application memory.  Mutable blocks enter native history only through finalized
+ordered retirement batches.  A block may instead declare a terminal-row
+append-only contract, allowing its stable head prefix to scroll naturally while
+it remains active.  Terminal resize is
+modeled separately as an environment event because an emulator may move old
+screen rows before the process observes the new geometry.
+
+The refinement includes sampled-versus-requested height accounting,
+shrink-before-admit scheduling, queued finalization, zero-row live capacity,
+pressure-driven retirement, Preserve, Append, and Rebuild resize policies,
+bottom-first replay preparation followed by one synchronously buffered write,
+replay without rewinding the logical commit frontier, failed partial writes,
+graceful flush, detach, and the final viewport newline.  The temporary resize
+debounce period is collapsed into one environment transition.  TLC checks the bounded
+state machine; the parameterized arguments prove the logical protocol and the
+successful terminal writer under their stated assumptions.
+\end{abstract}
+
+\tableofcontents
+
+\section{Model}
+\label{sec:model}
+
+\subsection{Scope and abstraction boundary}
+
+The proof separates three contracts:
+\begin{enumerate}
+  \item semantic snapshots and their creation order;
+  \item logical exactly-once retirement acknowledged by the application;
+  \item physical terminal effects, including replay, resize, failure, and exit.
+\end{enumerate}
+This separation is required.  A resize can change native scrollback without a
+logical retirement, while an empty finalized snapshot can advance the logical
+frontier without adding a terminal row.
+
+The bounded model uses an explicit $\mathsf{Absent}$ state and a monotonic
+Create action, so only created ordinals contribute demand or memory pressure.
+The model omits glyph-level ANSI parsing,
+images, overlays, and batch-only presentation decorations.  The implementation
+contract in Section~\ref{sec:implementation} states where those details may
+refine the model without changing its safety claims.
+
+\subsection{Blocks and lifecycle}
+
+Let
+\[
+  \Blocks=\{1,\ldots,N\}
+\]
+be monotonically increasing creation order.  The model uses
+$\mathsf{Absent}$ before creation; a created block phase is one of
+\[
+  \Queued,\quad \Active,\quad \Finalized,\quad \Committed.
+\]
+A queued block may be admitted and become active, or may finalize directly.
+Direct queued finalization models fixed notices and results that complete
+before a viewport row is available.  Consequently there is no contiguous
+``admitted frontier.''
+
+Let $n\leq N$ be the number of created blocks.  The commit frontier
+$c\in\{0,\ldots,n\}$ is the number logically committed.  Its shape invariant is
+\begin{equation}
+  i\leq c\Rightarrow\operatorname{phase}_i=\Committed,
+  \qquad
+  c<i\leq n\Rightarrow\operatorname{phase}_i\neq\Committed,
+  \qquad
+  i>n\Rightarrow\operatorname{phase}_i=\mathsf{Absent}.
+  \label{eq:lifecycle-shape}
+\end{equation}
+Retirement may advance only across a finalized head $c+1$.  A later finalized
+block cannot cross a queued or active predecessor.
+
+At creation, a block permanently declares one presentation mode:
+\[
+  \mathsf{Mutable}\qquad\text{or}\qquad\mathsf{AppendOnly}.
+\]
+Mutable is the conservative default.  AppendOnly is a terminal-row contract,
+not merely a promise that source text grows: every published semantic row is
+complete and immutable, and each later value extends the previous value by
+sequence concatenation.  A renderer with an incomplete wrapped line, open
+Markdown construct, or mutable status suffix must retain that suffix outside
+the declared stable prefix.
+
+\subsection{Semantic state and width rendering}
+
+Each created block has a complete speculative semantic value
+$\Want_i\in\seq{\Rows}$.  Queued or active mutable producers may replace it
+arbitrarily.  An append-only producer must satisfy
+\begin{equation}
+  \Want_i\prefixof\Want_i'
+  \label{eq:append-contract}
+\end{equation}
+on every update.  Finalize accepts one complete terminal semantic value $S$;
+for an append-only block it additionally requires $\Want_i\prefixof S$.
+It atomically records
+\[
+  \Want_i:=S,\qquad \Final_i:=S.
+\]
+Normal completion supplies the current semantic value.  A mutable block may
+replace it with an abandonment, cancellation, or timeout notice.  Once an
+append-only prefix has escaped, such an outcome must append an explicit terminal
+row rather than replace any emitted row.  The recorded final is immutable.  Direct queued finalization uses the same
+operation.
+
+Let
+\[
+  \rho_w:\seq{\Rows}\longrightarrow\seq{\Rows}
+\]
+be deterministic rendering at width $w$.  Wrapping, disclosure state, theme,
+and presentation filters are inputs to the concrete rendering function even
+when the bounded model represents only two widths.  Semantic snapshots never
+depend on terminal width.
+
+\subsection{Live geometry and shrinking}
+
+Let $H_{\max}\geq1$ and let the current transcript capacity be
+\[
+  0\leq H\leq H_{\max}.
+\]
+Production derives $H$ after subtracting editor and chrome rows; a terminal can
+therefore have positive height while transcript capacity is zero.
+
+Let $e_i$ be the number of semantic rows already emitted through natural
+append-only scrolling.  It is zero for every mutable block and every block
+except the current uncommitted head.  For an append-only head define
+\[
+  U_i=\Want_i[e_i+1\,..\,\len{\Want_i}],
+\]
+the suffix still owned by the mutable viewport.  The emitted prefix remains
+reconstructible from application state and cannot change by
+Equation~\eqref{eq:append-contract}.
+
+A block is presented when it is active, or when it is finalized with a
+nonempty width-rendered snapshot.  Active empty blocks use an owned placeholder.
+Let $P$ be the presented set and $m=\lvert P\rvert$.
+
+For active block $i$, $\alloc_i$ is the sampled painted height and
+$\target_i$ is the requested height.  Outstanding growth reserves rows before
+the animation reaches them:
+\begin{equation}
+  \sum_{i\in P}\max(\alloc_i,\target_i)+\sigma\leq H,
+  \label{eq:reservation}
+\end{equation}
+where $\sigma\in\{0,1\}$ is the aggregate overflow row.  Finalized visible
+blocks have equal sampled and requested allocations; their clipping is a
+frame-layout choice rather than an allocator animation.
+
+When $m\leq H$, every presented block may own at least one row and $\sigma=0$.
+When $m>H>0$, the overflow layout reserves one aggregate row and gives one row
+to at most $H-1$ recent presented blocks.  At $H=0$, all projections are
+hidden and no summary is painted.  Full semantic values remain in memory.
+Admission is disabled until a non-overflow allocation with one additional row
+exists.
+
+Active contraction preserves the two-row bridge used by production:
+\[
+  k>2\longrightarrow2\longrightarrow1.
+\]
+A finalized block does not traverse a sampled $1\to0$ bridge in the current
+implementation; it leaves the active allocator immediately and is laid out as
+a settled semantic entry.
+
+For an allocation vector $a$, let
+$\operatorname{slot}_i(S,w,a_i)$ be a deterministic $a_i$-row projection of
+$\rho_w(S)$, owned by block $i$.  Zero allocation produces the empty
+sequence.  The canonical viewport is
+\[
+  \operatorname{layout}(\phi,\Final,w,H,a)
+  =\blank^{H-\sigma-\sum_i a_i}
+   \cat\mathsf{summary}^{\sigma}
+   \cat\operatorname{slot}_1\cat\cdots\cat\operatorname{slot}_N,
+  \qquad \len{\operatorname{layout}}=H,
+\]
+where nonpresented blocks have allocation zero.  A mutable slot uses $\Want_i$
+or $\Final_i$; an append-only slot uses only its un-emitted suffix $U_i$.  At $H=0$ every
+term is empty.
+
+\subsection{Logical and native histories}
+
+The logical ledger is
+\[
+  \History\in\seq{(\Blocks\times\Rows)}.
+\]
+Define
+\[
+  C(c)=\operatorname{tag}_1(\Final_1)\cat\cdots\cat
+       \operatorname{tag}_c(\Final_c).
+\]
+If block $c+1$ is append-only and has emitted $e_{c+1}$ rows, define
+\[
+  A(c)=\operatorname{tag}_{c+1}
+       \bigl(\Want_{c+1}[1..e_{c+1}]\bigr);
+\]
+otherwise $A(c)$ is empty.  For a fresh surface,
+\begin{equation}
+  \History=C(c)\cat A(c).
+  \label{eq:logical-history}
+\end{equation}
+An ambient prefix lifts the theorem by concatenating the same unchanged prefix
+to both sides; the checked instance starts empty.
+
+Physical native history $\Native$ uses proof-only source tags:
+\[
+  \mathsf{Append},\ \mathsf{Retire},\ \mathsf{Replay},\ \mathsf{Resize},\
+  \mathsf{FailedWrite},\ \mathsf{Exit}.
+\]
+$\mathsf{Append}$ extends only the stable prefix of the active append-only head.
+Retirement or zero-row completion advances $c$.  Replay repeats logical
+presentation without changing $c$.  Resize rows record an environment effect and may belong
+to an old active or finalized viewport.  A failed-write row belongs to the
+finalized batch whose partial write stopped the host.  Exit rows occur only
+after terminal ownership is released.
+
+Logical no-yank is unconditional:
+\begin{equation}
+  \History\prefixof\History'.
+  \label{eq:logical-no-yank}
+\end{equation}
+Physical no-yank is scoped to one display epoch.  Rebuild explicitly starts a
+new epoch by clearing native history; every other writer transition extends
+the current native prefix.
+
+\subsection{Bottom-first synchronous replay}
+
+Let $R_w$ be the complete width-rendered logical ledger
+$C(c)\cat A(c)$, and let $L$ be the $H$-row live viewport before replay.
+Assume $L$ begins with $b$ unused blank rows.  Define
+\[
+  q=\min(\len{R_w},b),\qquad
+  M=\operatorname{suffix}_q(R_w),\qquad
+  F=\operatorname{prefix}_{\len{R_w}-q}(R_w),
+\]
+and
+\begin{equation}
+  Q=M\cat L[q+1..H],\qquad \len{Q}=H.
+  \label{eq:replay-split}
+\end{equation}
+Replay first paints $Q$ history-neutrally, from the bottom, so the final
+viewport is already complete.  It retains $F$ as the remainder.  Only then
+does it build the complete terminal transaction $F\cat Q$ in memory and issue
+one synchronous stdout write.  No block-at-a-time replay frame is observable.
+
+Preserve creates no replay.  Append retains native history and appends $F$.
+Rebuild clears native history, increments the display epoch, then appends $F$.
+Both modes capture committed blocks and any emitted prefix of the append-only
+head without changing phases or $c$.  Normal retirement and semantic updates
+are suspended after bottom preparation until the single buffered write
+succeeds or fails.  A geometry change before preparation may supersede the
+pending split; after preparation no interleaving is allowed.  Interactive
+overlays may delay preparation but cannot cancel it.
+
+\subsection{Pressure, flush, and shutdown}
+
+Let \textsf{Pressure} mean that the full rendered demand of every created
+queued producer, active block, and finalized-pending block exceeds current
+transcript capacity, or that the created uncommitted block count reaches the
+memory cap.  Queued demand is measured but not painted until admission.  Normal
+retirement requires
+\[
+  \mathsf{Pressure}\lor\mathsf{Flush}.
+\]
+It retires only a contiguous finalized prefix beginning at $c+1$, and under
+ordinary pressure chooses the shortest prefix that restores both bounds.
+
+Graceful shutdown freezes active and queued work as explicit final snapshots,
+sets \textsf{Flush}, drains replay, and retires the remaining contiguous
+prefix.  Only then does it blank the viewport and return control to the shell.
+Detach and suspend do not fabricate cancellation or require a logical flush.
+
+\section{Protocol}
+\label{sec:protocol}
+
+\subsection{Admission, update, and finalization}
+
+Admission selects the earliest queued block.  Its exact guard requires both a
+non-overflow post-allocation and the reservation bound
+\[
+  1+\sum_{i\in P}\max(\alloc_i,\target_i)\leq H.
+\]
+The inequality alone is not sufficient in an existing overflow state.  A lower
+target is not free capacity while the sampled height is larger.
+Updates change one queued or active speculative value; only active updates
+repaint the viewport.  Finalization records the supplied complete terminal
+semantic value, removes the block from active sampling,
+and recomputes the bounded live layout.  None of these operations changes
+logical or native history.
+
+\subsection{Natural append-only scrolling}
+
+Only the current uncommitted head may emit while active.  It emits only when
+rendered row demand exceeds live capacity, leaving the suffix that still fits
+as the mutable remainder.  If it declared AppendOnly and
+$e_{c+1}<\len{\Want_{c+1}}$, one successful natural scroll performs
+\begin{align*}
+  \History'&=\History\cat
+    \operatorname{tag}_{c+1}(\Want_{c+1}[e_{c+1}+1]),\\
+  \Native'&=\Native\cat
+    \operatorname{tag}_{c+1}(\Want_{c+1}[e_{c+1}+1]),\\
+  e_{c+1}'&=e_{c+1}+1.
+\end{align*}
+Every predecessor is already committed, and the row can never change by
+Equation~\eqref{eq:append-contract}; therefore natural terminal scrolling is
+safe without speculative-slot retirement.  Later blocks cannot emit until
+this block fully commits, because an unfinished head may append more rows
+before them.
+
+If the head finalizes after all of its rows have already emitted, the logical
+frontier advances with no physical write.  Otherwise ordinary retirement
+writes only the un-emitted final suffix.  Mutable blocks retain the existing
+all-or-nothing finalized retirement path.
+
+\subsection{Pressure-driven retirement}
+
+When the head is finalized and retirement is requested, select a contiguous
+finalized range $[c+1,k]$.  One batch performs
+\begin{align*}
+  \History'&=\History\cat
+    \operatorname{tag}_{c+1}
+      (\Final_{c+1}[e_{c+1}+1..\len{\Final_{c+1}}])
+    \cat\operatorname{tag}_{c+2}(\Final_{c+2})\cat\cdots\cat
+    \operatorname{tag}_{k}(\Final_k),\\
+  c'&=k,\\
+  \operatorname{phase}'_i&=\Committed\qquad(c<i\leq k).
+\end{align*}
+Production ordinary pressure chooses the shortest sufficient range, subject to
+the physical frame-height chunk cap; Flush may take the whole eligible prefix
+in one or more chunks.  TLA nondeterministically permits any eligible
+contiguous end as a safety over-approximation and therefore does not prove
+minimality.  The application advances the frontier only after the complete
+terminal write returns successfully.
+
+\subsection{Successful terminal retirement}
+\label{sec:terminal-realization}
+
+Let
+\[
+\begin{aligned}
+  F_{\rm phys}={}&
+    \operatorname{tag}_{c+1}\Bigl(
+      \rho_{\Width}(\Final_{c+1}[e_{c+1}+1..\len{\Final_{c+1}}])
+    \Bigr)\\
+    &{}\cat\operatorname{tag}_{c+2}\bigl(\rho_{\Width}(\Final_{c+2})\bigr)
+      \cat\cdots\cat\operatorname{tag}_{k}\bigl(\rho_{\Width}(\Final_k)\bigr).
+\end{aligned}
+\]
+The second line is empty when $k=c+1$.
+First choose the \emph{post-retirement} allocation $\widehat\alloc$ for the
+remaining phases.  It is an ordinary valid allocation if the remaining
+presented count fits; otherwise it is the aggregate overflow allocation.
+Define
+\[
+  Q=\operatorname{layout}
+    (\operatorname{phase}',\Final,\Width,H,\widehat\alloc),
+  \qquad \len{Q}=H.
+\]
+Thus $Q$ includes the overflow marker when required and restores newly visible
+blocks when retirement leaves overflow.  This post-state definition is
+essential; using the pre-retirement allocation is incorrect.
+
+The writer serializes
+\[
+  T=F_{\rm phys}\cat Q.
+\]
+It overwrites the first $H$ rows without scrolling.  For every remaining row,
+it moves to the bottom, scrolls once, erases, and writes the row.  It emits no
+line feed after the final row.  Autowrap remains disabled except at a deliberate
+soft-wrap join.
+
+\begin{lemma}[Generic terminal streaming]
+\label{lem:streaming}
+For $T=F\cat Q$ with $\len{Q}=H$, the writer above appends exactly $F$ to
+native history and leaves exactly $Q$ visible.
+\end{lemma}
+
+\begin{proof}
+Let $L=\len{F}$.  After the initial overwrite, native history is unchanged and
+the screen is $T[1..H]$.  After $j\in\{0,\ldots,L\}$ scroll-and-write steps,
+induction gives
+\[
+  \Native_j=\Native_0\cat T[1..j],
+  \qquad
+  \Screen_j=T[j+1..j+H].
+\]
+At $j=L$, these are $\Native_0\cat F$ and $Q$.  Exactly $L$ iterations occur
+because $\len{T}=L+H$.
+\end{proof}
+
+\begin{lemma}[Bottom-first synchronous replay]
+\label{lem:replay}
+Equation~\eqref{eq:replay-split} produces an $H$-row viewport, and one
+buffered write of $F\cat Q$ appends exactly the replay remainder $F$ without
+exposing an intermediate top-down redraw.
+\end{lemma}
+
+\begin{proof}
+The suffix size $q$ is at most the number $b$ of leading viewport blanks, so
+replacing those blanks by $M$ leaves exactly
+$q+(H-q)=H$ rows.  Painting $Q$ is history-neutral.  Applying
+Lemma~\ref{lem:streaming} to the single in-memory sequence $F\cat Q$ appends
+exactly $F$ and restores the already prepared $Q$.  Since construction and
+serialization occur before one stdout call, no prefix is externally visible
+as a separate replay frame.
+\end{proof}
+
+\subsection{Failed terminal writes}
+
+A successful retirement is atomic at the host boundary, but the byte stream is
+not physically atomic.  If the writer fails after $p$ bottom scrolls, native
+history may contain the first $p$ rows of the finalized batch
+$F_{\rm phys}$.  The logical ledger and $c$ remain unchanged.  The renderer is
+poisoned, the host stops, and the batch is never retried.  Since every such
+physical row came from the immutable finalized range, failure cannot put active output in native history; fail-stop prevents
+duplication.  The TLA model includes partial retire and replay failures
+explicitly.  Failures of history-neutral paint, reset controls, or terminal
+teardown remain adapter error handling and are not part of the mechanical
+failure claim.
+
+\subsection{Instantaneous resize and replay}
+\label{sec:resize}
+
+The model collapses notification, debounce, and repaint into one resize event.
+It does \emph{not} assume pre-shrink blanking.  An emulator may move a prefix
+$B_p$ of the old screen into native history before the process observes new
+geometry.  These rows receive source $\mathsf{Resize}$ and do not advance the
+logical frontier.
+
+For a width change, the settled physical outcomes are
+\begin{align*}
+  \mathsf{Preserve}:\quad
+    &\Native'=\Native\cat B_p,\\
+  \mathsf{Append}:\quad
+    &\Native'=\Native\cat B_p\cat F,\\
+  \mathsf{Rebuild}:\quad
+    &\Native'=F\quad\text{in a new display epoch},
+  \label{eq:resize-modes}
+\end{align*}
+Here $F$ is the buffered prefix from Equation~\eqref{eq:replay-split}; $Q$ is
+painted first and remains visible.  The append/rebuild stdout transaction is
+synchronous.  A height-only or chrome-only relayout uses Preserve and
+may subsequently cause ordinary pressure retirement; therefore resize itself
+leaves $c$ unchanged, while a later retirement need not.
+
+Inside a multiplexer, destructive Rebuild degrades to Append.  If an overlay is
+active when width settling completes, the replay request remains pending until
+the normal buffer returns.
+
+\subsection{Exit modes}
+
+Graceful quit flushes first, paints a blank viewport, and then allows terminal
+teardown to emit at most one viewport newline.  Any resulting native row is
+blank.  Detach or suspend may instead hand off an existing viewport and append
+zero or one old top cell.  Neither action advances logical history.  No model
+transition occurs after handoff.
+
+\subsection{Implementation contract}
+\label{sec:implementation}
+
+A conforming implementation must satisfy:
+\begin{center}
+\begin{tabular}{@{}>{\raggedright\arraybackslash}p{0.17\textwidth}
+                    >{\raggedright\arraybackslash}p{0.36\textwidth}
+                    >{\raggedright\arraybackslash}p{0.35\textwidth}@{}}
+\toprule
+Operation & Required effect & Forbidden effect\\
+\midrule
+Update & Replace mutable state or extend append-only state & Change an emitted prefix\\
+Append & Emit only the stable head block's next row & Emit a later block first\\
+Shrink & Reserve sampled or requested height, whichever is larger & Admit into an occupied row\\
+Finalize & Freeze one complete semantic value & Mutate it in the same proof episode\\
+Retire & Write only a finalized frontier prefix & Advance before successful return\\
+Replay & Paint the bottom split, then write the buffered prefix once & Expose incremental redraws\\
+Resize & Preserve logical state; tag possible old-screen pushes & Claim native purity across emulator reflow\\
+Failure & Stop without retry or frontier advance & Duplicate an uncertain partial batch\\
+Graceful exit & Finalize, flush, blank, then hand off & Drop eligible finalized output silently\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Batch-only decorative rows must be deterministic functions of committed
+semantic entries and must be reproduced identically by replay.  Otherwise they
+must not enter durable native history.  Rewind, clear-history, disclosure, and
+filter changes begin a new explicitly scoped presentation episode or become
+inputs to $\rho_w$; they are not silent mutations of $\Final$.
+
+\section{Proof}
+\label{sec:proof}
+
+\subsection{Capacity and overflow}
+
+\begin{theorem}[Exact ordinary capacity]
+\label{thm:capacity}
+A one-row minimum for all $m$ presented blocks is feasible if and only if
+$m\leq H$.
+\end{theorem}
+
+\begin{proof}
+Necessity follows from
+$m\leq\sum_{i\in P}\alloc_i\leq H$.
+For sufficiency, assign one row to every presented block and leave the remaining
+$H-m$ rows blank.
+\end{proof}
+
+\begin{corollary}[Overflow capacity]
+For $m>H>0$, one summary row and at most $H-1$ one-row projections fit in the
+viewport; with blank padding the screen has exactly $H$ rows.  At $H=0$, the
+empty projection is the unique valid screen.
+\end{corollary}
+
+\subsection{Sampled allocation safety}
+
+\begin{lemma}[Reservation dominates occupancy]
+\label{lem:reservation}
+If Equation~\eqref{eq:reservation} holds, moving one active sample monotonically
+toward its target preserves capacity.  Lowering a target does not release a row
+until the smaller sample is observed.
+\end{lemma}
+
+\begin{proof}
+Every intermediate sample is bounded by
+$\max(\alloc_i,\target_i)$.  Summing the pointwise bounds proves capacity.
+When $\alloc_i>\target_i$, lowering only $\target_i$ leaves that maximum equal
+to $\alloc_i$.
+\end{proof}
+
+\begin{lemma}[Active bridge termination]
+A contraction to one reaches its target in at most two sampled transitions and
+exposes height two whenever the old sample exceeds two.
+\end{lemma}
+
+\begin{proof}
+A sample above two moves to two; two moves to one.  Samples at or below two move
+directly to one.
+\end{proof}
+
+\subsection{Append-only prefix safety}
+
+\begin{lemma}[Stable-head emission]
+\label{lem:append}
+If block $c+1$ declared AppendOnly and satisfies
+Equation~\eqref{eq:append-contract}, appending its next un-emitted row to
+logical and native history preserves ordering, exactness, and no-yank.
+\end{lemma}
+
+\begin{proof}
+Every predecessor is in $C(c)$ and already committed.  No later block has
+emitted a row.  The new row is exactly position $e_{c+1}+1$ of the head's
+semantic sequence.  Prefix monotonicity prevents every future update or final
+value from changing positions at or below that index.  Concatenation therefore
+preserves the prefix relation and changes $A(c)$ to the next exact prefix.
+\end{proof}
+
+\subsection{Logical transition preservation}
+
+Mutable updates and allocation steps do not change finals, $c$, or
+$\History$.  Append-only updates preserve every emitted row by
+Equation~\eqref{eq:append-contract}; natural emission preserves the exact
+ledger by Lemma~\ref{lem:append}.  Finalization leaves $c$ and $\History$
+unchanged and establishes an immutable final extending any emitted prefix.
+Admission changes only a queued phase and geometry.
+
+A successful retirement batch appends the first block's un-emitted suffix and
+every later finalized block in the selected range.  Concatenating that suffix
+with $A(c)$ yields the complete $\Final_{c+1}$, followed by complete finals
+through $k$; hence the result is $C(k)$ and the new partial head is empty.  If
+the append-only head finalized after all rows emitted, advancing $c$ without a
+physical write establishes the same equality.  Empty finals append no rows,
+but $c$ still records their exactly-once retirement event.
+
+\subsection{Physical transition preservation}
+
+Lemma~\ref{lem:streaming} proves successful retirement using the correct
+post-retirement $Q$.  Replay first prepares the bottom suffix in
+Equation~\eqref{eq:replay-split}; the same lemma then proves that one buffered
+$F\cat Q$ write appends exactly $F$ and leaves $Q$ visible.  The captured rows
+belong to committed blocks or the stable emitted prefix of the append-only
+head, so replay changes no logical state.  Preserve and Append concatenate
+$B_p$ and therefore preserve native prefix order; Rebuild is the sole explicit
+epoch boundary.  A failed retirement/replay writer appends only a prefix of
+immutable finalized or declared-stable rows and then stops.  Exit appends at most one row and then stops.  Thus every
+non-Rebuild physical action extends its epoch's native prefix.
+
+\subsection{Global safety}
+
+\begin{theorem}[Source-aligned safety]
+\label{thm:safety}
+Every finite execution from a well-formed fresh surface satisfies:
+\begin{enumerate}
+  \item $\History=C(c)\cat A(c)$ and $c$ never decreases;
+  \item the only uncommitted logical rows are the exact stable prefix of the
+        append-only head;
+  \item every committed block's nonempty semantic rows occur exactly once and
+        in creation order; empty commits are represented by $c$;
+  \item append-only wants and finals preserve every emitted prefix, and final
+        semantic values are immutable within the proof episode;
+  \item sampled and requested allocations never exceed current live capacity;
+  \item replay prepares its bottom viewport first and exposes only one
+        synchronous buffered history write, without changing phases or $c$;
+  \item resize changes no logical state, although it may add explicitly tagged
+        old-screen rows to native history;
+  \item a failed writer never advances $c$ or retries, and no transition follows
+        failure or exit.
+\end{enumerate}
+\end{theorem}
+
+\begin{proof}
+By induction over the transition relation.  The initial state has $c=0$, empty
+histories, absent phases, and zero allocations.  Create, admission, update,
+allocation, both finalization actions, stable append, and zero-write append-only
+completion satisfy the logical preservation argument above.  Successful
+retirement preserves the exact ledger equation.  Bottom preparation and the
+single synchronous replay write, resize, partial failure, graceful shutdown,
+and both exits satisfy the physical argument.  BeginFlush changes only its control flag.
+These cases exhaust the model actions.
+\end{proof}
+
+\subsection{Conditional progress}
+
+\begin{theorem}[Flush completion or stop]
+\label{thm:flush}
+Assume every created block is finalized, graceful shutdown has set Flush,
+replay and successful retirement steps are weakly fair, and the created range
+is finite.  Then eventually every created block is committed or the host
+stops.
+\end{theorem}
+
+\begin{proof}
+Replay either drains or a modeled writer failure stops the host.  While the
+host remains running, if $c<n$, the head $c+1$ is finalized and retirement is
+continuously enabled by Flush.  Weak fairness advances $c$ by at least one.
+The natural-valued variant $n-c$ strictly decreases, so finite repetition
+reaches zero unless a stop occurs.
+\end{proof}
+
+\begin{corollary}[Persistent graceful completion]
+Under the assumptions of Theorem~\ref{thm:flush}, if the host remains running
+and retire/replay writes do not fail, eventually every created block is
+committed.
+\end{corollary}
+
+\begin{theorem}[Replay completion or stop]
+Assume a finite captured ledger, finitely many superseding geometry requests,
+and weak fairness of replay preparation and the synchronous write.  Then the
+latest replay eventually completes without changing $c$, or the host stops.
+\end{theorem}
+
+\begin{proof}
+After the last superseding geometry request, fair preparation computes
+Equation~\eqref{eq:replay-split} and paints $Q$.  The transition relation then
+permits no interleaving action: the next nonstuttering step is one buffered
+success, which appends $F$ and clears replay state, or one failed prefix write,
+which stops the host.  Neither outcome changes $c$.
+\end{proof}
+
+No unconditional ``all finalized implies committed'' theorem is claimed for
+ordinary pressure mode.  A finalized tail that fits may remain live forever;
+Flush is the explicit progress premise.
+
+\section{Mechanical TLA\texorpdfstring{\textsuperscript{+}}{+} validation}
+\label{sec:tla}
+
+The companion module \texttt{proof/ElasticSlots.tla} encodes the transition
+system independently of the prose proof.  It uses no generated PlusCal
+translation.
+
+\subsection{Action correspondence}
+
+\begin{center}
+\begin{tabular}{@{}>{\raggedright\arraybackslash}p{0.33\textwidth}
+                    >{\raggedright\arraybackslash}p{0.57\textwidth}@{}}
+\toprule
+TLA\textsuperscript{+} action & Abstract transition\\
+\midrule
+\texttt{Create} & Materialize the next absent ordinal as queued\\
+\texttt{Admit} & Admit the earliest queued block after sampled capacity is free\\
+\texttt{Update} & Replace one queued or active speculative semantic value\\
+\texttt{RequestAllocation} & Select reservation-safe active targets\\
+\texttt{ApplyAllocation} & Publish one sampled active-height step\\
+\texttt{AppendStable} & Emit the append-only head's next immutable row\\
+\texttt{CompleteAppendOnly} & Advance a fully emitted finalized head without writing\\
+\texttt{FinalizeActive/Queued} & Record one supplied immutable terminal snapshot\\
+\texttt{RetireSuccess/Failure} & Commit atomically, or record a partial prefix and stop\\
+\texttt{Resize} & Relayout, tag possible screen pushes, and initiate replay\\
+\texttt{PrepareReplay} & Paint the bottom suffix and retain its prefix remainder\\
+\texttt{ReplaySynchronousSuccess} & Write the buffered prefix once\\
+\texttt{ReplaySynchronousFailure} & Record a partial buffered write and stop\\
+\texttt{BeginGracefulShutdown} & Freeze remaining work and request Flush\\
+\texttt{GracefulExit/DetachExit} & Hand off a blank or existing viewport\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Checked properties}
+
+The configuration checks state invariants for type bounds, lifecycle shape,
+snapshot and append-emission discipline, capacity, exact
+$C(c)\cat A(c)$ history, no premature rows, exact screen accounting including
+$H=0$, bottom-first replay split shape, and native source safety.  It checks
+temporal properties for logical monotonicity, append-only prefix monotonicity,
+epoch-scoped native monotonicity, final immutability, resize logical neutrality,
+failed-write fail-stop, post-stop quiescence, graceful Flush liveness,
+synchronous replay liveness, and queued-demand pressure retirement.
+
+The model deliberately makes resize pollution observable instead of proving it
+blank.  It models natural append-only rows, prepares the bottom replay tail
+before writing, and permits both successful and partial failed
+retirement/replay writes.  Width rendering changes native row counts; live-screen properties
+check capacity and ownership rather than claiming a full ANSI refinement.
+
+\subsection{Exhaustive bounded result}
+
+The primary checked instance uses a finite block set, maximum live height one,
+two widths, three snapshots, one resize, both block modes, all three resize
+policies, natural append pressure, bottom-first synchronous replay, direct
+queued finalization, pressure and Flush, partial failures, graceful exit, and
+detach.  The reproducible command is:
+
+\begin{verbatim}
+tlc -config proof/ElasticSlots.cfg proof/ElasticSlots.tla
+\end{verbatim}
+
+\begin{center}
+\begin{tabular}{@{}lr@{}}
+\toprule
+Measurement & Result\\
+\midrule
+Generated states & 568,654\\
+Distinct states & 219,721\\
+Maximum search depth & 18\\
+States left on queue & 0\\
+Safety or liveness violations & 0\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+This is exhaustive only for the configured finite instance
+($N=2$, $H_{\max}=1$, one resize).  Two focused checks avoid multiplying its
+state graph: \texttt{ElasticSlotsBridges.cfg} generated 1,736 states
+(501 distinct, depth 9), and \texttt{ElasticSlotsResize.cfg} generated
+117,042 states (52,638 distinct, depth 16) across two resize epochs.  Both
+completed with zero violations.  Parameterized safety comes from
+Theorem~\ref{thm:safety}; TLC checks that the executable actions implement the
+same cases within each configured bound.
+
+\end{document}
