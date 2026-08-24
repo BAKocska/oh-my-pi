@@ -3,10 +3,12 @@
 use std::{
 	path::Path,
 	str,
+	str::FromStr as _,
 	sync::atomic::{AtomicBool, Ordering},
 };
 
 use bytes::Bytes;
+use strum::{EnumString, IntoStaticStr};
 use tokio_util::sync::CancellationToken;
 
 use super::{
@@ -15,6 +17,49 @@ use super::{
 	query::GitPath,
 	runner::{GitRunError, GitRunOptions, GitRunner},
 };
+
+/// Kind of one index or worktree change reported by Git porcelain.
+#[derive(Clone, Copy, Debug, EnumString, Eq, IntoStaticStr, PartialEq)]
+pub enum ChangeKind {
+	/// File contents or metadata changed.
+	#[strum(serialize = "M")]
+	Modified,
+	/// Path was added.
+	#[strum(serialize = "A")]
+	Added,
+	/// Path was deleted.
+	#[strum(serialize = "D")]
+	Deleted,
+	/// Path was renamed.
+	#[strum(serialize = "R")]
+	Renamed,
+	/// Path was copied.
+	#[strum(serialize = "C")]
+	Copied,
+	/// File type changed.
+	#[strum(serialize = "T")]
+	TypeChanged,
+	/// Index stages disagree because a merge is unresolved.
+	#[strum(serialize = "U")]
+	Unmerged,
+}
+
+/// One NUL-safe porcelain-v1 status record.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StatusEntry {
+	/// Change between `HEAD` and the index.
+	pub staged:     Option<ChangeKind>,
+	/// Change between the index and worktree.
+	pub worktree:   Option<ChangeKind>,
+	/// Whether the XY pair is one of Git's unresolved merge states.
+	pub conflicted: bool,
+	/// Whether Git reported the path as untracked.
+	pub untracked:  bool,
+	/// Current repository-relative path.
+	pub path:       GitPath,
+	/// Original path for a rename or copy.
+	pub orig_path:  Option<GitPath>,
+}
 
 /// Porcelain status counts.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -284,161 +329,204 @@ impl GitDiff {
 			.invoke(cwd, &["status", "--porcelain=v2", "-z", "--untracked-files=all"], false, cancel)
 			.await?;
 		Ok(parse_status(&bytes))
-		}
+	}
+
+	/// Reads rich porcelain-v1 status entries with byte-exact NUL-framed paths.
+	pub async fn status_entries(
+		&self,
+		cwd: &Path,
+		cancel: &CancellationToken,
+	) -> Result<Vec<StatusEntry>, CommandError> {
+		let bytes = self
+			.invoke(cwd, &["status", "--porcelain=v1", "-z", "--untracked-files=all"], false, cancel)
+			.await?;
+		Ok(parse_status_entries(&bytes))
+	}
 }
 
-	fn native_status_counts(
-		repository: &mut gix::Repository,
-		stop: &AtomicBool,
-	) -> Result<StatusCounts, native::NativeError> {
-		let ignored_staged = index_paths_with_flags(
-			repository,
-			gix::index::entry::Flags::INTENT_TO_ADD | gix::index::entry::Flags::CONFLICTED,
-		)?;
-		let mut counts = StatusCounts::default();
-		let items = status_items(repository, gix::status::UntrackedFiles::Files)?;
-		for item in items {
-			if stop.load(Ordering::Relaxed) {
-				return Err(native::NativeError::Cancelled);
-			}
-			match item.map_err(native::op_error)? {
-				gix::status::Item::TreeIndex(change) => {
-					if !path_in(&ignored_staged, change.location().as_ref()) {
-						counts.staged += 1;
+fn native_status_counts(
+	repository: &mut gix::Repository,
+	stop: &AtomicBool,
+) -> Result<StatusCounts, native::NativeError> {
+	let ignored_staged = index_paths_with_flags(
+		repository,
+		gix::index::entry::Flags::INTENT_TO_ADD | gix::index::entry::Flags::CONFLICTED,
+	)?;
+	let mut counts = StatusCounts::default();
+	let items = status_items(repository, gix::status::UntrackedFiles::Files)?;
+	for item in items {
+		if stop.load(Ordering::Relaxed) {
+			return Err(native::NativeError::Cancelled);
+		}
+		match item.map_err(native::op_error)? {
+			gix::status::Item::TreeIndex(change) => {
+				if !path_in(&ignored_staged, change.location().as_ref()) {
+					counts.staged += 1;
+				}
+			},
+			gix::status::Item::IndexWorktree(item) => match item {
+				entry @ gix::status::index_worktree::Item::DirectoryContents { .. } => {
+					if entry.summary().is_some() {
+						counts.untracked += 1;
 					}
 				},
-				gix::status::Item::IndexWorktree(item) => match item {
-					entry @ gix::status::index_worktree::Item::DirectoryContents { .. } => {
-						if entry.summary().is_some() {
-							counts.untracked += 1;
-						}
+				_ => match item.summary() {
+					Some(gix::status::index_worktree::iter::Summary::Conflict) => {
+						counts.staged += 1;
+						counts.unstaged += 1;
 					},
-					_ => match item.summary() {
-						Some(gix::status::index_worktree::iter::Summary::Conflict) => {
-							counts.staged += 1;
-							counts.unstaged += 1;
-						},
-						Some(_) => counts.unstaged += 1,
-						None => {},
-					},
+					Some(_) => counts.unstaged += 1,
+					None => {},
 				},
-			}
+			},
 		}
-		Ok(counts)
 	}
+	Ok(counts)
+}
 
-	fn native_names(
-		repository: &mut gix::Repository,
-		stop: &AtomicBool,
-		cached: bool,
-	) -> Result<Vec<GitPath>, native::NativeError> {
-		let ignored_staged = cached
-			.then(|| {
-				index_paths_with_flags(
-					repository,
-								gix::index::entry::Flags::INTENT_TO_ADD,
-				)
-			})
-			.transpose()?
-			.unwrap_or_default();
-		let mut paths = Vec::new();
-		let items = status_items(repository, gix::status::UntrackedFiles::None)?;
-		for item in items {
-			if stop.load(Ordering::Relaxed) {
-				return Err(native::NativeError::Cancelled);
-			}
-			match item.map_err(native::op_error)? {
-				gix::status::Item::TreeIndex(change)
-					if cached && !path_in(&ignored_staged, change.location().as_ref()) =>
-				{
-					paths.push(GitPath::from_bytes(change.location().as_ref()));
-				},
-				gix::status::Item::IndexWorktree(item)
-					if !cached
-						&& !matches!(
-							&item,
-							gix::status::index_worktree::Item::DirectoryContents { .. }
-						) && item.summary().is_some() =>
-				{
-					paths.push(GitPath::from_bytes(item.rela_path().as_ref()));
-				},
-				_ => {},
-			}
+fn native_names(
+	repository: &mut gix::Repository,
+	stop: &AtomicBool,
+	cached: bool,
+) -> Result<Vec<GitPath>, native::NativeError> {
+	let ignored_staged = cached
+		.then(|| index_paths_with_flags(repository, gix::index::entry::Flags::INTENT_TO_ADD))
+		.transpose()?
+		.unwrap_or_default();
+	let mut paths = Vec::new();
+	let items = status_items(repository, gix::status::UntrackedFiles::None)?;
+	for item in items {
+		if stop.load(Ordering::Relaxed) {
+			return Err(native::NativeError::Cancelled);
 		}
-		paths.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
-		Ok(paths)
-	}
-
-	fn native_has(
-		repository: &mut gix::Repository,
-		stop: &AtomicBool,
-		cached: bool,
-	) -> Result<bool, native::NativeError> {
-		let ignored_staged = cached
-			.then(|| {
-				index_paths_with_flags(
-					repository,
-								gix::index::entry::Flags::INTENT_TO_ADD,
-				)
-			})
-			.transpose()?
-			.unwrap_or_default();
-		let items = status_items(repository, gix::status::UntrackedFiles::None)?;
-		for item in items {
-			if stop.load(Ordering::Relaxed) {
-				return Err(native::NativeError::Cancelled);
-			}
-			match item.map_err(native::op_error)? {
-				gix::status::Item::TreeIndex(change)
-					if cached && !path_in(&ignored_staged, change.location().as_ref()) =>
-				{
-					return Ok(true);
-				},
-				gix::status::Item::IndexWorktree(item)
-					if !cached
-						&& !matches!(
-							&item,
-							gix::status::index_worktree::Item::DirectoryContents { .. }
-						) && item.summary().is_some() =>
-				{
-					return Ok(true);
-				},
-				_ => {},
-			}
+		match item.map_err(native::op_error)? {
+			gix::status::Item::TreeIndex(change)
+				if cached && !path_in(&ignored_staged, change.location().as_ref()) =>
+			{
+				paths.push(GitPath::from_bytes(change.location().as_ref()));
+			},
+			gix::status::Item::IndexWorktree(item)
+				if !cached
+					&& !matches!(&item, gix::status::index_worktree::Item::DirectoryContents { .. })
+					&& item.summary().is_some() =>
+			{
+				paths.push(GitPath::from_bytes(item.rela_path().as_ref()));
+			},
+			_ => {},
 		}
-		Ok(false)
 	}
+	paths.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+	Ok(paths)
+}
 
-	fn status_items(
-		repository: &gix::Repository,
-		untracked: gix::status::UntrackedFiles,
-	) -> Result<gix::status::Iter, native::NativeError> {
-		repository
-			.status(gix::progress::Discard)
-			.map_err(native::op_error)?
-			.untracked_files(untracked)
-			.tree_index_track_renames(gix::status::tree_index::TrackRenames::AsConfigured)
-			.index_worktree_rewrites(gix::diff::Rewrites::default())
-			.into_iter(Vec::new())
-			.map_err(native::op_error)
+fn native_has(
+	repository: &mut gix::Repository,
+	stop: &AtomicBool,
+	cached: bool,
+) -> Result<bool, native::NativeError> {
+	let ignored_staged = cached
+		.then(|| index_paths_with_flags(repository, gix::index::entry::Flags::INTENT_TO_ADD))
+		.transpose()?
+		.unwrap_or_default();
+	let items = status_items(repository, gix::status::UntrackedFiles::None)?;
+	for item in items {
+		if stop.load(Ordering::Relaxed) {
+			return Err(native::NativeError::Cancelled);
+		}
+		match item.map_err(native::op_error)? {
+			gix::status::Item::TreeIndex(change)
+				if cached && !path_in(&ignored_staged, change.location().as_ref()) =>
+			{
+				return Ok(true);
+			},
+			gix::status::Item::IndexWorktree(item)
+				if !cached
+					&& !matches!(&item, gix::status::index_worktree::Item::DirectoryContents { .. })
+					&& item.summary().is_some() =>
+			{
+				return Ok(true);
+			},
+			_ => {},
+		}
 	}
+	Ok(false)
+}
 
-	fn index_paths_with_flags(
-		repository: &gix::Repository,
-		flags: gix::index::entry::Flags,
-	) -> Result<Vec<Vec<u8>>, native::NativeError> {
-		let index = repository.index_or_empty().map_err(native::op_error)?;
-		Ok(index
-			.entries()
-			.iter()
-			.filter(|entry| entry.flags.intersects(flags))
-			.map(|entry| entry.path(&index).to_vec())
-			.collect())
-	}
+fn status_items(
+	repository: &gix::Repository,
+	untracked: gix::status::UntrackedFiles,
+) -> Result<gix::status::Iter, native::NativeError> {
+	repository
+		.status(gix::progress::Discard)
+		.map_err(native::op_error)?
+		.untracked_files(untracked)
+		.tree_index_track_renames(gix::status::tree_index::TrackRenames::AsConfigured)
+		.index_worktree_rewrites(gix::diff::Rewrites::default())
+		.into_iter(Vec::new())
+		.map_err(native::op_error)
+}
 
-	fn path_in(paths: &[Vec<u8>], location: &[u8]) -> bool {
-		paths.iter().any(|path| path == location)
+fn index_paths_with_flags(
+	repository: &gix::Repository,
+	flags: gix::index::entry::Flags,
+) -> Result<Vec<Vec<u8>>, native::NativeError> {
+	let index = repository.index_or_empty().map_err(native::op_error)?;
+	Ok(index
+		.entries()
+		.iter()
+		.filter(|entry| entry.flags.intersects(flags))
+		.map(|entry| entry.path(&index).to_vec())
+		.collect())
+}
+
+fn path_in(paths: &[Vec<u8>], location: &[u8]) -> bool {
+	paths.iter().any(|path| path == location)
+}
+
+/// Parses porcelain v1 (line or NUL framed) and v2 records into counts.
+/// Parses NUL-framed porcelain-v1 records, including rename origins and
+/// unresolved merge states.
+pub fn parse_status_entries(bytes: &[u8]) -> Vec<StatusEntry> {
+	const CONFLICTS: [[u8; 2]; 7] = [*b"DD", *b"AU", *b"UD", *b"UA", *b"DU", *b"AA", *b"UU"];
+
+	let records: Vec<_> = bytes.split(|byte| *byte == 0).collect();
+	let mut entries = Vec::new();
+	let mut index = 0;
+	while let Some(record) = records.get(index).copied() {
+		index += 1;
+		if record.len() < 3 || record[2] != b' ' {
+			continue;
+		}
+		let xy = [record[0], record[1]];
+		if xy == *b"!!" {
+			continue;
+		}
+		let untracked = xy == *b"??";
+		let conflicted = CONFLICTS.contains(&xy);
+		let renamed_or_copied = xy.iter().any(|kind| matches!(kind, b'R' | b'C'));
+		let orig_path = if renamed_or_copied {
+			let origin = records.get(index).copied().filter(|path| !path.is_empty());
+			index += usize::from(index < records.len());
+			origin.map(GitPath::from_bytes)
+		} else {
+			None
+		};
+		let kind = |value: &[u8]| {
+			str::from_utf8(value)
+				.ok()
+				.and_then(|value| ChangeKind::from_str(value).ok())
+		};
+		entries.push(StatusEntry {
+			staged: if untracked { None } else { kind(&record[..1]) },
+			worktree: if untracked { None } else { kind(&record[1..2]) },
+			conflicted,
+			untracked,
+			path: GitPath::from_bytes(&record[3..]),
+			orig_path,
+		});
 	}
+	entries
+}
 
 /// Parses porcelain v1 (line or NUL framed) and v2 records into counts.
 pub fn parse_status(bytes: &[u8]) -> StatusCounts {
@@ -749,7 +837,11 @@ mod tests {
 			"-z",
 			"--",
 		])));
-		assert!(expected_worktree.windows(2).all(|paths| paths[0] <= paths[1]));
+		assert!(
+			expected_worktree
+				.windows(2)
+				.all(|paths| paths[0] <= paths[1])
+		);
 		assert_eq!(
 			native_names(&mut repository, &stop, false).expect("native worktree names"),
 			expected_worktree

@@ -88,7 +88,11 @@ impl McpClient {
 			protocol_version,
 			name: Str::from(raw.server_info.name),
 			version: raw.server_info.version.map(Str::from),
-			title: raw.server_info.title.filter(|value| !value.is_empty()).map(Str::from),
+			title: raw
+				.server_info
+				.title
+				.filter(|value| !value.is_empty())
+				.map(Str::from),
 			description: raw
 				.server_info
 				.description

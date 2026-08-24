@@ -42,7 +42,7 @@ therefore remain attached to daemon-owned project state for both embedded and
 connected transports.
 
 The crate is deliberately below the headless driver and application layers.
-Capabilities that require campaign state, inference composition,
+Capabilities that require regime state, inference composition,
 application-authored content, host RPC resources, or telemetry delivery enter
 through `RegistryBridges`. `omp-driver` constructs those bridges and the
 session composition; `omp-envd` does not import app presentation policy.

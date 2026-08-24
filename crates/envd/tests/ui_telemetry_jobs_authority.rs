@@ -1,4 +1,4 @@
-//! Proves UI, telemetry, and verdict control owners enforce identity fences and
+//! Proves UI, telemetry, and jobs control owners enforce identity fences and
 //! preserve results.
 use std::{collections::BTreeSet, sync::Arc};
 
@@ -10,8 +10,8 @@ use omp_envd::exthost::{
 		ControlConnectionIdentity, ControlEffect, ControlProtocolError, ControlRequestContext,
 	},
 	presentation::{
-		TelemetryControlAuthority, UiControlAuthority, UiControlOwner, UiControlRequest,
-		UiControlResult, VerdictControlAuthority, VerdictControlOwner,
+		JobsControlAuthority, JobsControlOwner, TelemetryControlAuthority, UiControlAuthority,
+		UiControlOwner, UiControlRequest, UiControlResult,
 	},
 };
 use omp_telemetry::authority::{
@@ -113,10 +113,10 @@ impl DurableTelemetryQuery for DurableQuery {
 	}
 }
 
-struct VerdictOwner;
+struct JobsOwner;
 
 #[async_trait]
-impl VerdictControlOwner for VerdictOwner {
+impl JobsControlOwner for JobsOwner {
 	async fn register_job(
 		&self,
 		_context: ControlRequestContext,
@@ -192,8 +192,8 @@ async fn owners_are_identity_fenced_and_preserve_real_results() {
 		.await
 		.unwrap();
 
-	let verdict = VerdictControlAuthority::new(live.clone(), Arc::new(VerdictOwner));
-	let registered = verdict
+	let jobs = JobsControlAuthority::new(live.clone(), Arc::new(JobsOwner));
+	let registered = jobs
 		.request(
 			context(live, 7),
 			Str::new_static("omp.jobs.register"),

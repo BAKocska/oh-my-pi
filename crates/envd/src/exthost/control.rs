@@ -15,31 +15,31 @@ pub const MAX_RAW_TERMINAL_FRAME_BYTES: usize = 4096;
 /// Maximum payload admitted through the trusted direct-filesystem escape.
 pub const MAX_DIRECT_FILESYSTEM_BYTES: usize = 1024 * 1024;
 
-/// Manifest capability permitting cross-extension campaign projection.
-pub const CAMPAIGNS_READ_CAPABILITY: &str = "campaigns.read";
+/// Manifest capability permitting cross-extension regime projection.
+pub const REGIMES_READ_CAPABILITY: &str = "regimes.read";
 
-/// Cross-extension campaign projection authorization failure.
+/// Cross-extension regime projection authorization failure.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
-pub enum CampaignAccessError {
-	/// The caller requested another extension without `campaigns.read`.
-	#[error("cross-extension campaign reads require campaigns.read")]
+pub enum RegimeAccessError {
+	/// The caller requested another extension without `regimes.read`.
+	#[error("cross-extension regime reads require regimes.read")]
 	ReadCapability,
 }
 
 /// Authorizes own-extension reads and capability-gated cross-extension reads.
-pub fn authorize_campaign_read(
+pub fn authorize_regime_read(
 	caller: &str,
 	target: &str,
 	capabilities: &BTreeSet<Str>,
-) -> Result<(), CampaignAccessError> {
+) -> Result<(), RegimeAccessError> {
 	if caller == target
 		|| capabilities
 			.iter()
-			.any(|capability| capability.as_str() == CAMPAIGNS_READ_CAPABILITY)
+			.any(|capability| capability.as_str() == REGIMES_READ_CAPABILITY)
 	{
 		Ok(())
 	} else {
-		Err(CampaignAccessError::ReadCapability)
+		Err(RegimeAccessError::ReadCapability)
 	}
 }
 
@@ -1798,39 +1798,39 @@ impl PolicyControlAuthorities {
 	}
 }
 
-/// UI, telemetry, and verdict authorities.
+/// UI, telemetry, and job authorities.
 pub struct PresentationControlAuthorities {
 	ui:        Arc<dyn ControlAuthorityFactory>,
 	telemetry: Arc<dyn ControlAuthorityFactory>,
-	verdicts:  Arc<dyn ControlAuthorityFactory>,
+	jobs:      Arc<dyn ControlAuthorityFactory>,
 }
 
 impl PresentationControlAuthorities {
-	/// Installs presentation, observation, and verdict owners.
+	/// Installs presentation, observation, and job owners.
 	pub fn new(
 		ui: Arc<dyn ControlAuthorityFactory>,
 		telemetry: Arc<dyn ControlAuthorityFactory>,
-		verdicts: Arc<dyn ControlAuthorityFactory>,
+		jobs: Arc<dyn ControlAuthorityFactory>,
 	) -> Self {
-		Self { ui, telemetry, verdicts }
+		Self { ui, telemetry, jobs }
 	}
 }
 
-/// Provider, campaign, and extension-service authorities.
+/// Provider, regime, and extension-service authorities.
 pub struct ProviderControlAuthorities {
-	provider:  Arc<dyn ControlAuthorityFactory>,
-	campaigns: Arc<dyn ControlAuthorityFactory>,
-	services:  Arc<dyn ControlAuthorityFactory>,
+	provider: Arc<dyn ControlAuthorityFactory>,
+	regimes:  Arc<dyn ControlAuthorityFactory>,
+	services: Arc<dyn ControlAuthorityFactory>,
 }
 
 impl ProviderControlAuthorities {
-	/// Installs provider handoff, campaign, and service-broker owners.
+	/// Installs provider handoff, regime, and service-broker owners.
 	pub fn new(
 		provider: Arc<dyn ControlAuthorityFactory>,
-		campaigns: Arc<dyn ControlAuthorityFactory>,
+		regimes: Arc<dyn ControlAuthorityFactory>,
 		services: Arc<dyn ControlAuthorityFactory>,
 	) -> Self {
-		Self { provider, campaigns, services }
+		Self { provider, regimes, services }
 	}
 }
 
@@ -1917,9 +1917,9 @@ impl HostControlAuthorityFactory {
 			(ControlDomain::Prompts, "prompts", &self.envd.policy.prompts),
 			(ControlDomain::Ui, "ui", &self.envd.presentation.ui),
 			(ControlDomain::Telemetry, "telemetry", &self.envd.presentation.telemetry),
-			(ControlDomain::Verdicts, "verdicts", &self.envd.presentation.verdicts),
+			(ControlDomain::Jobs, "jobs", &self.envd.presentation.jobs),
 			(ControlDomain::Provider, "provider", &self.envd.provider.provider),
-			(ControlDomain::Campaigns, "campaigns", &self.envd.provider.campaigns),
+			(ControlDomain::Regimes, "regimes", &self.envd.provider.regimes),
 			(ControlDomain::Services, "services", &self.envd.provider.services),
 			(ControlDomain::Auxiliary, "auxiliary", &self.envd.auxiliary),
 			(ControlDomain::Agents, "agents", &agents),
@@ -2027,9 +2027,9 @@ enum ControlDomain {
 	Prompts,
 	Ui,
 	Telemetry,
-	Verdicts,
+	Jobs,
 	Provider,
-	Campaigns,
+	Regimes,
 	Services,
 	Auxiliary,
 	Agents,
@@ -2054,13 +2054,11 @@ impl ControlDomain {
 			Self::Prompts => operation.starts_with("omp.prompts."),
 			Self::Ui => operation.starts_with("omp.ui."),
 			Self::Telemetry => operation.starts_with("omp.telemetry."),
-			Self::Verdicts => {
-				operation.starts_with("omp.verdicts.") || operation == "omp.jobs.register"
-			},
+			Self::Jobs => operation == "omp.jobs.register",
 			Self::Provider => {
 				operation.starts_with("omp.provider.") || operation.starts_with("omp.intents.")
 			},
-			Self::Campaigns => operation.starts_with("omp.campaigns."),
+			Self::Regimes => operation.starts_with("omp.regimes."),
 			Self::Services => operation.starts_with("omp.services."),
 			Self::Auxiliary => {
 				operation.starts_with("omp.params.")
@@ -3010,14 +3008,14 @@ mod tests {
 	use super::*;
 
 	#[test]
-	fn campaign_reads_are_own_extension_or_capability_gated() {
+	fn regime_reads_are_own_extension_or_capability_gated() {
 		let mut capabilities = BTreeSet::new();
-		assert_eq!(authorize_campaign_read("dev.a", "dev.a", &capabilities), Ok(()));
+		assert_eq!(authorize_regime_read("dev.a", "dev.a", &capabilities), Ok(()));
 		assert_eq!(
-			authorize_campaign_read("dev.a", "dev.b", &capabilities),
-			Err(CampaignAccessError::ReadCapability)
+			authorize_regime_read("dev.a", "dev.b", &capabilities),
+			Err(RegimeAccessError::ReadCapability)
 		);
-		capabilities.insert(Str::new_static(CAMPAIGNS_READ_CAPABILITY));
-		assert_eq!(authorize_campaign_read("dev.a", "dev.b", &capabilities), Ok(()));
+		capabilities.insert(Str::new_static(REGIMES_READ_CAPABILITY));
+		assert_eq!(authorize_regime_read("dev.a", "dev.b", &capabilities), Ok(()));
 	}
 }

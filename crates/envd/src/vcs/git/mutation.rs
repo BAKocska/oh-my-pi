@@ -1,7 +1,7 @@
 //! Consumer-facing Git mutation primitives serialized by primary repository
 //! root.
 
-use std::{collections::HashSet, fmt::Write as _, path::Path, str};
+use std::{collections::HashSet, fmt::Write as _, io, path::Path, str};
 
 use bytes::{Bytes, BytesMut};
 use omp_core::{IntoStr, Str};
@@ -41,6 +41,57 @@ pub struct HunkSelection {
 	pub selector: HunkSelector,
 }
 
+/// Inclusive one-based line range on one side of a unified diff.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LineRange {
+	/// First selected line, inclusive.
+	pub start: u64,
+	/// Last selected line, inclusive.
+	pub end:   u64,
+}
+
+impl LineRange {
+	/// Creates an inclusive one-based line range.
+	pub const fn new(start: u64, end: u64) -> Self {
+		Self { start, end }
+	}
+
+	fn contains(self, line: u64) -> bool {
+		self.start <= line && line <= self.end
+	}
+
+	fn is_valid(self) -> bool {
+		self.start != 0 && self.start <= self.end
+	}
+}
+
+/// Selected old-side deletions and new-side additions for a partial patch.
+///
+/// At least one side must be present. Supplying both sides allows one visual
+/// selection to include removed and added lines from a replacement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DiffLineSelection {
+	/// Old-file line range selecting `-` records.
+	pub old: Option<LineRange>,
+	/// New-file line range selecting `+` records.
+	pub new: Option<LineRange>,
+}
+
+impl DiffLineSelection {
+	/// Selects only additions in an inclusive new-file range.
+	pub const fn new_lines(start: u64, end: u64) -> Self {
+		Self { old: None, new: Some(LineRange::new(start, end)) }
+	}
+}
+/// Direction in which a synthesized line patch will be applied.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LinePatchDirection {
+	/// Apply the patch from its old side to its new side.
+	Apply,
+	/// Apply the patch through `git apply --reverse`.
+	Reverse,
+}
+
 /// Why a selective-hunk request was rejected before mutation.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum SelectionError {
@@ -73,7 +124,7 @@ pub enum SelectionError {
 		hunk_count: usize,
 	},
 	/// A line range was empty or started at line zero.
-	#[error("path {path} has an invalid new-file line range")]
+	#[error("path {path} has an invalid line range")]
 	InvalidLineRange {
 		/// Requested path.
 		path: Str,
@@ -81,6 +132,12 @@ pub enum SelectionError {
 	/// None of the file's hunks matched the selector.
 	#[error("no hunks matched path {path}")]
 	NoMatchingHunks {
+		/// Requested path.
+		path: Str,
+	},
+	/// None of the selected line coordinates referred to a changed line.
+	#[error("no changed lines matched path {path}")]
+	NoMatchingLines {
 		/// Requested path.
 		path: Str,
 	},
@@ -92,6 +149,9 @@ pub enum MutationError {
 	/// Repository admission failed.
 	#[error(transparent)]
 	Lock(#[from] lock::LockError),
+	/// A selected worktree file could not be read exactly.
+	#[error("selected worktree file could not be read")]
+	WorktreeRead(#[source] io::Error),
 	/// Environment execution failed, timed out, or was cancelled.
 	#[error(transparent)]
 	Run(#[from] GitRunError),
@@ -121,6 +181,8 @@ pub enum MutationError {
 pub enum GitMutationConsumer {
 	/// Autoresearch experiment isolation transactions.
 	Autoresearch,
+	/// User-driven `omp git` and `/git` staging-and-commit surface.
+	InteractiveGit,
 }
 
 /// Fixed autoresearch transaction records accepted by [`GitMutation`].
@@ -298,6 +360,8 @@ pub struct CommitOptions<'a> {
 	pub date:        Option<&'a str>,
 	/// Permit creation when the index tree equals `HEAD`.
 	pub allow_empty: bool,
+	/// Replace `HEAD` while preserving Git's ordinary amend semantics.
+	pub amend:       bool,
 }
 
 /// Lease protection accepted by one push.
@@ -459,6 +523,24 @@ impl GitMutation {
 		self.mutation(&argv, None, cancel).await
 	}
 
+	/// Stages every tracked, deleted, and untracked path with `git add -A`.
+	pub async fn stage_all(
+		&self,
+		cancel: &CancellationToken,
+	) -> Result<MutationOutcome, MutationError> {
+		let _guard = lock::write(&self.repository, cancel).await?;
+		self.mutation(&["add", "-A"], None, cancel).await
+	}
+
+	/// Resets the complete index to `HEAD` while preserving the worktree.
+	pub async fn unstage_all(
+		&self,
+		cancel: &CancellationToken,
+	) -> Result<MutationOutcome, MutationError> {
+		let _guard = lock::write(&self.repository, cancel).await?;
+		self.mutation(&["reset"], None, cancel).await
+	}
+
 	/// Removes only the supplied exact paths from the index. An empty list is a
 	/// no-op.
 	pub async fn reset_index_entries(
@@ -481,7 +563,6 @@ impl GitMutation {
 	pub async fn stage_hunks(
 		&self,
 		selections: &[HunkSelection],
-		from_cached_diff: bool,
 		cancel: &CancellationToken,
 	) -> Result<MutationOutcome, MutationError> {
 		let _guard = lock::write(&self.repository, cancel).await?;
@@ -491,7 +572,7 @@ impl GitMutation {
 		let raw = GitDiff::new(self.runner.clone())
 			.raw(
 				self.cwd(),
-				DiffOptions { cached: from_cached_diff, binary: true, ..Default::default() },
+				DiffOptions { cached: false, binary: true, ..Default::default() },
 				&[],
 				cancel,
 			)
@@ -499,6 +580,91 @@ impl GitMutation {
 		let patch = build_selected_patch(&raw, selections)?;
 		self
 			.mutation(&["apply", "--binary", "--cached", "-"], Some(&patch), cancel)
+			.await
+	}
+
+	/// Unstages selected hunks by reversing a complete cached diff in the index.
+	pub async fn unstage_hunks(
+		&self,
+		selections: &[HunkSelection],
+		cancel: &CancellationToken,
+	) -> Result<MutationOutcome, MutationError> {
+		let _guard = lock::write(&self.repository, cancel).await?;
+		if selections.is_empty() {
+			return Ok(MutationOutcome::Applied(noop_output()));
+		}
+		let raw = GitDiff::new(self.runner.clone())
+			.raw(
+				self.cwd(),
+				DiffOptions { cached: true, binary: true, ..Default::default() },
+				&[],
+				cancel,
+			)
+			.await?;
+		let patch = build_selected_patch(&raw, selections)?;
+		self
+			.mutation(&["apply", "--binary", "--cached", "--reverse", "-"], Some(&patch), cancel)
+			.await
+	}
+
+	/// Discards selected worktree hunks by applying their complete diff in
+	/// reverse.
+	pub async fn discard_hunks(
+		&self,
+		selections: &[HunkSelection],
+		cancel: &CancellationToken,
+	) -> Result<MutationOutcome, MutationError> {
+		let _guard = lock::write(&self.repository, cancel).await?;
+		if selections.is_empty() {
+			return Ok(MutationOutcome::Applied(noop_output()));
+		}
+		let raw = GitDiff::new(self.runner.clone())
+			.raw(
+				self.cwd(),
+				DiffOptions { cached: false, binary: true, ..Default::default() },
+				&[],
+				cancel,
+			)
+			.await?;
+		let patch = build_selected_patch(&raw, selections)?;
+		self
+			.mutation(&["apply", "--binary", "--reverse", "-"], Some(&patch), cancel)
+			.await
+	}
+
+	/// Stages selected old/new changed lines from one worktree file diff.
+	pub async fn stage_lines(
+		&self,
+		path: &str,
+		range: DiffLineSelection,
+		cancel: &CancellationToken,
+	) -> Result<MutationOutcome, MutationError> {
+		self
+			.apply_selected_lines(path, range, false, false, cancel)
+			.await
+	}
+
+	/// Unstages selected old/new changed lines from one cached file diff.
+	pub async fn unstage_lines(
+		&self,
+		path: &str,
+		range: DiffLineSelection,
+		cancel: &CancellationToken,
+	) -> Result<MutationOutcome, MutationError> {
+		self
+			.apply_selected_lines(path, range, true, true, cancel)
+			.await
+	}
+
+	/// Discards selected old/new changed lines from one worktree file diff.
+	pub async fn discard_lines(
+		&self,
+		path: &str,
+		range: DiffLineSelection,
+		cancel: &CancellationToken,
+	) -> Result<MutationOutcome, MutationError> {
+		self
+			.apply_selected_lines(path, range, false, true, cancel)
 			.await
 	}
 
@@ -783,6 +949,9 @@ impl GitMutation {
 		if options.allow_empty {
 			argv.push("--allow-empty");
 		}
+		if options.amend {
+			argv.push("--amend");
+		}
 		self.mutation(&argv, Some(message), cancel).await
 	}
 
@@ -808,6 +977,89 @@ impl GitMutation {
 		argv.push(remote);
 		argv.extend_from_slice(refspecs);
 		self.network_mutation(&argv, cancel).await
+	}
+
+	async fn apply_selected_lines(
+		&self,
+		path: &str,
+		range: DiffLineSelection,
+		cached: bool,
+		reverse: bool,
+		cancel: &CancellationToken,
+	) -> Result<MutationOutcome, MutationError> {
+		let _guard = lock::write(&self.repository, cancel).await?;
+		let raw = GitDiff::new(self.runner.clone())
+			.raw(self.cwd(), DiffOptions { cached, binary: true, ..Default::default() }, &[], cancel)
+			.await?;
+		let files = diff::parse_unified(raw);
+		let file = files
+			.iter()
+			.find(|file| file_matches_path(file, path.as_bytes()))
+			.ok_or_else(|| SelectionError::PathMissing { path: path.to_str() })?;
+		let patch = build_line_patch_with_endings(
+			file,
+			path,
+			range,
+			if reverse {
+				LinePatchDirection::Reverse
+			} else {
+				LinePatchDirection::Apply
+			},
+			&self.line_endings(file, cached, path, cancel).await?,
+		)?;
+		let options =
+			PatchOptions { binary: true, cached: cached || !reverse, reverse, ..Default::default() };
+		self
+			.mutation(&apply_argv(options), Some(&patch), cancel)
+			.await
+	}
+
+	async fn line_endings(
+		&self,
+		file: &FileDiff,
+		cached: bool,
+		path: &str,
+		cancel: &CancellationToken,
+	) -> Result<LineEndings, MutationError> {
+		let old_path = file
+			.old_path
+			.as_deref()
+			.and_then(|path| str::from_utf8(path).ok())
+			.unwrap_or(path);
+		let new_path = file
+			.path
+			.as_deref()
+			.and_then(|path| str::from_utf8(path).ok())
+			.unwrap_or(path);
+		let old_spec = if cached {
+			format!("HEAD:{old_path}")
+		} else {
+			format!(":0:{old_path}")
+		};
+		let old = self.blob_or_empty(&old_spec, cancel).await?;
+		let new = if cached {
+			self.blob_or_empty(&format!(":0:{new_path}"), cancel).await?
+		} else {
+			match tokio::fs::read(self.cwd().join(new_path)).await {
+				Ok(bytes) => Bytes::from(bytes),
+				Err(error) if error.kind() == io::ErrorKind::NotFound => Bytes::new(),
+				Err(error) => return Err(MutationError::WorktreeRead(error)),
+			}
+		};
+		Ok(LineEndings::from_contents(&old, &new))
+	}
+
+	async fn blob_or_empty(
+		&self,
+		spec: &str,
+		cancel: &CancellationToken,
+	) -> Result<Bytes, MutationError> {
+		let output = self.invoke_complete(&["show", spec], None, cancel).await?;
+		Ok(if output.exit_code == 0 {
+			output.stdout
+		} else {
+			Bytes::new()
+		})
 	}
 
 	fn cwd(&self) -> &Path {
@@ -1083,19 +1335,415 @@ fn build_selected_patch(
 				if *start == 0 || start > end {
 					return Err(SelectionError::InvalidLineRange { path: selection.path.clone() });
 				}
-				let hunks: Vec<_> = file
-					.hunks
-					.iter()
-					.filter(|hunk| {
-						let hunk_end = hunk.new_start.saturating_add(hunk.new_count.max(1) - 1);
-						hunk.new_start <= *end && hunk_end >= *start
-					})
-					.collect();
-				append_selected_hunks(&mut patch, file, &hunks, &selection.path)?;
+				let selected = build_line_patch(
+					file,
+					selection.path.as_str(),
+					DiffLineSelection::new_lines(*start, *end),
+					LinePatchDirection::Apply,
+				)?;
+				append_patch_part(&mut patch, &selected);
 			},
 		}
 	}
 	Ok(patch.freeze())
+}
+/// Synthesizes one standalone apply-intent patch containing only selected
+/// changed lines from `file`.
+///
+/// For [`LinePatchDirection::Apply`], unselected additions are omitted and
+/// unselected deletions become context. Reverse patches use the inverse
+/// transformation so their source is the complete new side. Hunk coordinates
+/// and no-final-newline markers are rewritten without decoding file content.
+pub fn build_line_patch(
+	file: &FileDiff,
+	path: &str,
+	selection: DiffLineSelection,
+	direction: LinePatchDirection,
+) -> Result<Bytes, SelectionError> {
+	build_line_patch_with_endings(file, path, selection, direction, &LineEndings::default())
+}
+
+fn build_line_patch_with_endings(
+	file: &FileDiff,
+	path: &str,
+	selection: DiffLineSelection,
+	direction: LinePatchDirection,
+	line_endings: &LineEndings,
+) -> Result<Bytes, SelectionError> {
+	let path = path.to_str();
+	if file.binary {
+		return Err(SelectionError::BinarySubset { path });
+	}
+	if selection.old.is_none() && selection.new.is_none()
+		|| selection.old.is_some_and(|range| !range.is_valid())
+		|| selection.new.is_some_and(|range| !range.is_valid())
+	{
+		return Err(SelectionError::InvalidLineRange { path });
+	}
+	if file.hunks.is_empty() {
+		return Err(SelectionError::NoMatchingLines { path });
+	}
+
+	let header_end = find_bytes(&file.raw, &file.hunks[0].raw).unwrap_or(file.raw.len());
+	let mut transformed_hunks = Vec::with_capacity(file.hunks.len());
+	let mut delta = 0_i64;
+	let mut selected_changes = 0_usize;
+	for hunk in &file.hunks {
+		let Some(transformed) =
+			transform_hunk(hunk, selection, delta, direction, line_endings)
+		else {
+			continue;
+		};
+		selected_changes += transformed.selected_changes;
+		delta += transformed.delta;
+		transformed_hunks.push(transformed);
+	}
+	if transformed_hunks.is_empty() {
+		return Err(SelectionError::NoMatchingLines { path });
+	}
+	let total_changes = file
+		.hunks
+		.iter()
+		.flat_map(|hunk| hunk.raw.split_inclusive(|byte| *byte == b'\n').skip(1))
+		.filter(|line| matches!(line.first(), Some(b'+' | b'-')))
+		.count();
+	let mut patch = BytesMut::with_capacity(file.raw.len());
+	append_line_patch_header(
+		&mut patch,
+		file,
+		header_end,
+		direction,
+		selected_changes == total_changes,
+	);
+	for transformed in transformed_hunks {
+		patch.extend_from_slice(&transformed.raw);
+	}
+	if !patch.ends_with(b"\n") {
+		patch.extend_from_slice(b"\n");
+	}
+	Ok(patch.freeze())
+}
+fn append_line_patch_header(
+	patch: &mut BytesMut,
+	file: &FileDiff,
+	header_end: usize,
+	direction: LinePatchDirection,
+	complete: bool,
+) {
+	let normalize = match (&file.old_path, &file.path) {
+		(Some(old_path), Some(path)) => old_path != path,
+		(Some(_), None) => direction == LinePatchDirection::Apply && !complete,
+		(None, Some(_)) => direction == LinePatchDirection::Reverse && !complete,
+		(None, None) => false,
+	};
+	if normalize && let Some(path) = file.path.as_ref().or(file.old_path.as_ref()) {
+		patch.extend_from_slice(b"diff --git a/");
+		patch.extend_from_slice(path);
+		patch.extend_from_slice(b" b/");
+		patch.extend_from_slice(path);
+		patch.extend_from_slice(b"\n--- a/");
+		patch.extend_from_slice(path);
+		patch.extend_from_slice(b"\n+++ b/");
+		patch.extend_from_slice(path);
+		patch.extend_from_slice(b"\n");
+		return;
+	}
+	patch.extend_from_slice(&file.raw[..header_end]);
+}
+
+#[derive(Default)]
+struct LineEndings {
+	old_crlf: Vec<bool>,
+	new_crlf: Vec<bool>,
+}
+
+impl LineEndings {
+	fn from_contents(old: &[u8], new: &[u8]) -> Self {
+		Self { old_crlf: crlf_lines(old), new_crlf: crlf_lines(new) }
+	}
+
+	fn old_is_crlf(&self, line: u64) -> bool {
+		line.checked_sub(1)
+			.and_then(|index| usize::try_from(index).ok())
+			.and_then(|index| self.old_crlf.get(index))
+			.copied()
+			.unwrap_or(false)
+	}
+
+	fn new_is_crlf(&self, line: u64) -> bool {
+		line.checked_sub(1)
+			.and_then(|index| usize::try_from(index).ok())
+			.and_then(|index| self.new_crlf.get(index))
+			.copied()
+			.unwrap_or(false)
+	}
+}
+
+fn crlf_lines(contents: &[u8]) -> Vec<bool> {
+	contents
+		.split_inclusive(|byte| *byte == b'\n')
+		.map(|line| line.ends_with(b"\r\n"))
+		.collect()
+}
+
+struct TransformedHunk {
+	raw:              Bytes,
+	delta:            i64,
+	selected_changes: usize,
+}
+
+fn transform_hunk(
+	hunk: &DiffHunk,
+	selection: DiffLineSelection,
+	delta_before: i64,
+	direction: LinePatchDirection,
+	line_endings: &LineEndings,
+) -> Option<TransformedHunk> {
+	let header_end = hunk
+		.raw
+		.iter()
+		.position(|byte| *byte == b'\n')
+		.map_or(hunk.raw.len(), |position| position + 1);
+	let header = &hunk.raw[..header_end];
+	let closing = find_bytes(header.get(2..).unwrap_or_default(), b"@@").map(|offset| offset + 2)?;
+	let suffix = &header[closing + 2..];
+	let mut body = BytesMut::with_capacity(hunk.raw.len().saturating_sub(header_end));
+	let mut old_line = hunk.old_start;
+	let mut new_line = hunk.new_start;
+	let mut old_count = 0_u64;
+	let mut new_count = 0_u64;
+	let mut selected_additions = 0_i64;
+	let mut selected_deletions = 0_i64;
+	let mut matched = false;
+	let mut deletions = Vec::new();
+	let mut additions = Vec::new();
+	let mut lines = hunk.raw[header_end..]
+		.split_inclusive(|byte| *byte == b'\n')
+		.peekable();
+
+	while let Some(line) = lines.next() {
+		let marker = if lines
+			.peek()
+			.is_some_and(|next| next.first() == Some(&b'\\'))
+		{
+			lines.next()
+		} else {
+			None
+		};
+		match line.first().copied() {
+			Some(b' ') => {
+				append_transformed_change_block(
+					&mut body,
+					&mut deletions,
+					&mut additions,
+					direction,
+					&mut old_count,
+					&mut new_count,
+					&mut selected_deletions,
+					&mut selected_additions,
+				);
+				append_context_hunk_line(
+					&mut body,
+					line,
+					marker,
+					line_endings.old_is_crlf(old_line),
+					line_endings.new_is_crlf(new_line),
+				);
+				old_count += 1;
+				new_count += 1;
+				old_line += 1;
+				new_line += 1;
+			},
+			Some(b'-') => {
+				let selected = selection.old.is_some_and(|range| range.contains(old_line));
+				matched |= selected;
+				deletions.push(PendingHunkLine { raw: line, marker, selected, crlf: line_endings.old_is_crlf(old_line) });
+				old_line += 1;
+			},
+			Some(b'+') => {
+				let selected = selection.new.is_some_and(|range| range.contains(new_line));
+				matched |= selected;
+				additions.push(PendingHunkLine { raw: line, marker, selected, crlf: line_endings.new_is_crlf(new_line) });
+				new_line += 1;
+			},
+			_ => {
+				append_transformed_change_block(
+					&mut body,
+					&mut deletions,
+					&mut additions,
+					direction,
+					&mut old_count,
+					&mut new_count,
+					&mut selected_deletions,
+					&mut selected_additions,
+				);
+				append_hunk_line(&mut body, line, marker, false);
+			},
+		}
+	}
+	append_transformed_change_block(
+		&mut body,
+		&mut deletions,
+		&mut additions,
+		direction,
+		&mut old_count,
+		&mut new_count,
+		&mut selected_deletions,
+		&mut selected_additions,
+	);
+	if !matched {
+		return None;
+	}
+
+	let (old_start, new_start) = match direction {
+		LinePatchDirection::Apply => {
+			(hunk.old_start, transformed_new_start(hunk.old_start, old_count, new_count, delta_before))
+		},
+		LinePatchDirection::Reverse => {
+			(transformed_old_start(hunk.new_start, old_count, new_count, delta_before), hunk.new_start)
+		},
+	};
+	let mut raw = BytesMut::with_capacity(header.len() + body.len() + 48);
+	let header = format!("@@ -{},{} +{},{} @@", old_start, old_count, new_start, new_count);
+	raw.extend_from_slice(header.as_bytes());
+	raw.extend_from_slice(suffix);
+	raw.extend_from_slice(&body);
+	Some(TransformedHunk {
+		raw:              raw.freeze(),
+		delta:            selected_additions - selected_deletions,
+		selected_changes: (selected_additions + selected_deletions) as usize,
+	})
+}
+
+struct PendingHunkLine<'a> {
+	raw:      &'a [u8],
+	marker:   Option<&'a [u8]>,
+	selected: bool,
+	crlf:     bool,
+}
+
+fn append_transformed_change_block(
+	body: &mut BytesMut,
+	deletions: &mut Vec<PendingHunkLine<'_>>,
+	additions: &mut Vec<PendingHunkLine<'_>>,
+	direction: LinePatchDirection,
+	old_count: &mut u64,
+	new_count: &mut u64,
+	selected_deletions: &mut i64,
+	selected_additions: &mut i64,
+) {
+	let rows = deletions.len().max(additions.len());
+	for index in 0..rows {
+		if let Some(line) = deletions.get(index) {
+			match (direction, line.selected) {
+				(_, true) => {
+					append_hunk_line(body, line.raw, line.marker, line.crlf);
+					*old_count += 1;
+					*selected_deletions += 1;
+				},
+				(LinePatchDirection::Apply, false) => {
+					append_context_hunk_line(body, line.raw, line.marker, line.crlf, line.crlf);
+					*old_count += 1;
+					*new_count += 1;
+				},
+				(LinePatchDirection::Reverse, false) => {},
+			}
+		}
+		if let Some(line) = additions.get(index) {
+			match (direction, line.selected) {
+				(_, true) => {
+					append_hunk_line(body, line.raw, line.marker, line.crlf);
+					*new_count += 1;
+					*selected_additions += 1;
+				},
+				(LinePatchDirection::Reverse, false) => {
+					append_context_hunk_line(body, line.raw, line.marker, line.crlf, line.crlf);
+					*old_count += 1;
+					*new_count += 1;
+				},
+				(LinePatchDirection::Apply, false) => {},
+			}
+		}
+	}
+	deletions.clear();
+	additions.clear();
+}
+
+fn append_hunk_line(
+	body: &mut BytesMut,
+	line: &[u8],
+	marker: Option<&[u8]>,
+	crlf: bool,
+) {
+	if crlf {
+		let content = line
+			.strip_suffix(b"\r\n")
+			.or_else(|| line.strip_suffix(b"\n"))
+			.unwrap_or(line);
+		body.extend_from_slice(content);
+		body.extend_from_slice(b"\r\n");
+	} else {
+		body.extend_from_slice(line);
+	}
+	if let Some(marker) = marker {
+		body.extend_from_slice(marker);
+	}
+}
+
+fn append_context_hunk_line(
+	body: &mut BytesMut,
+	line: &[u8],
+	marker: Option<&[u8]>,
+	old_crlf: bool,
+	new_crlf: bool,
+) {
+	if old_crlf || new_crlf {
+		let content = line
+			.strip_suffix(b"\r\n")
+			.or_else(|| line.strip_suffix(b"\n"))
+			.unwrap_or(line);
+		body.extend_from_slice(b"-");
+		body.extend_from_slice(&content[1..]);
+		body.extend_from_slice(if old_crlf { b"\r\n" } else { b"\n" });
+		body.extend_from_slice(b"+");
+		body.extend_from_slice(&content[1..]);
+		body.extend_from_slice(if new_crlf { b"\r\n" } else { b"\n" });
+	} else {
+		body.extend_from_slice(b" ");
+		body.extend_from_slice(&line[1..]);
+	}
+	if let Some(marker) = marker {
+		body.extend_from_slice(marker);
+	}
+}
+
+fn transformed_new_start(old_start: u64, old_count: u64, new_count: u64, delta_before: i64) -> u64 {
+	let base = if old_count == 0 {
+		old_start.saturating_add(1)
+	} else if new_count == 0 {
+		old_start.saturating_sub(1)
+	} else {
+		old_start
+	};
+	if delta_before.is_negative() {
+		base.saturating_sub(delta_before.unsigned_abs())
+	} else {
+		base.saturating_add(delta_before as u64)
+	}
+}
+fn transformed_old_start(new_start: u64, old_count: u64, new_count: u64, delta_before: i64) -> u64 {
+	let base = if old_count == 0 {
+		new_start.saturating_sub(1)
+	} else if new_count == 0 {
+		new_start.saturating_add(1)
+	} else {
+		new_start
+	};
+	if delta_before.is_negative() {
+		base.saturating_add(delta_before.unsigned_abs())
+	} else {
+		base.saturating_sub(delta_before as u64)
+	}
 }
 
 fn file_matches_path(file: &FileDiff, path: &[u8]) -> bool {

@@ -1125,9 +1125,8 @@ impl McpManager {
 					version: connection.and_then(|live| live.initialized.version.clone()),
 					title: connection.and_then(|live| live.initialized.title.clone()),
 					description: connection.and_then(|live| live.initialized.description.clone()),
-					instructions: connection.and_then(|live| {
-						bounded_instructions(live.initialized.instructions.as_ref())
-					}),
+					instructions: connection
+						.and_then(|live| bounded_instructions(live.initialized.instructions.as_ref())),
 					tools: connection
 						.map(|live| live.tools.read().clone())
 						.unwrap_or_else(|| Arc::from([])),

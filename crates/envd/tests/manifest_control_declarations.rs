@@ -29,7 +29,7 @@ fn verified_properties() -> BTreeMap<Str, serde_json::Value> {
 				"grants": ["network.provider"],
 				"models": ["test-model"]
 			},
-			{"id": "campaign", "kind": "campaign"},
+			{"id": "regime", "kind": "regime"},
 			{"id": "command", "kind": "command"},
 			{"id": "shortcut", "kind": "shortcut"},
 			{"id": "renderer", "kind": "verdict_renderer"},
@@ -64,6 +64,12 @@ fn verified_manifest_retains_every_control_declaration_before_runtime_import() {
 	let static_declarations =
 		StaticDeclarations::from_properties(&properties).expect("verified declaration projection");
 	assert_eq!(static_declarations.rows().count(), 16);
+	assert_eq!(static_declarations.regimes[0].id, "regime");
+	assert!(
+		static_declarations
+			.identities()
+			.any(|(class, id)| class == StaticDeclarationClass::Regime && id == "regime")
+	);
 	assert_eq!(static_declarations.providers[0].module, "extension.provider");
 	assert_eq!(static_declarations.providers[0].grants.as_ref(), ["network.provider"]);
 	assert_eq!(

@@ -931,10 +931,11 @@ impl ProjectEnvironment {
 	}
 
 	/// Returns the live generation-fenced extension callback transport used by
-	/// provider, campaign, presentation, and verdict owners.
+	/// provider, regime, presentation, and job owners.
 	pub fn extension_callback_dispatcher(&self) -> Arc<dyn CallbackDispatcher> {
 		self.lifecycle.server.extension_callback_dispatcher()
 	}
+
 	/// Returns the shared extension and built-in provider usage registry.
 	pub fn usage_fetchers(&self) -> omp_inference::operation::usage::UsageFetcherRegistry {
 		self.lifecycle.server.usage_fetchers()
@@ -949,7 +950,7 @@ impl ProjectEnvironment {
 		self.lifecycle.server.extension_control_manifest(identity)
 	}
 
-	/// Returns full frozen provider and campaign declarations for one exact
+	/// Returns full frozen provider and regime declarations for one exact
 	/// authenticated extension generation.
 	pub fn extension_registry_evidence(
 		&self,
@@ -958,12 +959,12 @@ impl ProjectEnvironment {
 		self.lifecycle.server.extension_registry_evidence(identity)
 	}
 
-	/// Returns the live resolver over exact-generation campaign declarations
+	/// Returns the live resolver over exact-generation regime declarations
 	/// retained from extension FREEZE acknowledgments.
-	pub fn extension_campaign_resolver(&self) -> Arc<worker::ExtensionCampaignResolver> {
+	pub fn extension_regime_resolver(&self) -> Arc<worker::ExtensionRegimeResolver> {
 		let server = Arc::clone(&self.lifecycle.server);
 		let callbacks = server.extension_callback_dispatcher();
-		worker::ExtensionCampaignResolver::new(callbacks, move |identity| {
+		worker::ExtensionRegimeResolver::new(callbacks, move |identity| {
 			server.extension_registry_evidence(identity)
 		})
 	}

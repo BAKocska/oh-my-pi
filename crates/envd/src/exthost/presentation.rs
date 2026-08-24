@@ -1,4 +1,4 @@
-//! Identity-fenced UI, telemetry, and verdict CONTROL domain owners.
+//! Identity-fenced UI, telemetry, and job CONTROL domain owners.
 
 use std::{mem, sync::Arc};
 
@@ -379,9 +379,9 @@ impl ControlAuthority for TelemetryControlAuthority {
 	}
 }
 
-/// Driver-owned verdict/job boundary.
+/// Driver-owned job supervision boundary.
 #[async_trait]
-pub trait VerdictControlOwner: Send + Sync + 'static {
+pub trait JobsControlOwner: Send + Sync + 'static {
 	/// Registers and supervises one scoped detached job.
 	async fn register_job(
 		&self,
@@ -390,24 +390,21 @@ pub trait VerdictControlOwner: Send + Sync + 'static {
 	) -> Result<Value, ControlProtocolError>;
 }
 
-/// Identity-fenced adapter for verdict/job operations.
-pub struct VerdictControlAuthority {
+/// Identity-fenced adapter for job supervision operations.
+pub struct JobsControlAuthority {
 	identity: Arc<ControlConnectionIdentity>,
-	owner:    Arc<dyn VerdictControlOwner>,
+	owner:    Arc<dyn JobsControlOwner>,
 }
 
-impl VerdictControlAuthority {
+impl JobsControlAuthority {
 	/// Binds the durable job owner to one authenticated connection.
-	pub fn new(
-		identity: Arc<ControlConnectionIdentity>,
-		owner: Arc<dyn VerdictControlOwner>,
-	) -> Self {
+	pub fn new(identity: Arc<ControlConnectionIdentity>, owner: Arc<dyn JobsControlOwner>) -> Self {
 		Self { identity, owner }
 	}
 }
 
 #[async_trait]
-impl ControlAuthority for VerdictControlAuthority {
+impl ControlAuthority for JobsControlAuthority {
 	fn handles(&self, operation: &str) -> bool {
 		operation == "omp.jobs.register"
 	}
@@ -435,7 +432,7 @@ impl ControlAuthority for VerdictControlAuthority {
 		arguments: Map<String, Value>,
 	) -> Result<Value, ControlProtocolError> {
 		if operation.as_str() != "omp.jobs.register" {
-			return Err(protocol("unknown_operation", "verdict owner does not handle operation"));
+			return Err(protocol("unknown_operation", "jobs owner does not handle operation"));
 		}
 		self.owner.register_job(context, arguments).await
 	}
@@ -445,7 +442,7 @@ impl ControlAuthority for VerdictControlAuthority {
 		_context: ControlRequestContext,
 		_effect: ControlEffect,
 	) -> Result<(), ControlProtocolError> {
-		Err(protocol("wrong_domain", "verdict authority does not accept effects"))
+		Err(protocol("wrong_domain", "jobs authority does not accept effects"))
 	}
 }
 
@@ -670,5 +667,5 @@ fn _assert_send_sync() {
 	fn assert_owner<T: Send + Sync>() {}
 	assert_owner::<UiControlAuthority>();
 	assert_owner::<TelemetryControlAuthority>();
-	assert_owner::<VerdictControlAuthority>();
+	assert_owner::<JobsControlAuthority>();
 }

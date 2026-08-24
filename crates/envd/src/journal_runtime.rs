@@ -2207,7 +2207,7 @@ mod tests {
 				match mailbox.handle_next(&mut journal).await {
 					ControlMailboxEvent::Closed => break,
 					ControlMailboxEvent::JournalHandled | ControlMailboxEvent::Rewind(_) => {},
-					ControlMailboxEvent::Campaign(command) => {
+					ControlMailboxEvent::Regime(command) => {
 						command.reject_unavailable();
 					},
 				}

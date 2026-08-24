@@ -486,7 +486,12 @@ impl GitCommands {
 		cwd: &Path,
 		cancel: &CancellationToken,
 	) -> Result<Option<Str>, CommandError> {
-		match native::with_repository(cwd, cancel, native_workdir_prefix).await {
+		match native::with_repository(cwd, cancel, {
+			let cwd = cwd.to_path_buf();
+			move |repository, stop| native_workdir_prefix(repository, stop, &cwd)
+		})
+		.await
+		{
 			Ok(value) => return Ok(value),
 			Err(error) if error.is_cancelled() => return Err(GitRunError::Cancelled.into()),
 			Err(error) => tracing::debug!(%error, "in-process Git read fell back to system Git"),
@@ -697,11 +702,15 @@ fn native_config_get(
 fn native_workdir_prefix(
 	repository: &mut gix::Repository,
 	stop: &AtomicBool,
+	cwd: &Path,
 ) -> Result<Option<Str>, native::NativeError> {
 	cancelled(stop)?;
-	let Some(prefix) = repository.prefix().map_err(native::op_error)? else {
+	let Some(worktree) = repository.work_dir() else {
 		return Ok(None);
 	};
+	let cwd = std::fs::canonicalize(cwd).map_err(native::op_error)?;
+	let worktree = std::fs::canonicalize(worktree).map_err(native::op_error)?;
+	let prefix = cwd.strip_prefix(worktree).map_err(native::op_error)?;
 	if prefix.as_os_str().is_empty() {
 		return Ok(None);
 	}
@@ -770,18 +779,21 @@ fn version_digits(left: &[u8], right: &[u8]) -> Ordering {
 
 #[cfg(test)]
 mod tests {
-	use std::{
-		fs,
-		path::Path,
-		process::Command,
-		sync::atomic::AtomicBool,
-	};
+	use std::{fs, path::Path, process::Command, sync::atomic::AtomicBool};
 
 	use super::*;
 
 	fn git(cwd: &Path, arguments: &[&str]) {
-		let output = Command::new("git").current_dir(cwd).args(arguments).output().expect("fixture git launches");
-		assert!(output.status.success(), "git {arguments:?}: {}", String::from_utf8_lossy(&output.stderr));
+		let output = Command::new("git")
+			.current_dir(cwd)
+			.args(arguments)
+			.output()
+			.expect("fixture git launches");
+		assert!(
+			output.status.success(),
+			"git {arguments:?}: {}",
+			String::from_utf8_lossy(&output.stderr)
+		);
 	}
 
 	fn fixture() -> tempfile::TempDir {
@@ -804,24 +816,51 @@ mod tests {
 		let stop = AtomicBool::new(false);
 		let root = fixture();
 		let mut repo = repository(root.path());
-		assert_eq!(native_current_branch(&mut repo, &stop).expect("head").as_deref(), Some("main"));
-		assert!(native_resolve_ref(&mut repo, &stop, "HEAD").expect("resolve").is_some());
+		assert_eq!(
+			native_current_branch(&mut repo, &stop)
+				.expect("head")
+				.as_deref(),
+			Some("main")
+		);
+		assert!(
+			native_resolve_ref(&mut repo, &stop, "HEAD")
+				.expect("resolve")
+				.is_some()
+		);
 		assert_eq!(native_resolve_ref(&mut repo, &stop, "missing").expect("missing"), None);
 		assert!(native_ref_exists(&mut repo, &stop, "refs/heads/main").expect("exists"));
 		assert!(!native_ref_exists(&mut repo, &stop, "main").expect("not full ref"));
 		git(root.path(), &["branch", "topic"]);
 		git(root.path(), &["update-ref", "refs/remotes/origin/x", "HEAD"]);
 		git(root.path(), &["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/x"]);
-		assert_eq!(native_default_branch(&mut repo, &stop).expect("default").as_deref(), Some("x"));
-		assert_eq!(native_list_branches(&mut repo, &stop, false).expect("locals"), vec!["main".to_str(), "topic".to_str()]);
-		assert_eq!(native_list_branches(&mut repo, &stop, true).expect("all"), vec!["main".to_str(), "topic".to_str(), "origin/HEAD".to_str(), "origin/x".to_str()]);
+		assert_eq!(
+			native_default_branch(&mut repo, &stop)
+				.expect("default")
+				.as_deref(),
+			Some("x")
+		);
+		assert_eq!(native_list_branches(&mut repo, &stop, false).expect("locals"), vec![
+			"main".to_str(),
+			"topic".to_str()
+		]);
+		assert_eq!(native_list_branches(&mut repo, &stop, true).expect("all"), vec![
+			"main".to_str(),
+			"topic".to_str(),
+			"origin/HEAD".to_str(),
+			"origin/x".to_str()
+		]);
 		git(root.path(), &["checkout", "--detach"]);
 		let mut detached = repository(root.path());
 		assert_eq!(native_current_branch(&mut detached, &stop).expect("detached"), None);
 		let unborn = tempfile::tempdir().expect("unborn root");
 		git(unborn.path(), &["init", "-b", "main"]);
 		let mut unborn = repository(unborn.path());
-		assert_eq!(native_current_branch(&mut unborn, &stop).expect("unborn").as_deref(), Some("main"));
+		assert_eq!(
+			native_current_branch(&mut unborn, &stop)
+				.expect("unborn")
+				.as_deref(),
+			Some("main")
+		);
 	}
 
 	#[test]
@@ -834,16 +873,38 @@ mod tests {
 		git(root.path(), &["remote", "add", "origin", "https://old.example/repo"]);
 		git(root.path(), &["config", "answer.value", "  value  "]);
 		let mut repo = repository(root.path());
-		assert_eq!(native_tags(&mut repo, &stop, "HEAD").expect("tags"), vec!["v2.0".to_str(), "v1.10".to_str(), "v1.9".to_str()]);
+		assert_eq!(native_tags(&mut repo, &stop, "HEAD").expect("tags"), vec![
+			"v2.0".to_str(),
+			"v1.10".to_str(),
+			"v1.9".to_str()
+		]);
 		assert_eq!(native_remotes(&mut repo, &stop).expect("remotes"), vec!["origin".to_str()]);
-		assert_eq!(native_remote_url(&mut repo, &stop, "origin").expect("url").as_deref(), Some("https://old.example/repo"));
+		assert_eq!(
+			native_remote_url(&mut repo, &stop, "origin")
+				.expect("url")
+				.as_deref(),
+			Some("https://old.example/repo")
+		);
 		assert_eq!(native_remote_url(&mut repo, &stop, "missing").expect("missing url"), None);
-		assert_eq!(native_config_get(&mut repo, &stop, "answer.value").expect("config").as_deref(), Some("value"));
-		assert_eq!(native_config_get(&mut repo, &stop, "missing.value").expect("missing config"), None);
-		assert_eq!(native_workdir_prefix(&mut repo, &stop).expect("root prefix"), None);
+		assert_eq!(
+			native_config_get(&mut repo, &stop, "answer.value")
+				.expect("config")
+				.as_deref(),
+			Some("value")
+		);
+		assert_eq!(
+			native_config_get(&mut repo, &stop, "missing.value").expect("missing config"),
+			None
+		);
+		assert_eq!(native_workdir_prefix(&mut repo, &stop, root.path()).expect("root prefix"), None);
 		fs::create_dir(root.path().join("nested")).expect("nested");
 		let mut nested = repository(&root.path().join("nested"));
-		assert_eq!(native_workdir_prefix(&mut nested, &stop).expect("nested prefix").as_deref(), Some("nested/"));
+		assert_eq!(
+			native_workdir_prefix(&mut nested, &stop, &root.path().join("nested"))
+				.expect("nested prefix")
+				.as_deref(),
+			Some("nested/")
+		);
 	}
 
 	#[test]

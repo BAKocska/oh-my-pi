@@ -36,7 +36,9 @@ impl GitPath {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommitMetadata {
 	/// Full object ID.
-	pub commit:       Str,
+	pub hash:         Str,
+	/// Full object IDs of this commit's parents, in commit order.
+	pub parents:      Vec<Str>,
 	/// Author name.
 	pub author_name:  Str,
 	/// Author email.
@@ -84,7 +86,20 @@ impl GitQuery {
 		Ok(output.stdout)
 	}
 
-	/// Lists tracked files in-process via gitoxide, falling back to `git ls-files -z`.
+	/// Reads exact blob bytes from any `git show` object spec.
+	///
+	/// Examples include `HEAD:path`, `<object-id>:path`, and `:0:path`.
+	pub async fn show_path(
+		&self,
+		cwd: &Path,
+		spec: &str,
+		cancel: &CancellationToken,
+	) -> Result<Bytes, CommandError> {
+		self.bytes(cwd, &["show", spec], cancel).await
+	}
+
+	/// Lists tracked files in-process via gitoxide, falling back to `git
+	/// ls-files -z`.
 	pub async fn tracked(
 		&self,
 		cwd: &Path,
@@ -127,7 +142,10 @@ impl GitQuery {
 		cancel: &CancellationToken,
 	) -> Result<Vec<GitPath>, CommandError> {
 		let tree_owned = tree.to_owned();
-		let paths_owned = paths.iter().map(|path| (*path).to_owned()).collect::<Vec<_>>();
+		let paths_owned = paths
+			.iter()
+			.map(|path| (*path).to_owned())
+			.collect::<Vec<_>>();
 		match native::with_repository(cwd, cancel, move |repository, stop| {
 			native_tree(repository, stop, &tree_owned, &paths_owned)
 		})
@@ -147,7 +165,8 @@ impl GitQuery {
 	}
 
 	/// Lists tracked gitlinks and initialized nested submodules in-process via
-	/// gitoxide, falling back to `git ls-files --stage -z` and `git submodule foreach`.
+	/// gitoxide, falling back to `git ls-files --stage -z` and `git submodule
+	/// foreach`.
 	pub async fn submodules(
 		&self,
 		cwd: &Path,
@@ -158,7 +177,9 @@ impl GitQuery {
 			Err(error) if error.is_cancelled() => return Err(GitRunError::Cancelled.into()),
 			Err(error) => tracing::debug!(%error, "in-process Git read fell back to system Git"),
 		}
-		let bytes = self.bytes(cwd, &["ls-files", "--stage", "-z"], cancel).await?;
+		let bytes = self
+			.bytes(cwd, &["ls-files", "--stage", "-z"], cancel)
+			.await?;
 		let mut paths = Vec::new();
 		for entry in bytes
 			.split(|byte| *byte == 0)
@@ -173,13 +194,7 @@ impl GitQuery {
 		let nested = self
 			.bytes(
 				cwd,
-				&[
-					"submodule",
-					"foreach",
-					"--recursive",
-					"--quiet",
-					"printf '%s\\0' \"$displaypath\"",
-				],
+				&["submodule", "foreach", "--recursive", "--quiet", "printf '%s\\0' \"$displaypath\""],
 				cancel,
 			)
 			.await?;
@@ -262,7 +277,11 @@ impl GitQuery {
 			Err(error) => tracing::debug!(%error, "in-process Git read fell back to system Git"),
 		}
 		let range = format!("{base}..{head}");
-		parse_lines(self.bytes(cwd, &["rev-list", "--reverse", range.as_str()], cancel).await?)
+		parse_lines(
+			self
+				.bytes(cwd, &["rev-list", "--reverse", range.as_str()], cancel)
+				.await?,
+		)
 	}
 
 	/// Lists commits touching one literal path in-process via gitoxide, falling
@@ -294,8 +313,9 @@ impl GitQuery {
 		)
 	}
 
-	/// Reads author, date, and complete body metadata in-process via gitoxide,
-	/// falling back to `git show -s --format=%H%x00%an%x00%ae%x00%aI%x00%B%x00 rev`.
+	/// Reads identity, parents, author, date, and complete message body metadata
+	/// in-process via gitoxide, falling back to `git show -s
+	/// --format=%H%x00%P%x00%an%x00%ae%x00%aI%x00%B rev`.
 	pub async fn commit_metadata(
 		&self,
 		cwd: &Path,
@@ -315,16 +335,11 @@ impl GitQuery {
 		let bytes = self
 			.bytes(
 				cwd,
-				&[
-					"show",
-					"-s",
-					"--format=%H%x00%an%x00%ae%x00%aI%x00%B%x00",
-					revision,
-				],
+				&["show", "-s", "--format=%H%x00%P%x00%an%x00%ae%x00%aI%x00%B", revision],
 				cancel,
 			)
 			.await?;
-		let mut fields = bytes.split(|byte| *byte == 0);
+		let mut fields = bytes.splitn(6, |byte| *byte == 0);
 		let mut next = || -> Result<Str, CommandError> {
 			let field = fields.next().ok_or(CommandError::NonUtf8)?;
 			str::from_utf8(field)
@@ -332,15 +347,16 @@ impl GitQuery {
 				.map_err(|_| CommandError::NonUtf8)
 		};
 		let metadata = CommitMetadata {
-			commit:       next()?,
+			hash:         next()?,
+			parents:      next()?
+				.split_ascii_whitespace()
+				.map(|parent| parent.to_str())
+				.collect(),
 			author_name:  next()?,
 			author_email: next()?,
 			author_date:  next()?,
 			body:         next()?,
 		};
-		if fields.any(|field| !field.is_empty() && field != b"\n") {
-			return Err(CommandError::NonUtf8);
-		}
 		Ok(metadata)
 	}
 }
@@ -397,14 +413,19 @@ fn native_tree(
 		.peel_to_tree()
 		.map_err(native::op_error)?;
 	let mut recorder = gix::traverse::tree::Recorder::default();
-	tree.traverse().depthfirst(&mut recorder).map_err(native::op_error)?;
+	tree
+		.traverse()
+		.depthfirst(&mut recorder)
+		.map_err(native::op_error)?;
 	let pathspecs = pathspecs.iter().map(String::as_bytes).collect::<Vec<_>>();
 	let mut paths = Vec::with_capacity(recorder.records.len());
 	for entry in recorder.records {
 		check_cancelled(stop)?;
 		if !entry.mode.is_tree()
 			&& (pathspecs.is_empty()
-				|| pathspecs.iter().any(|pathspec| literal_pathspec_matches(entry.filepath.as_ref(), pathspec)))
+				|| pathspecs
+					.iter()
+					.any(|pathspec| literal_pathspec_matches(entry.filepath.as_ref(), pathspec)))
 		{
 			paths.push(GitPath::from_bytes(entry.filepath.as_ref()));
 		}
@@ -438,7 +459,8 @@ fn native_submodules_in(
 			continue;
 		}
 		let local = entry.path(&index);
-		let mut path = Vec::with_capacity(prefix.len() + local.len() + usize::from(!prefix.is_empty()));
+		let mut path =
+			Vec::with_capacity(prefix.len() + local.len() + usize::from(!prefix.is_empty()));
 		if !prefix.is_empty() {
 			path.extend_from_slice(prefix);
 			path.push(b'/');
@@ -486,7 +508,10 @@ fn native_log_subjects(
 	let mut subjects = Vec::with_capacity(count);
 	for info in walk {
 		check_cancelled(stop)?;
-		let commit = info.map_err(native::op_error)?.object().map_err(native::op_error)?;
+		let commit = info
+			.map_err(native::op_error)?
+			.object()
+			.map_err(native::op_error)?;
 		let decoded = commit.decode().map_err(native::op_error)?;
 		let summary = decoded.message().summary();
 		let summary = str::from_utf8(summary.as_ref()).map_err(native::op_error)?;
@@ -538,8 +563,12 @@ fn native_rev_list_range(
 	base: &str,
 	head: &str,
 ) -> Result<Vec<Str>, NativeError> {
-	let base = repository.rev_parse_single(base).map_err(native::op_error)?;
-	let head = repository.rev_parse_single(head).map_err(native::op_error)?;
+	let base = repository
+		.rev_parse_single(base)
+		.map_err(native::op_error)?;
+	let head = repository
+		.rev_parse_single(head)
+		.map_err(native::op_error)?;
 	let walk = repository
 		.rev_walk([head.detach()])
 		.with_hidden([base.detach()])
@@ -565,7 +594,10 @@ fn native_rev_list_touching(
 	if limit == 0 {
 		return Ok(Vec::new());
 	}
-	let head = repository.rev_parse_single(reference).map_err(native::op_error)?.detach();
+	let head = repository
+		.rev_parse_single(reference)
+		.map_err(native::op_error)?
+		.detach();
 	let path = Path::new(path);
 	let mut frontier = BinaryHeap::new();
 	frontier.push((commit_seconds(repository, head)?, head));
@@ -577,7 +609,10 @@ fn native_rev_list_touching(
 			continue;
 		}
 		let commit = repository.find_commit(id).map_err(native::op_error)?;
-		let parents = commit.parent_ids().map(|parent| parent.detach()).collect::<Vec<_>>();
+		let parents = commit
+			.parent_ids()
+			.map(|parent| parent.detach())
+			.collect::<Vec<_>>();
 		let current = tree_entry_id(&commit, path)?;
 		if parents.is_empty() {
 			if current.is_some() {
@@ -623,8 +658,12 @@ fn native_commit_metadata(
 		.map_err(native::op_error)?;
 	let decoded = commit.decode().map_err(native::op_error)?;
 	let author = decoded.author().map_err(native::op_error)?;
-	let author_name = str::from_utf8(author.name).map_err(native::op_error)?.to_str();
-	let author_email = str::from_utf8(author.email).map_err(native::op_error)?.to_str();
+	let author_name = str::from_utf8(author.name)
+		.map_err(native::op_error)?
+		.to_str();
+	let author_email = str::from_utf8(author.email)
+		.map_err(native::op_error)?
+		.to_str();
 	let author_date = author
 		.time()
 		.map_err(native::op_error)?
@@ -635,7 +674,11 @@ fn native_commit_metadata(
 		.map_err(native::op_error)?
 		.to_str();
 	Ok(CommitMetadata {
-		commit: format!("{}", commit.id()).to_str(),
+		hash: format!("{}", commit.id()).to_str(),
+		parents: commit
+			.parent_ids()
+			.map(|parent| format!("{}", parent.detach()).to_str())
+			.collect(),
 		author_name,
 		author_email,
 		author_date,
@@ -776,10 +819,12 @@ mod tests {
 			vec![b"untracked-a".as_slice(), b"untracked-z"]
 		);
 		let head = repository.head_id().expect("head");
-		fixture_git(
-			fixture.path(),
-			&["update-index", "--add", "--cacheinfo", &format!("160000,{},submodule", head)],
-		);
+		fixture_git(fixture.path(), &[
+			"update-index",
+			"--add",
+			"--cacheinfo",
+			&format!("160000,{},submodule", head),
+		]);
 		assert_eq!(
 			native_submodules(&mut repository, &stop)
 				.expect("submodules")
@@ -835,21 +880,25 @@ mod tests {
 		fixture_git(fixture.path(), &["commit", "-m", "third subject", "-m", "body line"]);
 		let mut repository = repository(fixture.path());
 		let stop = AtomicBool::new(false);
-		assert_eq!(
-			native_log_subjects(&mut repository, &stop, 2).expect("subjects"),
-			vec!["third subject".to_str(), "second subject".to_str()]
-		);
+		assert_eq!(native_log_subjects(&mut repository, &stop, 2).expect("subjects"), vec![
+			"third subject".to_str(),
+			"second subject".to_str()
+		]);
 		let onelines = native_log_onelines(&mut repository, &stop, 1).expect("oneline");
 		let (short, subject) = onelines[0].split_once(' ').expect("short sha and subject");
 		assert!(short.len() >= 7);
 		assert_eq!(subject, "third subject");
 		assert_eq!(
-			native_rev_list_range(&mut repository, &stop, &first, "HEAD").expect("range").len(),
+			native_rev_list_range(&mut repository, &stop, &first, "HEAD")
+				.expect("range")
+				.len(),
 			2
 		);
-		assert!(native_rev_list_range(&mut repository, &stop, "HEAD", "HEAD")
-			.expect("empty range")
-			.is_empty());
+		assert!(
+			native_rev_list_range(&mut repository, &stop, "HEAD", "HEAD")
+				.expect("empty range")
+				.is_empty()
+		);
 		assert_eq!(
 			native_rev_list_touching(&mut repository, &stop, "HEAD", "watched", 10)
 				.expect("touching")

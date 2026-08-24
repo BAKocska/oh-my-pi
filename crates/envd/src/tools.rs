@@ -6,8 +6,10 @@ use std::{
 	env::consts,
 	future::Future,
 	path::{Path, PathBuf},
-	sync::{Arc, LazyLock},
-	sync::atomic::{AtomicU64, Ordering},
+	sync::{
+		Arc, LazyLock,
+		atomic::{AtomicU64, Ordering},
+	},
 	time,
 };
 
@@ -55,7 +57,7 @@ use omp_tools::{
 	},
 	register_builtin_renderers,
 	shell::TimeoutBounds,
-	staging::PreviewRegistry,
+	staging::StagedProposalRegistry,
 };
 use parking_lot::{Mutex, RwLock};
 use serde_json::{Map as JsonMap, Value as JsonValue, json};
@@ -76,7 +78,8 @@ use super::{
 		CallbackConcurrency, ExtensionManifest,
 		control::{
 			ControlAuthority, ControlAuthorityFactory, ControlCompositionError,
-			ControlConnectionIdentity, ControlDispatch, ControlEffect, ControlInvocationAuthority, ControlProtocolError, ControlRequestContext,
+			ControlConnectionIdentity, ControlDispatch, ControlEffect, ControlInvocationAuthority,
+			ControlProtocolError, ControlRequestContext,
 		},
 		dispatch::{CallbackDispatcher, EventDeadline, NestedCallbackDispatcher},
 	},
@@ -119,7 +122,7 @@ pub struct RegistryBridges {
 	pub dynamic_tools:       Vec<DynamicTool>,
 	/// Internal-URL resolvers installed into the read resolver table.
 	pub url_resolvers:       Vec<Arc<dyn ContentResolver>>,
-	/// Campaign/goal authority backing the `goal` tool.
+	/// Regime/goal authority backing the `goal` tool.
 	pub goal_control:        Option<Arc<dyn GoalAuthority>>,
 	/// Auxiliary inference used by workspace search and media tools.
 	pub search:              Option<Arc<dyn SearchInference>>,
@@ -1041,23 +1044,23 @@ impl ConsoleUsageFetcher for ExtensionUsageFetcher {
 					operation: sf!("omp.hooks.dispatch"),
 					arguments,
 					authority: ControlInvocationAuthority {
-						invocation: sf!("provider-usage:{}:{id}", self.identity.host_generation),
-						phase: InvocationPhase::EffectsAuthorized,
-						session: self.session.clone(),
-						turn: None,
-						event: Some(sf!("provider_usage")),
-						call: None,
-						device: None,
-						effects: Box::new([]),
-						place_kind: sf!("host"),
-						lifecycle: LifecyclePhase::Active,
-						roots: Box::new([]),
-						remote: false,
-						has_ui: false,
-						headless: true,
-						settings: JsonMap::new(),
-						secret_settings: Box::new([]),
-						data: None,
+						invocation:        sf!("provider-usage:{}:{id}", self.identity.host_generation),
+						phase:             InvocationPhase::EffectsAuthorized,
+						session:           self.session.clone(),
+						turn:              None,
+						event:             Some(sf!("provider_usage")),
+						call:              None,
+						device:            None,
+						effects:           Box::new([]),
+						place_kind:        sf!("host"),
+						lifecycle:         LifecyclePhase::Active,
+						roots:             Box::new([]),
+						remote:            false,
+						has_ui:            false,
+						headless:          true,
+						settings:          JsonMap::new(),
+						secret_settings:   Box::new([]),
+						data:              None,
 						direct_filesystem: None,
 					},
 					policy: self.concurrency,
@@ -1090,7 +1093,10 @@ fn decode_extension_usage(
 		.collect::<Result<Vec<_>, _>>()?;
 	Ok(ConsoleUsageObservation {
 		account_meta: UsageAccountMetadata::default(),
-		plan: report.get("plan").and_then(JsonValue::as_str).map(Str::from),
+		plan: report
+			.get("plan")
+			.and_then(JsonValue::as_str)
+			.map(Str::from),
 		source_label: Some(sf!("extension")),
 		notes: Box::new([]),
 		reset_credits: None,
@@ -1136,7 +1142,12 @@ fn decode_extension_usage_window(
 			.map(Str::from)
 			.ok_or(UsageFetchError::Protocol)?,
 		kind: UsageWindowKind::Quota,
-		dimension: Str::from(window.get("unit").and_then(JsonValue::as_str).unwrap_or("usage")),
+		dimension: Str::from(
+			window
+				.get("unit")
+				.and_then(JsonValue::as_str)
+				.unwrap_or("usage"),
+		),
 		label: None,
 		scope: None,
 		amount: UsageAmount { unit, consumed, remaining, limit },
@@ -1162,11 +1173,11 @@ fn usage_registration_id(subscription: &HookSubscription) -> Str {
 
 #[derive(Clone)]
 pub struct HookControlFactory {
-	registries:    Arc<RegistryControlFactory>,
-	dispatcher:    Arc<dyn CallbackDispatcher>,
-	callbacks:     Arc<NestedCallbackDispatcher>,
-	policies:      Arc<RwLock<BTreeMap<Str, HookEventPolicy>>>,
-	subscriptions: Arc<RwLock<BTreeMap<ControlConnectionKey, Vec<HookSubscription>>>>,
+	registries:     Arc<RegistryControlFactory>,
+	dispatcher:     Arc<dyn CallbackDispatcher>,
+	callbacks:      Arc<NestedCallbackDispatcher>,
+	policies:       Arc<RwLock<BTreeMap<Str, HookEventPolicy>>>,
+	subscriptions:  Arc<RwLock<BTreeMap<ControlConnectionKey, Vec<HookSubscription>>>>,
 	usage_fetchers: UsageFetcherRegistry,
 }
 
@@ -1186,6 +1197,7 @@ impl HookControlFactory {
 			usage_fetchers: UsageFetcherRegistry::default(),
 		})
 	}
+
 	/// Returns the shared runtime provider usage registry.
 	pub fn usage_fetchers(&self) -> UsageFetcherRegistry {
 		self.usage_fetchers.clone()
@@ -1268,14 +1280,14 @@ impl HookControlFactory {
 				fetchers.register_runtime(
 					usage_registration_id(row),
 					Arc::new(ExtensionUsageFetcher {
-						provider: ProviderId::from(provider.clone()),
-						identity: Arc::clone(&row.identity),
-						session: session.clone(),
-						dispatcher: Arc::clone(&self.dispatcher),
-						callback: row.name.clone(),
+						provider:    ProviderId::from(provider.clone()),
+						identity:    Arc::clone(&row.identity),
+						session:     session.clone(),
+						dispatcher:  Arc::clone(&self.dispatcher),
+						callback:    row.name.clone(),
 						concurrency: row.concurrency,
-						timeout: row.timeout.unwrap_or(row.event_policy.timeout),
-						next_id: Arc::new(AtomicU64::new(1)),
+						timeout:     row.timeout.unwrap_or(row.event_policy.timeout),
+						next_id:     Arc::new(AtomicU64::new(1)),
 					}),
 				);
 			}
@@ -1616,7 +1628,7 @@ pub trait ContentResolver: Send + Sync + 'static {
 	}
 }
 
-/// Object-safe campaign authority supplied by composition.
+/// Object-safe regime authority supplied by composition.
 ///
 /// This exists because [`goal::GoalControl`] requires `Clone` and
 /// uses return-position `impl Future`, so that tools trait is not
@@ -1768,7 +1780,7 @@ pub(crate) fn production_registry<
 		Arc<ReflectionBridgeHost>,
 		EvalSessionControl,
 		AgentCheckpointControl,
-		PreviewRegistry,
+		StagedProposalRegistry,
 		Arc<ResolverTable<UrlResolver>>,
 		Arc<SearchBridgeHost>,
 		Arc<GithubCredentialBridge>,
@@ -1789,7 +1801,7 @@ pub(crate) fn production_registry<
 		ask_presenter,
 		content,
 	} = bridges;
-	let previews = PreviewRegistry::new();
+	let previews = StagedProposalRegistry::new();
 	let ask_presenter = PresenterSlot::new(
 		ask_presenter.unwrap_or_else(|| Arc::new(omp_tools::ask::HeadlessPresenter)),
 	);
@@ -2021,7 +2033,10 @@ pub(crate) fn production_registry<
 				.unwrap_or_else(|| sf!("unknown")),
 			..omp_tools::edit::observer::EditBlackboxConfig::default()
 		},
-		tool_settings.edit_auto_repair.then_some(edit_repair).flatten(),
+		tool_settings
+			.edit_auto_repair
+			.then_some(edit_repair)
+			.flatten(),
 	);
 	let mut hashline_edit = Some(omp_tools::edit::tool_with_observer(
 		documents.clone(),
@@ -2358,8 +2373,8 @@ pub(crate) fn production_registry<
 		}
 		Some(flatten_slots(slots).map_err(|collision| {
 			EnvdError::WorkerDeclaration(Str::from(format!(
-				"tool_only slot {} is claimed by both {} and {}",
-				collision.slot, collision.first, collision.second
+				"tool_only slot {} is owned by both {} and {}",
+				collision.slot, collision.existing_owner, collision.conflicting_owner
 			)))
 		})?)
 	} else {
@@ -2391,8 +2406,8 @@ pub(crate) fn production_registry<
 	}
 	let registry = Arc::new(registry);
 	catalog
-		.bind(Arc::clone(&registry))
-		.map_err(|_| EnvdError::WorkerDeclaration(sf!("dynamic device catalog bound twice")))?;
+		.install_registry(Arc::clone(&registry))
+		.map_err(|_| EnvdError::WorkerDeclaration(sf!("dynamic device catalog installed twice")))?;
 	eval_host
 		.bind_registry(Arc::clone(&registry))
 		.map_err(|error| EnvdError::Eval(Str::from(error.to_string())))?;
@@ -2517,10 +2532,10 @@ fn checkpoint_fault(error: control::ControlError) -> omp_tools::checkpoint::Chec
 		),
 		control::ControlError::Closed
 		| control::ControlError::Journal(_)
-		| control::ControlError::CampaignEngage(_)
-		| control::ControlError::CampaignDisengage(_)
-		| control::ControlError::CampaignArbiter(_)
-		| control::ControlError::UnknownCoreCampaign { .. } => {
+		| control::ControlError::RegimeStart(_)
+		| control::ControlError::RegimeStop(_)
+		| control::ControlError::RegimeArbiter(_)
+		| control::ControlError::UnknownCoreRegime { .. } => {
 			(checkpoint::FaultCode::Control, sf!("active Agent CONTROL checkpoint operation failed"))
 		},
 	};

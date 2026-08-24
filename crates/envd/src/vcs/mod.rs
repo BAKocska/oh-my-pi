@@ -61,8 +61,8 @@ pub enum SnapshotError {
 	Command(#[from] CommandError),
 }
 
-/// Captures one complete immutable repository snapshot asynchronously without probing system Git for
-/// ordinary file-ref repositories.
+/// Captures one complete immutable repository snapshot asynchronously without
+/// probing system Git for ordinary file-ref repositories.
 pub async fn snapshot(
 	root: &Path,
 	runner: &GitRunner,
@@ -78,21 +78,26 @@ pub async fn snapshot(
 			status_counts: StatusCounts::default(),
 		});
 	};
-	if refs::is_reftable(&repository).await? && !system_git_available(runner, &repository, cancel).await? {
+	if refs::is_reftable(&repository).await?
+		&& !system_git_available(runner, &repository, cancel).await?
+	{
 		return Ok(git_unavailable_snapshot(&repository));
 	}
 	let head = refs::resolve_head(&repository, runner, cancel).await?;
 	let status_counts = if repository.bare {
 		StatusCounts::default()
 	} else {
-		match GitDiff::new(runner.clone()).status_counts(&repository.worktree_root, cancel).await {
+		match GitDiff::new(runner.clone())
+			.status_counts(&repository.worktree_root, cancel)
+			.await
+		{
 			Ok(counts) => counts,
 			Err(error) if system_git_missing_error(&error) => {
 				if !system_git_available(runner, &repository, cancel).await? {
 					return Ok(git_unavailable_snapshot(&repository));
 				}
 				return Err(error.into());
-			}
+			},
 			Err(error) => return Err(error.into()),
 		}
 	};

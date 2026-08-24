@@ -1,7 +1,7 @@
 //! Extension declaration, verification, and activation lifecycle.
 
 use std::{
-	collections::{BTreeMap, BTreeSet},
+	collections::BTreeSet,
 	future::Future,
 	sync::{
 		Arc,
@@ -11,16 +11,13 @@ use std::{
 };
 
 use flume::Receiver;
-use omp_agent::{HookPhase, MailboxSender, OnFailure, device_availability_interrupt};
+use omp_agent::{HookPhase, MailboxSender, device_availability_interrupt};
 pub use omp_core::{ActivateReason, LifecyclePhase, Principal, RestartReason, sf};
 use omp_core::{InvocationPhase, Provenance, Str};
 use omp_ext::config::StaticDeclarations;
 use omp_proto::{
 	thread::v1::{Item, Message, Part, Role, item, part},
-	toolhost::v1::{
-		CampaignDeclare, CampaignManifest, CampaignReaction, CampaignScope, CampaignVerdictKind,
-		SetAvailability,
-	},
+	toolhost::v1::{RegimeDeclare, RegimeLifetime, RegimeManifest, SetAvailability},
 	ui::v1::{UiEffect, UiRequest},
 };
 use omp_tool::{AvailabilityDelta, Registry};
@@ -725,72 +722,89 @@ pub enum LifecycleError {
 	/// The frozen runtime registry differed from the manifest.
 	#[error("frozen declarations differ from the manifest")]
 	Drift(DeclarationDrift),
-	/// A campaign declaration violated the mode-slot contract.
+	/// A regime declaration violated the mode-slot contract.
 	#[error(transparent)]
-	CampaignManifest(#[from] CampaignManifestError),
+	RegimeManifest(#[from] RegimeManifestError),
 	/// An activation handler failed.
 	#[error("extension activation failed: {0}")]
 	Activation(Str),
 }
 
-/// Structured rejection for a campaign declaration that can silently act as a
+/// Structured rejection for a regime declaration that can silently act as a
 /// mode.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
-pub enum CampaignManifestError {
-	/// A Session campaign binds a mode-affecting surface without owning or
-	/// composing the mode slot.
-	#[error(
-		"session campaign {campaign} binds {binding} without claiming mode or declaring composition"
-	)]
-	ModeClaimRequired {
-		/// Campaign specification identifier.
-		campaign: Str,
-		/// Mode-affecting binding that triggered the rejection.
-		binding:  Str,
+pub enum RegimeManifestError {
+	/// A Session regime sets a mode-affecting surface without owning the
+	/// mode resource.
+	#[error("session regime {regime} sets {setting} without owning mode")]
+	ModeOwnershipRequired {
+		/// Regime specification identifier.
+		regime:  Str,
+		/// Mode-affecting setting that triggered the rejection.
+		setting: Str,
+	},
+	/// A declaration's scoped settings were not a canonical JSON object.
+	#[error("regime {regime} sets must encode a JSON object")]
+	InvalidSettings {
+		/// Regime specification identifier.
+		regime: Str,
 	},
 }
 
 /// Declarations retained by the extension host from DECLARE through FREEZE.
 #[derive(Clone, Debug, Default)]
-pub struct CampaignDeclarationTable {
-	manifests: Box<[CampaignManifest]>,
+pub struct RegimeDeclarationTable {
+	manifests: Box<[RegimeManifest]>,
 }
 
-impl CampaignDeclarationTable {
+impl RegimeDeclarationTable {
 	/// Validates and retains one worker declaration table.
-	pub fn declare(declaration: CampaignDeclare) -> Result<Self, CampaignManifestError> {
-		validate_campaign_manifests(&declaration.manifests)?;
+	pub fn declare(declaration: RegimeDeclare) -> Result<Self, RegimeManifestError> {
+		validate_regime_manifests(&declaration.manifests)?;
 		Ok(Self { manifests: declaration.manifests.into_boxed_slice() })
 	}
 
-	/// Revalidates the sealed table at FREEZE before any campaign may activate.
-	pub fn freeze(&self) -> Result<(), CampaignManifestError> {
-		validate_campaign_manifests(&self.manifests)
+	/// Revalidates the sealed table at FREEZE before any regime may activate.
+	pub fn freeze(&self) -> Result<(), RegimeManifestError> {
+		validate_regime_manifests(&self.manifests)
 	}
 
 	/// Returns the exact declaration order supplied by the worker.
-	pub fn manifests(&self) -> &[CampaignManifest] {
+	pub fn manifests(&self) -> &[RegimeManifest] {
 		&self.manifests
 	}
 }
 
-/// Rejects Session campaigns that stealth-bind the model or toolset.
-pub fn validate_campaign_manifests(
-	manifests: &[CampaignManifest],
-) -> Result<(), CampaignManifestError> {
+/// Rejects session regimes that set the model or toolset without owning `mode`.
+pub fn validate_regime_manifests(manifests: &[RegimeManifest]) -> Result<(), RegimeManifestError> {
 	for manifest in manifests {
-		if CampaignScope::try_from(manifest.scope) != Ok(CampaignScope::Session)
-			|| manifest.composes
-			|| manifest.claims.iter().any(|claim| claim == "mode")
+		if RegimeLifetime::try_from(manifest.lifetime) != Ok(RegimeLifetime::Session)
+			|| manifest.owns.iter().any(|resource| resource == "mode")
 		{
 			continue;
 		}
-		if let Some(binding) = manifest.binds.iter().find(|binding| {
-			binding.eq_ignore_ascii_case("toolset") || binding.eq_ignore_ascii_case("model")
+		let sets = if manifest.sets.is_empty() {
+			None
+		} else {
+			Some(
+				serde_json::from_slice::<serde_json::Value>(&manifest.sets)
+					.ok()
+					.and_then(|sets| sets.as_object().cloned())
+					.ok_or_else(|| RegimeManifestError::InvalidSettings {
+						regime: Str::from(manifest.id.as_str()),
+					})?,
+			)
+		};
+		if let Some(setting) = sets.as_ref().and_then(|sets| {
+			sets.keys().find(|setting| {
+				setting.eq_ignore_ascii_case("toolset")
+					|| setting.eq_ignore_ascii_case("model")
+					|| setting.eq_ignore_ascii_case("model_route")
+			})
 		}) {
-			return Err(CampaignManifestError::ModeClaimRequired {
-				campaign: Str::from(manifest.id.as_str()),
-				binding:  Str::from(binding.as_str()),
+			return Err(RegimeManifestError::ModeOwnershipRequired {
+				regime:  Str::from(manifest.id.as_str()),
+				setting: Str::from(setting.as_str()),
 			});
 		}
 	}
@@ -943,8 +957,7 @@ impl ExtensionManifest {
 pub struct LifecycleMachine {
 	modules:             Box<[Str]>,
 	expected:            DeclarationSet,
-	campaigns:           CampaignDeclarationTable,
-	campaign_faults:     BTreeMap<Str, u8>,
+	regimes:             RegimeDeclarationTable,
 	activation_triggers: BTreeSet<ActivationTrigger>,
 	phase:               LifecyclePhase,
 	session_started_at:  SystemTime,
@@ -977,8 +990,7 @@ impl LifecycleMachine {
 		Self {
 			modules: modules.into_boxed_slice(),
 			expected,
-			campaigns: CampaignDeclarationTable::default(),
-			campaign_faults: BTreeMap::new(),
+			regimes: RegimeDeclarationTable::default(),
 			activation_triggers,
 			phase: LifecyclePhase::Declared,
 			session_started_at,
@@ -993,58 +1005,18 @@ impl LifecycleMachine {
 		self.phase
 	}
 
-	/// Accepts and validates the worker campaign table before FREEZE.
-	pub fn declare_campaigns(&mut self, declaration: CampaignDeclare) -> Result<(), LifecycleError> {
-		match CampaignDeclarationTable::declare(declaration) {
-			Ok(campaigns) => {
-				self.campaigns = campaigns;
+	/// Accepts and validates the worker regime table before FREEZE.
+	pub fn declare_regimes(&mut self, declaration: RegimeDeclare) -> Result<(), LifecycleError> {
+		match RegimeDeclarationTable::declare(declaration) {
+			Ok(regimes) => {
+				self.regimes = regimes;
 				Ok(())
 			},
 			Err(error) => {
 				self.phase = LifecyclePhase::Degraded;
-				Err(LifecycleError::CampaignManifest(error))
+				Err(LifecycleError::RegimeManifest(error))
 			},
 		}
-	}
-
-	/// Iterates over the resolved import order.
-	/// Resolves one failed extension callback through its declared hook policy.
-	///
-	/// The second fault in one engagement force-exhausts the lane and degrades
-	/// this extension generation.
-	pub fn campaign_failure(
-		&mut self,
-		engagement: &str,
-		campaign_rev: u32,
-		on_failure: OnFailure,
-	) -> CampaignReaction {
-		let faults = self
-			.campaign_faults
-			.entry(Str::new(engagement))
-			.and_modify(|faults| *faults = faults.saturating_add(1))
-			.or_insert(1);
-		let verdict = if *faults >= 2 {
-			self.phase = LifecyclePhase::Degraded;
-			CampaignVerdictKind::Exhausted
-		} else if on_failure == OnFailure::Deny {
-			CampaignVerdictKind::Deny
-		} else {
-			CampaignVerdictKind::Pass
-		};
-		CampaignReaction {
-			engagement_id: engagement.to_owned(),
-			campaign_rev,
-			verdict: verdict.into(),
-			verdict_payload: Default::default(),
-			step: None,
-			new_state: Default::default(),
-			props: None,
-		}
-	}
-
-	/// Clears transient fault accounting after one valid reaction.
-	pub fn campaign_reacted(&mut self, engagement: &str) {
-		self.campaign_faults.remove(engagement);
 	}
 
 	/// Iterates over the resolved import order.
@@ -1106,9 +1078,9 @@ impl LifecycleMachine {
 			self.phase = LifecyclePhase::Degraded;
 			return Err(LifecycleError::Drift(drift));
 		}
-		if let Err(error) = self.campaigns.freeze() {
+		if let Err(error) = self.regimes.freeze() {
 			self.phase = LifecyclePhase::Degraded;
-			return Err(LifecycleError::CampaignManifest(error));
+			return Err(LifecycleError::RegimeManifest(error));
 		}
 		if let Err(message) = host.freeze().await {
 			self.phase = LifecyclePhase::Degraded;
@@ -1138,32 +1110,36 @@ impl LifecycleMachine {
 mod tests {
 	use super::*;
 
-	fn core_campaign(
+	fn core_regime(
 		id: &str,
-		scope: CampaignScope,
-		claims: &[&str],
-		binds: &[&str],
-		composes: bool,
-	) -> CampaignManifest {
-		CampaignManifest {
+		lifetime: RegimeLifetime,
+		owns: &[&str],
+		sets: serde_json::Value,
+	) -> RegimeManifest {
+		RegimeManifest {
 			id: id.to_owned(),
-			scope: scope.into(),
-			claims: claims.iter().map(|value| (*value).to_owned()).collect(),
-			binds: binds.iter().map(|value| (*value).to_owned()).collect(),
-			composes,
+			lifetime: lifetime.into(),
+			owns: owns.iter().map(|value| (*value).to_owned()).collect(),
+			sets: serde_json::to_vec(&sets)
+				.expect("serialize regime settings")
+				.into(),
 			..Default::default()
 		}
 	}
 
 	#[test]
-	fn core_campaign_specs_cannot_declare_stealth_modes() {
-		let stealth =
-			core_campaign("stealth", CampaignScope::Session, &["worktree"], &["Toolset"], false);
+	fn core_regime_specs_cannot_declare_stealth_modes() {
+		let stealth = core_regime(
+			"stealth",
+			RegimeLifetime::Session,
+			&["worktree"],
+			serde_json::json!({"toolset": "coding"}),
+		);
 		assert_eq!(
-			validate_campaign_manifests(&[stealth]),
-			Err(CampaignManifestError::ModeClaimRequired {
-				campaign: Str::from("stealth"),
-				binding:  Str::from("Toolset"),
+			validate_regime_manifests(&[stealth]),
+			Err(RegimeManifestError::ModeOwnershipRequired {
+				regime:  Str::from("stealth"),
+				setting: Str::from("toolset"),
 			})
 		);
 		let mut lifecycle = LifecycleMachine::new(
@@ -1175,62 +1151,48 @@ mod tests {
 			1,
 		);
 		let error = lifecycle
-			.declare_campaigns(CampaignDeclare {
-				manifests: vec![core_campaign(
+			.declare_regimes(RegimeDeclare {
+				manifests: vec![core_regime(
 					"stealth",
-					CampaignScope::Session,
+					RegimeLifetime::Session,
 					&[],
-					&["Model"],
-					false,
+					serde_json::json!({"model": "fast"}),
 				)],
 				..Default::default()
 			})
 			.expect_err("stealth mode must fail at declare");
 		assert!(matches!(
 			error,
-			LifecycleError::CampaignManifest(CampaignManifestError::ModeClaimRequired { .. })
+			LifecycleError::RegimeManifest(RegimeManifestError::ModeOwnershipRequired { .. })
 		));
 		assert_eq!(lifecycle.phase(), LifecyclePhase::Degraded);
 	}
 
 	#[test]
-	fn campaign_faults_apply_hook_policy_and_degrade_on_second_fault() {
-		let mut lifecycle = LifecycleMachine::new(
-			"core",
-			[],
-			DeclarationSet::default(),
-			BTreeSet::new(),
-			SystemTime::UNIX_EPOCH,
-			1,
-		);
-		let deferred = lifecycle.campaign_failure("eng-1", 1, OnFailure::Defer);
-		assert_eq!(deferred.verdict, CampaignVerdictKind::Pass as i32);
-		assert_eq!(lifecycle.phase(), LifecyclePhase::Declared);
-		let exhausted = lifecycle.campaign_failure("eng-1", 1, OnFailure::Deny);
-		assert_eq!(exhausted.verdict, CampaignVerdictKind::Exhausted as i32);
-		assert_eq!(lifecycle.phase(), LifecyclePhase::Degraded);
-
-		lifecycle.campaign_reacted("eng-1");
-		let denied = lifecycle.campaign_failure("eng-1", 1, OnFailure::Deny);
-		assert_eq!(denied.verdict, CampaignVerdictKind::Deny as i32);
-	}
-
-	#[test]
-	fn core_campaign_specs_may_own_compose_or_avoid_the_mode_slot() {
+	fn core_regime_specs_may_own_or_avoid_the_mode_resource() {
 		let manifests = [
-			core_campaign("plan", CampaignScope::Session, &["mode", "worktree"], &["Toolset"], false),
-			core_campaign("code-mode", CampaignScope::Session, &[], &["Model"], true),
-			core_campaign("turn-route", CampaignScope::Run, &[], &["Model"], false),
-			core_campaign("prompt-notice", CampaignScope::Session, &[], &["PromptSlot"], false),
+			core_regime(
+				"plan",
+				RegimeLifetime::Session,
+				&["mode", "worktree"],
+				serde_json::json!({"toolset": "planning"}),
+			),
+			core_regime("turn-route", RegimeLifetime::Run, &[], serde_json::json!({"model": "fast"})),
+			core_regime(
+				"prompt-notice",
+				RegimeLifetime::Session,
+				&[],
+				serde_json::json!({"prompt_slot": "notice"}),
+			),
 		];
-		assert_eq!(validate_campaign_manifests(&manifests), Ok(()));
+		assert_eq!(validate_regime_manifests(&manifests), Ok(()));
 
-		let table = CampaignDeclarationTable::declare(CampaignDeclare {
+		let table = RegimeDeclarationTable::declare(RegimeDeclare {
 			manifests: manifests.into(),
 			..Default::default()
 		})
-		.expect("valid core campaign declarations");
-		assert_eq!(table.manifests().len(), 4);
+		.expect("valid core regime declarations");
+		assert_eq!(table.manifests().len(), 3);
 		assert_eq!(table.freeze(), Ok(()));
 	}
 }

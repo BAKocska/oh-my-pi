@@ -339,7 +339,7 @@ pub(super) fn git_environment() -> EnvironmentDelta {
 pub(super) fn command_source(binary: &str, argv: &[&str], read_only: bool) -> String {
 	let mut source = String::from("if command -v ");
 	push_shell_word(&mut source, binary);
-	source.push_str(" >/dev/null 2>&1; then exec ");
+	source.push_str(" >/dev/null 2>&1; then ");
 	push_shell_word(&mut source, binary);
 	for argument in ["-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false"] {
 		source.push(' ');

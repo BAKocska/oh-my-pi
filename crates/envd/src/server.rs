@@ -56,7 +56,7 @@ use omp_tools::{
 		resolver::{self as resolver, ResolverTable, ResourceCapability, ResourceCompletion},
 		selector::{self, ParsedUri},
 	},
-	staging::PreviewRegistry,
+	staging::StagedProposalRegistry,
 };
 use omp_walker::{
 	CompiledWalkGlob, DirectoryErrorMode, FileType, FollowLinks, WalkDetail, WalkFilter,
@@ -765,9 +765,9 @@ enum DeclaredExternalDomain {
 	Prompts,
 	Ui,
 	Telemetry,
-	Verdicts,
+	Jobs,
 	Provider,
-	Campaigns,
+	Regimes,
 	Services,
 }
 
@@ -804,9 +804,9 @@ impl DeclaredExternalDomain {
 				!declarations.telemetry.subscriptions.is_empty()
 					|| !declarations.telemetry.exports.is_empty()
 			},
-			Self::Verdicts => !declarations.ui.verdict_renderers.is_empty(),
+			Self::Jobs => !declarations.ui.verdict_renderers.is_empty(),
 			Self::Provider => !declarations.providers.is_empty(),
-			Self::Campaigns => !declarations.campaigns.is_empty(),
+			Self::Regimes => !declarations.regimes.is_empty(),
 			Self::Services => {
 				manifest.services.provides().next().is_some()
 					|| manifest.services.requires().next().is_some()
@@ -824,9 +824,9 @@ impl DeclaredExternalDomain {
 			Self::Prompts => "prompts",
 			Self::Ui => "ui",
 			Self::Telemetry => "telemetry",
-			Self::Verdicts => "verdicts",
+			Self::Jobs => "jobs",
 			Self::Provider => "provider",
-			Self::Campaigns => "campaigns",
+			Self::Regimes => "regimes",
 			Self::Services => "services",
 		}
 	}
@@ -844,9 +844,9 @@ impl DeclaredExternalDomain {
 			Self::Prompts => factories.prompts.clone(),
 			Self::Ui => factories.ui.clone(),
 			Self::Telemetry => factories.telemetry.clone(),
-			Self::Verdicts => factories.verdicts.clone(),
+			Self::Jobs => factories.jobs.clone(),
 			Self::Provider => factories.provider.clone(),
-			Self::Campaigns => factories.campaigns.clone(),
+			Self::Regimes => factories.regimes.clone(),
 			Self::Services => factories.services.clone(),
 		}
 	}
@@ -1720,9 +1720,9 @@ fn production_control_authorities(
 	let prompts = gated(DeclaredExternalDomain::Prompts);
 	let ui = gated(DeclaredExternalDomain::Ui);
 	let telemetry_owner = gated(DeclaredExternalDomain::Telemetry);
-	let verdicts = gated(DeclaredExternalDomain::Verdicts);
+	let jobs = gated(DeclaredExternalDomain::Jobs);
 	let provider_owner = gated(DeclaredExternalDomain::Provider);
-	let campaigns = gated(DeclaredExternalDomain::Campaigns);
+	let regimes = gated(DeclaredExternalDomain::Regimes);
 	let services = gated(DeclaredExternalDomain::Services);
 	let auxiliary: Arc<dyn ControlAuthorityFactory> = Arc::new(CompositeControlFactory {
 		owners: vec![Arc::clone(&envd), parameters, workers, direct_filesystem].into_boxed_slice(),
@@ -1736,8 +1736,8 @@ fn production_control_authorities(
 		credentials,
 	);
 	let policy = PolicyControlAuthorities::new(policy_owner, prompts);
-	let presentation = PresentationControlAuthorities::new(ui, telemetry_owner, verdicts);
-	let provider = ProviderControlAuthorities::new(provider_owner, campaigns, services);
+	let presentation = PresentationControlAuthorities::new(ui, telemetry_owner, jobs);
+	let provider = ProviderControlAuthorities::new(provider_owner, regimes, services);
 	let envd = EnvdControlAuthorities::new(
 		registry,
 		persistence,
@@ -1791,7 +1791,7 @@ pub struct EnvServer {
 	github_credentials:  Arc<GithubCredentialBridge>,
 	usage_fetchers:      omp_inference::operation::usage::UsageFetcherRegistry,
 	checkpoint_control:  AgentCheckpointControl,
-	previews:            PreviewRegistry,
+	previews:            StagedProposalRegistry,
 	sessions_index:      Arc<SessionIndex>,
 	journal_external:    ExternalJournalActor,
 	workers:             Arc<WorkerSupervisor>,
@@ -2101,7 +2101,7 @@ impl EnvServer {
 		github_credentials: Arc<GithubCredentialBridge>,
 		usage_fetchers: omp_inference::operation::usage::UsageFetcherRegistry,
 		checkpoint_control: AgentCheckpointControl,
-		previews: PreviewRegistry,
+		previews: StagedProposalRegistry,
 		sessions_index: Arc<SessionIndex>,
 		journal_external: ExternalJournalActor,
 		authority: Arc<AuthorityTable>,
@@ -2619,10 +2619,11 @@ impl EnvServer {
 	}
 
 	/// Returns the generation-fenced callback transport shared by provider,
-	/// campaign, presentation, and verdict backends.
+	/// regime, presentation, and job backends.
 	pub fn extension_callback_dispatcher(&self) -> Arc<dyn CallbackDispatcher> {
 		Arc::new(WeakExtensionCallbackDispatcher { supervisor: Arc::downgrade(&self.ext_hosts) })
 	}
+
 	/// Returns the shared extension and built-in provider usage registry.
 	pub fn usage_fetchers(&self) -> omp_inference::operation::usage::UsageFetcherRegistry {
 		self.usage_fetchers.clone()
@@ -2637,7 +2638,7 @@ impl EnvServer {
 		self.ext_hosts.control_manifest(identity)
 	}
 
-	/// Returns the full frozen runtime provider/campaign declaration projection
+	/// Returns the full frozen runtime provider/regime declaration projection
 	/// for an exact authenticated connection generation.
 	pub fn extension_registry_evidence(
 		&self,
@@ -2786,7 +2787,7 @@ impl EnvServer {
 		self.checkpoint_control.bind(id, sender.clone());
 		self
 			.previews
-			.bind_observer(staged_preview::observer(sender));
+			.install_activation_observer(staged_preview::observer(sender));
 		Ok(AgentControlBinding { server: Arc::clone(self), id })
 	}
 
@@ -2800,7 +2801,7 @@ impl EnvServer {
 	}
 
 	fn release_agent_control(&self, id: u64) {
-		self.previews.unbind_observer();
+		self.previews.remove_activation_observer();
 		self.ext_hosts.unbind_journal_runtime(id);
 		self.journal_external.unbind_agent(id);
 		self.checkpoint_control.unbind(id);
@@ -9747,8 +9748,9 @@ mod tests {
 			EvalSessionControl::default(),
 			Arc::new(SearchBridgeHost::new(None)),
 			Arc::new(GithubCredentialBridge::new()),
+			omp_inference::operation::usage::UsageFetcherRegistry::default(),
 			AgentCheckpointControl::default(),
-			PreviewRegistry::new(),
+			StagedProposalRegistry::new(),
 			sessions_index,
 			journal_external,
 			Arc::new(AuthorityTable::default()),

@@ -6,8 +6,12 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
 	commands::GitCommands,
-	diff::{self, GitDiff, LineCount, StatusCounts},
+	diff::{self, ChangeKind, GitDiff, LineCount, StatusCounts},
 	lock,
+	mutation::{
+		CommitOptions, DiffLineSelection, GitMutation, GitMutationConsumer, HunkSelection,
+		HunkSelector, LineRange, MutationOutcome, SelectionError,
+	},
 	query::GitQuery,
 	refs::{self, HeadInvalidations, HeadState},
 	repo::{self, RepositoryError},
@@ -327,6 +331,28 @@ fn vcs_parsers_preserve_porcelain_renames_binary_and_terminal_newlines() {
 		),
 		StatusCounts { staged: 2, unstaged: 0, untracked: 1 }
 	);
+	let entries = diff::parse_status_entries(
+		b"M  staged\0 R worktree-name\0worktree-old\0R  staged-name\0staged-old\0C  copied\0copy-source\0?? odd\nname\0UU conflict\0",
+	);
+	assert_eq!(entries.len(), 6);
+	assert_eq!(entries[0].staged, Some(ChangeKind::Modified));
+	assert_eq!(entries[1].worktree, Some(ChangeKind::Renamed));
+	assert_eq!(
+		entries[1].orig_path.as_ref().map(|path| path.as_bytes()),
+		Some(b"worktree-old".as_slice())
+	);
+	assert_eq!(entries[2].staged, Some(ChangeKind::Renamed));
+	assert_eq!(entries[2].path.as_bytes(), b"staged-name");
+	assert_eq!(entries[3].staged, Some(ChangeKind::Copied));
+	assert_eq!(
+		entries[3].orig_path.as_ref().map(|path| path.as_bytes()),
+		Some(b"copy-source".as_slice())
+	);
+	assert!(entries[4].untracked);
+	assert_eq!(entries[4].path.as_bytes(), b"odd\nname");
+	assert!(entries[5].conflicted);
+	assert_eq!(entries[5].staged, Some(ChangeKind::Unmerged));
+	assert_eq!(entries[5].worktree, Some(ChangeKind::Unmerged));
 
 	let numstat = diff::parse_numstat(Bytes::from_static(
 		b"3\t2\tplain\0-\t-\tbin\01\t0\t\0old name\0new name\0",
@@ -640,10 +666,40 @@ async fn vcs_commands_queries_and_diff_round_trip_real_repository_bytes() {
 			.len(),
 		1
 	);
+	assert_eq!(
+		query
+			.show_path(fixture.path(), "HEAD:seed.txt", &cancel)
+			.await
+			.unwrap(),
+		Bytes::from_static(b"seed\n")
+	);
+	let object_spec = format!("{head}:seed.txt");
+	assert_eq!(
+		query
+			.show_path(fixture.path(), &object_spec, &cancel)
+			.await
+			.unwrap(),
+		Bytes::from_static(b"seed\n")
+	);
+	assert_eq!(
+		query
+			.show_path(fixture.path(), ":0:seed.txt", &cancel)
+			.await
+			.unwrap(),
+		Bytes::from_static(b"seed\n")
+	);
+	assert!(
+		query
+			.show_path(fixture.path(), "HEAD:missing", &cancel)
+			.await
+			.is_err()
+	);
 	let metadata = query
 		.commit_metadata(fixture.path(), "HEAD", &cancel)
 		.await
 		.unwrap();
+	assert_eq!(metadata.hash.as_str(), head.as_str());
+	assert!(metadata.parents.is_empty());
 	assert_eq!(metadata.author_name.as_str(), "OMP Test");
 	assert!(metadata.body.as_str().starts_with("seed"));
 
@@ -653,6 +709,18 @@ async fn vcs_commands_queries_and_diff_round_trip_real_repository_bytes() {
 	assert!(counts.staged >= 2);
 	assert_eq!(counts.unstaged, 1);
 	assert_eq!(counts.untracked, 1);
+	let entries = diffs.status_entries(fixture.path(), &cancel).await.unwrap();
+	assert!(
+		entries
+			.iter()
+			.any(|entry| entry.path.as_bytes() == b"seed.txt"
+				&& entry.worktree == Some(ChangeKind::Modified))
+	);
+	assert!(
+		entries
+			.iter()
+			.any(|entry| entry.path.as_bytes() == b"untracked.bin" && entry.untracked)
+	);
 	let raw = diffs
 		.raw(fixture.path(), Default::default(), &[], &cancel)
 		.await
@@ -680,4 +748,275 @@ async fn vcs_commands_queries_and_diff_round_trip_real_repository_bytes() {
 		.await
 		.unwrap();
 	assert!(!diff::parse_numstat(numstat).unwrap().is_empty());
+}
+#[tokio::test]
+async fn interactive_mutations_cover_all_hunks_and_amend() {
+	let fixture = repository_fixture();
+	let repository = repo::discover(fixture.path()).await.unwrap().unwrap();
+	let runner = GitRunner::new(ExecHost::new());
+	let mutation = GitMutation::new(runner.clone(), repository, GitMutationConsumer::InteractiveGit);
+	let diffs = GitDiff::new(runner.clone());
+	let query = GitQuery::new(runner);
+	let cancel = CancellationToken::new();
+
+	fs::write(fixture.path().join("seed.txt"), "changed\n").unwrap();
+	fs::write(fixture.path().join("new.txt"), "new\n").unwrap();
+	assert!(mutation.stage_all(&cancel).await.unwrap().is_applied());
+	assert!(diffs.has(fixture.path(), true, &cancel).await.unwrap());
+	assert!(mutation.unstage_all(&cancel).await.unwrap().is_applied());
+	assert!(!diffs.has(fixture.path(), true, &cancel).await.unwrap());
+	fs::remove_file(fixture.path().join("new.txt")).unwrap();
+
+	let all = [HunkSelection { path: "seed.txt".into(), selector: HunkSelector::All }];
+	assert!(
+		mutation
+			.stage_hunks(&all, &cancel)
+			.await
+			.unwrap()
+			.is_applied()
+	);
+	assert!(
+		mutation
+			.unstage_hunks(&all, &cancel)
+			.await
+			.unwrap()
+			.is_applied()
+	);
+	assert!(!diffs.has(fixture.path(), true, &cancel).await.unwrap());
+	assert!(diffs.has(fixture.path(), false, &cancel).await.unwrap());
+	assert!(
+		mutation
+			.discard_hunks(&all, &cancel)
+			.await
+			.unwrap()
+			.is_applied()
+	);
+	assert_eq!(fs::read(fixture.path().join("seed.txt")).unwrap(), b"seed\n");
+
+	let before = query
+		.commit_metadata(fixture.path(), "HEAD", &cancel)
+		.await
+		.unwrap()
+		.hash;
+	fs::write(fixture.path().join("seed.txt"), "amended\n").unwrap();
+	mutation.stage_all(&cancel).await.unwrap();
+	let outcome = mutation
+		.create_commit(
+			b"amended root\n",
+			CommitOptions { amend: true, ..Default::default() },
+			&cancel,
+		)
+		.await
+		.unwrap();
+	assert!(matches!(outcome, MutationOutcome::Applied(_)));
+	let amended = query
+		.commit_metadata(fixture.path(), "HEAD", &cancel)
+		.await
+		.unwrap();
+	assert_ne!(amended.hash, before);
+	assert!(amended.parents.is_empty());
+	assert!(amended.body.as_str().starts_with("amended root"));
+	assert_eq!(
+		query
+			.log_subjects(fixture.path(), 2, &cancel)
+			.await
+			.unwrap()
+			.len(),
+		1
+	);
+}
+
+#[tokio::test]
+async fn interactive_line_patches_are_precise_across_content_shapes() {
+	let fixture = repository_fixture();
+	let repository = repo::discover(fixture.path()).await.unwrap().unwrap();
+	let runner = GitRunner::new(ExecHost::new());
+	let mutation = GitMutation::new(runner.clone(), repository, GitMutationConsumer::InteractiveGit);
+	let query = GitQuery::new(runner.clone());
+	let diffs = GitDiff::new(runner);
+	let cancel = CancellationToken::new();
+
+	let base = (1..=20)
+		.map(|line| format!("line {line}\n"))
+		.collect::<String>();
+	fs::write(fixture.path().join("lines.txt"), &base).unwrap();
+	fixture_git(fixture.path(), &["add", "lines.txt"]);
+	fixture_git(fixture.path(), &["commit", "-m", "line base"]);
+	assert_eq!(
+		query
+			.commit_metadata(fixture.path(), "HEAD", &cancel)
+			.await
+			.unwrap()
+			.parents
+			.len(),
+		1
+	);
+	let mut changed_lines = base.lines().map(|line| line.to_owned()).collect::<Vec<_>>();
+	changed_lines[1] = "changed 2".to_owned();
+	changed_lines[2] = "changed 3".to_owned();
+	changed_lines[14] = "changed 15".to_owned();
+	let changed = format!("{}\n", changed_lines.join("\n"));
+	fs::write(fixture.path().join("lines.txt"), &changed).unwrap();
+
+	let second =
+		DiffLineSelection { old: Some(LineRange::new(2, 2)), new: Some(LineRange::new(2, 2)) };
+	assert!(
+		mutation
+			.stage_lines("lines.txt", second, &cancel)
+			.await
+			.unwrap()
+			.is_applied()
+	);
+	let mut only_second = base.lines().map(|line| line.to_owned()).collect::<Vec<_>>();
+	only_second[1] = "changed 2".to_owned();
+	let only_second = format!("{}\n", only_second.join("\n"));
+	assert_eq!(
+		query
+			.show_path(fixture.path(), ":0:lines.txt", &cancel)
+			.await
+			.unwrap(),
+		Bytes::from(only_second)
+	);
+	mutation.unstage_all(&cancel).await.unwrap();
+
+	let spanning =
+		DiffLineSelection { old: Some(LineRange::new(2, 15)), new: Some(LineRange::new(2, 15)) };
+	assert!(
+		mutation
+			.stage_lines("lines.txt", spanning, &cancel)
+			.await
+			.unwrap()
+			.is_applied()
+	);
+	assert_eq!(
+		query
+			.show_path(fixture.path(), ":0:lines.txt", &cancel)
+			.await
+			.unwrap(),
+		Bytes::copy_from_slice(changed.as_bytes())
+	);
+	assert!(
+		mutation
+			.unstage_lines("lines.txt", second, &cancel)
+			.await
+			.unwrap()
+			.is_applied()
+	);
+	let mut without_second = changed_lines.clone();
+	without_second[1] = "line 2".to_owned();
+	let without_second = format!("{}\n", without_second.join("\n"));
+	assert_eq!(
+		query
+			.show_path(fixture.path(), ":0:lines.txt", &cancel)
+			.await
+			.unwrap(),
+		Bytes::copy_from_slice(without_second.as_bytes())
+	);
+	assert!(
+		mutation
+			.discard_lines("lines.txt", second, &cancel)
+			.await
+			.unwrap()
+			.is_applied()
+	);
+	assert_eq!(fs::read(fixture.path().join("lines.txt")).unwrap(), without_second.as_bytes());
+
+	fs::write(fixture.path().join("eof.txt"), b"old").unwrap();
+	fs::write(fixture.path().join("crlf.txt"), b"a\r\nb\r\n").unwrap();
+	fs::write(fixture.path().join("binary.bin"), b"a\0b").unwrap();
+	fixture_git(fixture.path(), &["add", "eof.txt", "crlf.txt", "binary.bin"]);
+	fixture_git(fixture.path(), &["commit", "-m", "content shapes"]);
+	fs::write(fixture.path().join("eof.txt"), b"new").unwrap();
+	fs::write(fixture.path().join("crlf.txt"), b"a\r\nB\r\n").unwrap();
+	fs::write(fixture.path().join("binary.bin"), b"a\0c").unwrap();
+	let one = DiffLineSelection { old: Some(LineRange::new(1, 1)), new: Some(LineRange::new(1, 1)) };
+	assert!(
+		mutation
+			.stage_lines("eof.txt", one, &cancel)
+			.await
+			.unwrap()
+			.is_applied()
+	);
+	assert_eq!(
+		query
+			.show_path(fixture.path(), ":0:eof.txt", &cancel)
+			.await
+			.unwrap(),
+		Bytes::from_static(b"new")
+	);
+	let second_line =
+		DiffLineSelection { old: Some(LineRange::new(2, 2)), new: Some(LineRange::new(2, 2)) };
+	assert!(
+		mutation
+			.stage_lines("crlf.txt", second_line, &cancel)
+			.await
+			.unwrap()
+			.is_applied()
+	);
+	assert_eq!(
+		query
+			.show_path(fixture.path(), ":0:crlf.txt", &cancel)
+			.await
+			.unwrap(),
+		Bytes::from_static(b"a\r\nB\r\n")
+	);
+	assert!(matches!(
+		mutation.stage_lines("binary.bin", one, &cancel).await,
+		Err(super::mutation::MutationError::Selection(SelectionError::BinarySubset { .. }))
+	));
+	fs::write(fixture.path().join("crlf.txt"), b"changed\r\nB\r\n").unwrap();
+	assert!(matches!(
+		mutation
+			.stage_lines("crlf.txt", DiffLineSelection::new_lines(99, 99), &cancel)
+			.await,
+		Err(super::mutation::MutationError::Selection(SelectionError::NoMatchingLines { .. }))
+	));
+	assert!(diffs.has(fixture.path(), false, &cancel).await.unwrap());
+}
+#[tokio::test]
+async fn line_patches_keep_rename_metadata_staged() {
+	let fixture = repository_fixture();
+	fs::write(fixture.path().join("old-name.txt"), b"one\ntwo\nthree\n").unwrap();
+	fixture_git(fixture.path(), &["add", "old-name.txt"]);
+	fixture_git(fixture.path(), &["commit", "-m", "rename base"]);
+	fixture_git(fixture.path(), &["mv", "old-name.txt", "new-name.txt"]);
+	fs::write(fixture.path().join("new-name.txt"), b"one\nchanged\nthree\n").unwrap();
+	fixture_git(fixture.path(), &["add", "new-name.txt"]);
+
+	let repository = repo::discover(fixture.path()).await.unwrap().unwrap();
+	let runner = GitRunner::new(ExecHost::new());
+	let mutation = GitMutation::new(runner.clone(), repository, GitMutationConsumer::InteractiveGit);
+	let query = GitQuery::new(runner.clone());
+	let diffs = GitDiff::new(runner);
+	let cancel = CancellationToken::new();
+	let second =
+		DiffLineSelection { old: Some(LineRange::new(2, 2)), new: Some(LineRange::new(2, 2)) };
+	assert!(
+		mutation
+			.unstage_lines("new-name.txt", second, &cancel)
+			.await
+			.unwrap()
+			.is_applied()
+	);
+	assert_eq!(
+		query
+			.show_path(fixture.path(), ":0:new-name.txt", &cancel)
+			.await
+			.unwrap(),
+		Bytes::from_static(b"one\ntwo\nthree\n")
+	);
+	let entries = diffs.status_entries(fixture.path(), &cancel).await.unwrap();
+	assert!(entries.iter().any(|entry| {
+		entry.path.as_bytes() == b"new-name.txt"
+			&& entry.orig_path.as_ref().map(|path| path.as_bytes()) == Some(b"old-name.txt".as_slice())
+			&& entry.staged == Some(ChangeKind::Renamed)
+	}));
+	assert!(
+		mutation
+			.discard_lines("new-name.txt", second, &cancel)
+			.await
+			.unwrap()
+			.is_applied()
+	);
+	assert_eq!(fs::read(fixture.path().join("new-name.txt")).unwrap(), b"one\ntwo\nthree\n");
 }

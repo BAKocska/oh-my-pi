@@ -27,17 +27,17 @@ pub use control::{
 	ProviderControlAuthorities, RegistryControlAuthorities,
 };
 pub use dispatch::{
-	CAMPAIGN_SUBMISSION_TIMEOUT, CallbackConcurrency, CampaignDispatch, CampaignDispatchError,
-	DispatchError, DispatchPending, DispatchRequest, DispatchRouter, EventDeadline,
-	decode_campaign_reaction,
+	CallbackConcurrency, DispatchError, DispatchPending, DispatchRequest, DispatchRouter,
+	EventDeadline, REGIME_SUBMISSION_TIMEOUT, RegimeDispatch, RegimeDispatchError,
+	decode_regime_draft,
 };
 pub use lifecycle::{
 	ActivateReason, ActivationCause, ActivationDisposition, ActivationEvent, ActivationTrigger,
-	AvailabilityBatch, AvailabilitySink, CampaignDeclarationTable, CampaignManifestError,
-	ControlLifecycleHost, DeclarationDrift, DeclarationSet, ExtensionManifest, GenerationFence,
-	HookDeclarationKey, LifecycleError, LifecycleHost, LifecycleMachine, Principal,
-	PrincipalAuthority, PrincipalMismatch, RegistryAvailabilitySink, RestartReason,
-	ToolDeclarationKey, validate_campaign_manifests,
+	AvailabilityBatch, AvailabilitySink, ControlLifecycleHost, DeclarationDrift, DeclarationSet,
+	ExtensionManifest, GenerationFence, HookDeclarationKey, LifecycleError, LifecycleHost,
+	LifecycleMachine, Principal, PrincipalAuthority, PrincipalMismatch, RegimeDeclarationTable,
+	RegimeManifestError, RegistryAvailabilitySink, RestartReason, ToolDeclarationKey,
+	validate_regime_manifests,
 };
 pub use params::{
 	DIRECT_FILESYSTEM_CAPABILITY, DirectFilesystemAuthorityError, DirectFilesystemControlOwner,
@@ -47,8 +47,8 @@ pub use params::{
 	ParameterPullRequest, ParameterPullResult, ParameterSource,
 };
 pub use presentation::{
-	TelemetryControlAuthority, TelemetryControlRequest, UiControlAuthority, UiControlOwner,
-	UiControlRequest, UiControlResult, VerdictControlAuthority, VerdictControlOwner,
+	JobsControlAuthority, JobsControlOwner, TelemetryControlAuthority, TelemetryControlRequest,
+	UiControlAuthority, UiControlOwner, UiControlRequest, UiControlResult,
 };
 pub use quota::{
 	ChargeOutcome, ControlQuotaLedger, FairControlQueue, QuotaBehavior, QuotaError, QuotaExceeded,
@@ -66,7 +66,7 @@ pub use spawn::{
 };
 
 pub use crate::worker::{
-	ControlHostStartError, ExtHostSupervisor, ExtensionCampaignResolver,
+	ControlHostStartError, ExtHostSupervisor, ExtensionRegimeResolver,
 	ExternalControlAuthorityBinding, ExternalDomainControlBinding, ExternalDomainControlFactories,
 	HostKey,
 };
