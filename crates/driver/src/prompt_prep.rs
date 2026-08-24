@@ -190,7 +190,8 @@ impl PromptSnapshot {
 			})
 			.collect::<Vec<_>>()
 			.into();
-		let has_dyn = registry.tools.iter().any(|tool| tool.name == "dyn");
+		let has_xd =
+			registry.tools.iter().any(|tool| tool.name == "shell") && !registry.devices.is_empty();
 		let has_auto_qa = registry
 			.devices
 			.iter()
@@ -215,7 +216,7 @@ impl PromptSnapshot {
 				coordination:    delegation.coordination,
 			},
 			mutations,
-			device_guidance: has_dyn.then(|| Str::new(omp_tools::device::PROMPT_GUIDANCE)),
+			device_guidance: has_xd.then(|| Str::new(omp_tools::device::PROMPT_GUIDANCE)),
 			auto_qa_guidance: has_auto_qa
 				.then(|| Str::new(omp_tools::device::AUTO_QA_PROMPT_GUIDANCE)),
 		};
