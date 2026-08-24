@@ -1634,6 +1634,10 @@ impl ElementsBuilder {
 pub enum HitTag {
 	/// Row `i` of a select, tree, or form.
 	Row(u16),
+	/// Absolute flattened row of a virtualized tree.
+	TreeRow(u32),
+	/// Trailing action chip on an absolute flattened tree row.
+	TreeAction(u32),
 	/// Dropdown row `i` of an open form submenu.
 	Sub(u16),
 	/// Chip `i` of a radio, segmented control, or tab bar.

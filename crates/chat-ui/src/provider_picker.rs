@@ -169,6 +169,9 @@ impl ProviderPicker {
 			| UiEvent::Filtered { .. }
 			| UiEvent::Highlighted { .. }
 			| UiEvent::Copied(_)
+			| UiEvent::TreeActivated { .. }
+			| UiEvent::TreeToggled { .. }
+			| UiEvent::TreeAction { .. }
 			| UiEvent::DiffAction { .. } => PickerEvent::Consumed,
 		}
 	}

@@ -1700,6 +1700,32 @@ pub enum UiEvent {
 		/// Value of the committed option.
 		value: Str,
 	},
+	/// A tree node was activated with Enter, Right on a leaf, or a row click.
+	TreeActivated {
+		/// The tree's `id`, or the empty string when unnamed.
+		id:  Str,
+		/// Stable node key.
+		key: Str,
+	},
+	/// A tree node was toggled with Space or by expanding/collapsing it.
+	TreeToggled {
+		/// The tree's `id`, or the empty string when unnamed.
+		id:       Str,
+		/// Stable node key.
+		key:      Str,
+		/// New expansion state for a branch; `None` for a leaf-level
+		/// application toggle.
+		expanded: Option<bool>,
+	},
+	/// A tree node's trailing action chip was activated.
+	TreeAction {
+		/// The tree's `id`, or the empty string when unnamed.
+		id:     Str,
+		/// Stable node key.
+		key:    Str,
+		/// Action value authored on the node.
+		action: Str,
+	},
 	/// An `id`-carrying filterable select's query changed.
 	Filtered {
 		/// The select's `id`.

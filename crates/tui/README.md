@@ -556,13 +556,17 @@ A focusable tab bar with one active pane.
 
 #### `<tree>` and `<node>`
 
-An expandable hierarchy with branch toggling and selectable leaves.
+A virtualized, focusable hierarchy with retained expansion, scrolling, selection, and rich rows.
 
 - **`<tree>` children:** Root `<node>` records only.
 - **`<tree>` props:** Shared; `id`; `guides` draws `├─`/`└─` connector gutters instead of plain indentation (bare flag for the square family, or `guides=round|heavy|double|dash`).
 - **`<node>` children:** Nested `<node>` records.
-- **`<node>` props:** `label`; `open`.
-- **Value:** An ID-bearing tree exports the selected leaf path, joined with `/`, or `null`.
+- **`<node>` props:** `key` (defaults to its `/`-joined label path); `label`; `prefix` (dim and start-truncated); `open`; `icon` or literal `badge` plus `color`; `annotation` plus `annotation-color`; `action` plus `action-color`; `bold`; `dim`.
+- **Rust annotations:** `TreeNode::annotate(TreeAnnotation::new(text).color(color))` is repeatable, so one row can carry independently colored counters; markup's singular `annotation` prop remains available.
+- **Value:** An ID-bearing tree exports the selected node key, or `null`.
+- **Events:** Activation emits `UiEvent::TreeActivated`; branch or application-leaf toggles emit `UiEvent::TreeToggled`; clicking an action chip emits `UiEvent::TreeAction`. Every event carries the tree id and node key.
+- **Keys:** Up/Down or `k`/`j`, Home/End or `g`/`G`, and PageUp/PageDown move selection; Left/`h` collapses or selects the parent; Right/`l` expands, enters the first child, or activates a leaf; Enter activates and Space toggles.
+- **Viewport:** The tree retains `scroll_top`, scrolls three rows per wheel tick, chases keyboard selection into view, and paints only the visible flattened window.
 
 #### `<todo>` and `<task>`
 
@@ -661,7 +665,7 @@ These properties apply to standalone retained components. Parent-owned records s
 | `align` | `start`/`left`, `center`/`middle`, `end`/`right` | Horizontal text placement and stack main-axis placement |
 | `valign` | `start`/`top`, `center`/`middle`, `end`/`bottom`, `stretch`/`fill` | Box, column, and row cross-axis placement |
 | `justify` | `start`, `center`, `end`, `between` | Row distribution of leftover width |
-| `wrap` | Flag or `char` | Flag: lets a row stack vertically when it cannot fit. `char` on text: terminal-exact grapheme flow whose width breaks re-join in native copy |
+| `wrap` | Flag, `word`, `char`, or `pre` | Flag/`word`: word flow. `char`: terminal-exact grapheme flow whose width breaks re-join in native copy. `pre`: preserves whitespace and newlines verbatim without soft wrapping |
 | `truncate` | Flag or `start`/`end` | Clips text, Markdown, LaTeX, or callout content to one line with an ellipsis; `start` keeps the tail behind a leading ellipsis |
 | `vertical` | Flag | Forces vertical rendering where supported; currently used by `<hr>` and set automatically by `<row>` |
 | `guides` | Bare flag or `square`/`round`/`heavy`/`double`/`dash` | `<tree>` and `<todo>` connector gutters; the flag means square |

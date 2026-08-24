@@ -129,6 +129,9 @@ impl ModelPicker {
 			| UiEvent::Submit
 			| UiEvent::Pressed(_)
 			| UiEvent::Copied(_)
+			| UiEvent::TreeActivated { .. }
+			| UiEvent::TreeToggled { .. }
+			| UiEvent::TreeAction { .. }
 			| UiEvent::DiffAction { .. }
 			| UiEvent::Changed { .. }
 			| UiEvent::Highlighted { .. }

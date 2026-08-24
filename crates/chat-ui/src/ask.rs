@@ -247,6 +247,9 @@ impl AskDialog {
 			| UiEvent::Highlighted { .. }
 			| UiEvent::Pressed(_)
 			| UiEvent::Copied(_)
+			| UiEvent::TreeActivated { .. }
+			| UiEvent::TreeToggled { .. }
+			| UiEvent::TreeAction { .. }
 			| UiEvent::DiffAction { .. } => AskDialogEvent::Consumed,
 		}
 	}

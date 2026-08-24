@@ -485,6 +485,31 @@ pub enum AppEvent {
 		/// Value of the committed option.
 		value: Str,
 	},
+	/// A tree node was activated.
+	TreeActivated {
+		/// The tree's `id`, or the empty string when unnamed.
+		id:  Str,
+		/// Stable node key.
+		key: Str,
+	},
+	/// A tree node was toggled.
+	TreeToggled {
+		/// The tree's `id`, or the empty string when unnamed.
+		id:       Str,
+		/// Stable node key.
+		key:      Str,
+		/// New branch expansion state, or `None` for an application leaf toggle.
+		expanded: Option<bool>,
+	},
+	/// A tree node's trailing action chip was activated.
+	TreeAction {
+		/// The tree's `id`, or the empty string when unnamed.
+		id:     Str,
+		/// Stable node key.
+		key:    Str,
+		/// Action value authored on the node.
+		action: Str,
+	},
 	/// An interactive diff pane requested a host-owned mutation.
 	DiffAction {
 		/// The pane's component `id`.
@@ -885,6 +910,15 @@ impl App {
 					Ok(event) => Routed::Event(event),
 					Err(UiEvent::Submit) => Routed::Event(AppEvent::Submitted),
 					Err(UiEvent::Pressed(id)) => Routed::Event(AppEvent::Pressed(id)),
+					Err(UiEvent::TreeActivated { id, key }) => {
+						Routed::Event(AppEvent::TreeActivated { id, key })
+					},
+					Err(UiEvent::TreeToggled { id, key, expanded }) => {
+						Routed::Event(AppEvent::TreeToggled { id, key, expanded })
+					},
+					Err(UiEvent::TreeAction { id, key, action }) => {
+						Routed::Event(AppEvent::TreeAction { id, key, action })
+					},
 					Err(UiEvent::DiffAction { id, action, target }) => {
 						Routed::Event(AppEvent::DiffAction { id, action, target })
 					},
@@ -991,6 +1025,15 @@ fn route_key_event(
 		UiEvent::Cancel if quit_on_cancel => Routed::Stop,
 		UiEvent::Submit => Routed::Event(AppEvent::Submitted),
 		UiEvent::Pressed(id) => Routed::Event(AppEvent::Pressed(id)),
+		UiEvent::TreeActivated { id, key } => {
+			Routed::Event(AppEvent::TreeActivated { id, key })
+		},
+		UiEvent::TreeToggled { id, key, expanded } => {
+			Routed::Event(AppEvent::TreeToggled { id, key, expanded })
+		},
+		UiEvent::TreeAction { id, key, action } => {
+			Routed::Event(AppEvent::TreeAction { id, key, action })
+		},
 		event
 		@ (UiEvent::Highlighted { .. } | UiEvent::Changed { .. } | UiEvent::Filtered { .. }) => {
 			Routed::Event(select_event(event).expect("select events map to app events"))

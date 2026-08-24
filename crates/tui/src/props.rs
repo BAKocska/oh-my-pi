@@ -383,10 +383,22 @@ define_props! {
 	When("when") => when: Str;
 	/// Initial or submitted field value.
 	Value("value") => value: Scalar;
+	/// Stable application-facing key for a tree node.
+	Key("key") => key: Str;
 	/// Space-delimited choices for a selection field.
 	Options("options") => options: Str;
 	/// User-facing field or item label.
 	Label("label") => label: Str;
+	/// Dim leading segment rendered before a tree node label.
+	Prefix("prefix") => prefix: Str;
+	/// Right-aligned annotation on a tree node row.
+	Annotation("annotation") => annotation: Str;
+	/// Color of a tree node annotation.
+	AnnotationColor("annotation-color") => annotation_color: PropColor;
+	/// Optional trailing tree-node action chip label and event value.
+	Action("action") => action: Str;
+	/// Color of a tree-node action chip.
+	ActionColor("action-color") => action_color: PropColor;
 	/// Supporting description for an option.
 	Desc("desc") => desc: Str;
 	/// Field control kind.
@@ -739,9 +751,13 @@ impl Props {
 				Some(Scalar::Str(value)) => Some(value),
 				_ => None,
 			},
+			Prop::Key => self.key.as_ref(),
 			Prop::Options => self.options.as_ref(),
 			Prop::Variant => self.variant.as_ref(),
 			Prop::Label => self.label.as_ref(),
+			Prop::Prefix => self.prefix.as_ref(),
+			Prop::Annotation => self.annotation.as_ref(),
+			Prop::Action => self.action.as_ref(),
 			Prop::Desc => self.desc.as_ref(),
 			Prop::Kind => self.kind.as_ref(),
 			Prop::Filter => match self.filter.as_ref() {
@@ -809,6 +825,8 @@ impl Props {
 			Prop::Edge => self.edge.as_ref(),
 			Prop::Hover => self.hover.as_ref(),
 			Prop::Color => self.color.as_ref(),
+			Prop::AnnotationColor => self.annotation_color.as_ref(),
+			Prop::ActionColor => self.action_color.as_ref(),
 			_ => None,
 		}
 	}
@@ -1234,7 +1252,7 @@ mod tests {
 			assert_eq!(name.parse(), Ok(prop));
 			count += 1;
 		}
-		assert_eq!(count, 79);
+		assert_eq!(count, 85);
 	}
 
 	#[test]

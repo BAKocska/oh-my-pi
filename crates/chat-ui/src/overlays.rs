@@ -200,6 +200,9 @@ impl ListPicker {
 			| UiEvent::Highlighted { .. }
 			| UiEvent::Pressed(_)
 			| UiEvent::Copied(_)
+			| UiEvent::TreeActivated { .. }
+			| UiEvent::TreeToggled { .. }
+			| UiEvent::TreeAction { .. }
 			| UiEvent::DiffAction { .. } => PickerEvent::Consumed,
 		}
 	}
@@ -345,6 +348,9 @@ impl PromptOverlay {
 			| UiEvent::Filtered { .. }
 			| UiEvent::Pressed(_)
 			| UiEvent::Copied(_)
+			| UiEvent::TreeActivated { .. }
+			| UiEvent::TreeToggled { .. }
+			| UiEvent::TreeAction { .. }
 			| UiEvent::DiffAction { .. } => PromptEvent::Consumed,
 		}
 	}
