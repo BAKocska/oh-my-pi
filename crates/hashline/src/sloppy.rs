@@ -11,6 +11,9 @@ const SELECT_OPEN: &str = "⟪";
 const SELECT_CLOSE: &str = "⟫";
 const SELECT_DIVIDER: &str = "│";
 const ADD_LINE: char = '＋';
+const LITERAL_OPEN: &str = "\0SLOPPY_OPEN\0";
+const LITERAL_CLOSE: &str = "\0SLOPPY_CLOSE\0";
+const LITERAL_DIVIDER: &str = "\0SLOPPY_DIVIDER\0";
 const MAX_CANDIDATES: usize = 200;
 
 /// One `§path` section of a sloppy payload.
@@ -73,6 +76,14 @@ pub enum SloppyError {
 	NoChange {
 		/// One-based position of the operation reported as unchanged.
 		operation: usize,
+	},
+	/// A malformed operation can be retried with one complete corrected payload.
+	#[error("{message}")]
+	Retry {
+		/// One-based position of the operation requiring repair.
+		operation: usize,
+		/// Copy-ready, path-aware corrected payload.
+		message:   Str,
 	},
 }
 
@@ -215,12 +226,14 @@ struct Operation {
 	desired:       Vec<Piece>,
 	has_add:       bool,
 	block_rewrite: Option<String>,
+	recovery_note: Option<Str>,
 }
 
 #[derive(Clone, Debug)]
 enum Piece {
 	Text(String),
 	Capture(usize),
+	CaptureOrGap(usize),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -230,7 +243,11 @@ enum ParseState {
 	Rewrite,
 }
 
-fn parse_operations(input: &str) -> Result<Vec<Operation>, SloppyError> {
+fn parse_operations(
+	input: &str,
+	source: &str,
+	path: Option<&str>,
+) -> Result<Vec<Operation>, SloppyError> {
 	let normalized = input.replace("\r\n", "\n").replace('\r', "\n");
 	let mut lines = Vec::<String>::new();
 	for line in normalized.split('\n') {
@@ -252,7 +269,7 @@ fn parse_operations(input: &str) -> Result<Vec<Operation>, SloppyError> {
 	let mut pattern = Vec::new();
 	let mut rewrite = Vec::new();
 
-	for line in &lines {
+	for (line_index, line) in lines.iter().enumerate() {
 		let trimmed = line.trim();
 		if trimmed == "§»" {
 			if state == ParseState::Pattern
@@ -269,6 +286,10 @@ fn parse_operations(input: &str) -> Result<Vec<Operation>, SloppyError> {
 					&pattern,
 					(state == ParseState::Rewrite).then_some(rewrite.as_slice()),
 					operations.len() + 1,
+					source,
+					&lines,
+					line_index,
+					path,
 				)?);
 			}
 			state = ParseState::Pattern;
@@ -298,6 +319,10 @@ fn parse_operations(input: &str) -> Result<Vec<Operation>, SloppyError> {
 			&pattern,
 			(state == ParseState::Rewrite).then_some(rewrite.as_slice()),
 			operations.len() + 1,
+			source,
+			&lines,
+			lines.len(),
+			path,
 		)?);
 	}
 	if operations.is_empty() {
@@ -319,6 +344,10 @@ fn build_operation(
 	pattern_lines: &[String],
 	rewrite_lines: Option<&[String]>,
 	operation: usize,
+	source: &str,
+	full_lines: &[String],
+	end_index: usize,
+	path: Option<&str>,
 ) -> Result<Operation, SloppyError> {
 	let mut pattern_raw = trim_trailing_blank_lines(pattern_lines).join("\n");
 	if pattern_raw.trim().is_empty() {
@@ -339,11 +368,23 @@ fn build_operation(
 
 	match explicit {
 		Some(rewrite) if selections.bare == 1 && selections.paired == 0 => {
-			let (match_text, desired) = legacy_selection_template(&pattern_raw, &rewrite, operation)?;
-			Ok(Operation { all, pattern_raw, match_text, desired, has_add, block_rewrite: None })
+			let expanded = expand_echoed_line_selection(&pattern_raw, &rewrite);
+			let pattern = expanded.as_deref().unwrap_or(&pattern_raw);
+			let (match_text, desired) = legacy_selection_template(pattern, &rewrite, operation)?;
+			Ok(Operation {
+				all,
+				pattern_raw,
+				match_text,
+				desired,
+				has_add,
+				block_rewrite: None,
+				recovery_note: expanded.map(|_| Str::new(
+					"Note: REWRITE restated the whole selection-bearing line, so the full line was replaced.",
+				)),
+			})
 		},
 		Some(rewrite) if selections.paired > 0 => {
-			let (match_text, inline_desired) = inline_template(&pattern_raw, true, operation)?;
+			let (match_text, inline_desired, notes) = inline_template(&pattern_raw, true, operation)?;
 			let inline_text = pieces_source(&inline_desired);
 			let redundant = rewrite.trim().is_empty()
 				|| normalize_text(&rewrite) == normalize_text(&inline_text)
@@ -353,7 +394,7 @@ fn build_operation(
 			let desired = if redundant {
 				inline_desired
 			} else {
-				pieces_from_rewrite(&rewrite, gap_count(&match_text), None)
+				pieces_from_rewrite(&rewrite, gap_count(&match_text), None, operation)?
 			};
 			Ok(Operation {
 				all,
@@ -362,6 +403,7 @@ fn build_operation(
 				desired,
 				has_add,
 				block_rewrite: (!redundant).then_some(rewrite),
+				recovery_note: (!notes.is_empty()).then(|| Str::new(notes.join("\n"))),
 			})
 		},
 		Some(_) if selections.bare > 0 => Err(SloppyError::Malformed {
@@ -370,7 +412,7 @@ fn build_operation(
 		}),
 		Some(rewrite) => {
 			let match_text = pattern_raw.clone();
-			let desired = pieces_from_rewrite(&rewrite, gap_count(&match_text), None);
+			let desired = pieces_from_rewrite(&rewrite, gap_count(&match_text), None, operation)?;
 			Ok(Operation {
 				all,
 				pattern_raw,
@@ -378,16 +420,51 @@ fn build_operation(
 				desired,
 				has_add,
 				block_rewrite: Some(rewrite),
+				recovery_note: None,
 			})
 		},
 		None if selections.paired > 0 || selections.bare > 0 || has_add => {
-			let (match_text, desired) = inline_template(&pattern_raw, true, operation)?;
-			Ok(Operation { all, pattern_raw, match_text, desired, has_add, block_rewrite: None })
+			let (match_text, desired, notes) = inline_template(&pattern_raw, true, operation)?;
+			Ok(Operation {
+				all,
+				pattern_raw,
+				match_text,
+				desired,
+				has_add,
+				block_rewrite: None,
+				recovery_note: (!notes.is_empty()).then(|| Str::new(notes.join("\n"))),
+			})
 		},
-		None => Err(SloppyError::Malformed {
-			operation,
-			reason: "operation needs » or an explicit ⟪current│desired⟫/＋ marker",
-		}),
+		None => {
+			if let Some(current) = closest_desired_block(source, &pattern_raw) {
+				return Ok(Operation {
+					all,
+					pattern_raw: pattern_raw.clone(),
+					match_text: current,
+					desired: vec![Piece::Text(pattern_raw)],
+					has_add,
+					block_rewrite: None,
+					recovery_note: Some(Str::new(format!(
+						"Note: operation {operation} stated desired text without markers; the closest matching block was replaced with it."
+					))),
+				});
+			}
+			let mut corrected = full_lines.to_vec();
+			corrected.splice(end_index..end_index, [REWRITE.to_owned(), "<new text>".to_owned()]);
+			if let Some(path) = path
+				&& let Some(opener) = corrected.first_mut()
+				&& matches!(opener.as_str(), "§" | "§*")
+			{
+				opener.push_str(path);
+			}
+			Err(SloppyError::Retry {
+				operation,
+				message: Str::new(format!(
+					"Operation {operation} needs ».\nCopy-ready corrected payload (fill in the new text):\n{}",
+					corrected.join("\n")
+				)),
+			})
+		},
 	}
 }
 
@@ -414,12 +491,6 @@ fn selection_facts(pattern: &str, operation: usize) -> Result<SelectionFacts, Sl
 			return Err(SloppyError::Malformed { operation, reason: "selection is missing ⟫" });
 		};
 		let selection = &after[..close];
-		if selection.matches(SELECT_DIVIDER).count() > 1 {
-			return Err(SloppyError::Malformed {
-				operation,
-				reason: "selection has multiple │ markers",
-			});
-		}
 		if selection.contains(SELECT_DIVIDER) {
 			facts.paired += 1;
 		} else {
@@ -433,8 +504,98 @@ fn selection_facts(pattern: &str, operation: usize) -> Result<SelectionFacts, Sl
 	Ok(facts)
 }
 
+fn expand_echoed_line_selection(pattern: &str, rewrite: &str) -> Option<String> {
+	let rewrite_lines = rewrite.lines().filter(|line| !line.trim().is_empty()).collect::<Vec<_>>();
+	if rewrite_lines.len() != 1 {
+		return None;
+	}
+	let mut lines = pattern.lines().map(str::to_owned).collect::<Vec<_>>();
+	let selected = lines.iter().position(|line| line.contains(SELECT_OPEN))?;
+	if lines.iter().filter(|line| line.contains(SELECT_OPEN)).count() != 1 {
+		return None;
+	}
+	let line = &lines[selected];
+	if line.contains(GAP) {
+		return None;
+	}
+	let open = line.find(SELECT_OPEN)?;
+	let after_open = open + SELECT_OPEN.len();
+	let close = line[after_open..].find(SELECT_CLOSE)? + after_open;
+	let selection = &line[after_open..close];
+	if selection.contains(SELECT_DIVIDER) {
+		return None;
+	}
+	let prefix = &line[..open];
+	if prefix.trim().is_empty() || !normalize_text(rewrite_lines[0]).starts_with(&normalize_text(prefix)) {
+		return None;
+	}
+	let unmarked = line.replace(SELECT_OPEN, "").replace(SELECT_CLOSE, "");
+	lines[selected] = format!("{SELECT_OPEN}{unmarked}{SELECT_CLOSE}");
+	Some(lines.join("\n"))
+}
+
+fn closest_desired_block(source: &str, stated: &str) -> Option<String> {
+	let stated_normalized = normalize_text(stated);
+	if !(12..=1000).contains(&stated_normalized.len()) {
+		return None;
+	}
+	let count = stated.split('\n').count();
+	let lines = source.split('\n').collect::<Vec<_>>();
+	if lines.len() < count {
+		return None;
+	}
+	let mut scores = vec![1.0_f64; lines.len() - count + 1];
+	let mut best: Option<(usize, f64)> = None;
+	for index in 0..=lines.len() - count {
+		let window = normalize_text(&lines[index..index + count].join("\n"));
+		let maximum = stated_normalized.len().max(window.len()).max(1);
+		let affix = stated_normalized.starts_with(window.as_str())
+			|| window.starts_with(stated_normalized.as_str())
+			|| stated_normalized.ends_with(window.as_str())
+			|| window.ends_with(stated_normalized.as_str());
+		if window == stated_normalized {
+			return None;
+		}
+		if window.is_empty()
+			|| affix
+			|| stated_normalized.len().abs_diff(window.len()) as f64 / maximum as f64 > 0.35
+		{
+			continue;
+		}
+		let score = levenshtein(&stated_normalized, &window) as f64 / maximum as f64;
+		scores[index] = score;
+		if best.is_none_or(|(_, current)| score < current) {
+			best = Some((index, score));
+		}
+	}
+	let (best_index, best_score) = best?;
+	if best_score > 0.35 {
+		return None;
+	}
+	if scores.iter().enumerate().any(|(index, score)| {
+		index.abs_diff(best_index) >= count && *score - best_score < 0.1
+	}) {
+		return None;
+	}
+	let text = lines[best_index..best_index + count].join("\n");
+	let structural = [SELECT_OPEN, SELECT_CLOSE, SELECT_DIVIDER, GAP, REWRITE, OPENER];
+	(!structural.iter().any(|marker| text.contains(marker))).then_some(text)
+}
+
 fn has_add_lines(pattern: &str) -> bool {
 	pattern.lines().any(|line| add_line_text(line).is_some())
+}
+
+fn encode_literal_markers(text: &str) -> String {
+	text.replace(SELECT_OPEN, LITERAL_OPEN)
+		.replace(SELECT_CLOSE, LITERAL_CLOSE)
+		.replace(SELECT_DIVIDER, LITERAL_DIVIDER)
+}
+
+fn decode_literal_markers(text: &str) -> String {
+	text.replace(LITERAL_OPEN, SELECT_OPEN)
+		.replace(LITERAL_CLOSE, SELECT_CLOSE)
+		.replace(LITERAL_DIVIDER, SELECT_DIVIDER)
 }
 
 fn add_line_text(line: &str) -> Option<String> {
@@ -477,7 +638,7 @@ fn embed_add_lines(pattern: &str) -> String {
 			let Some(line) = add_line_text(&compact[index]) else {
 				break;
 			};
-			added.push(line);
+			added.push(encode_literal_markers(&line));
 			index += 1;
 		}
 		if added.len() == 1
@@ -496,10 +657,18 @@ fn embed_add_lines(pattern: &str) -> String {
 			output.pop();
 		}
 		if index < compact.len() {
-			output.push(format!(
-				"{SELECT_OPEN}{SELECT_DIVIDER}{inserted}\n{SELECT_CLOSE}{}",
-				compact[index]
-			));
+			let gap_below = compact[index..]
+				.iter()
+				.find(|line| !line.trim().is_empty())
+				.is_some_and(|line| line.trim() == GAP);
+			if gap_below && wrap_trailing_add_anchor(&mut output, &inserted) {
+				output.push(compact[index].clone());
+			} else {
+				output.push(format!(
+					"{SELECT_OPEN}{SELECT_DIVIDER}{inserted}\n{SELECT_CLOSE}{}",
+					compact[index]
+				));
+			}
 			index += 1;
 		} else if let Some(previous) = output.last_mut() {
 			previous.push_str(&format!("{SELECT_OPEN}{SELECT_DIVIDER}\n{inserted}{SELECT_CLOSE}"));
@@ -508,6 +677,22 @@ fn embed_add_lines(pattern: &str) -> String {
 		}
 	}
 	output.join("\n")
+}
+
+fn wrap_trailing_add_anchor(output: &mut [String], inserted: &str) -> bool {
+	let Some(previous) = output.last_mut() else { return false };
+	if previous.trim().is_empty()
+		|| previous.contains(GAP)
+		|| previous.contains(SELECT_OPEN)
+		|| previous.contains(SELECT_DIVIDER)
+	{
+		return false;
+	}
+	let anchor = mem::take(previous);
+	*previous = format!(
+		"{SELECT_OPEN}{anchor}{SELECT_DIVIDER}{anchor}\n{inserted}{SELECT_CLOSE}"
+	);
+	true
 }
 
 fn is_near_variant(anchor: &str, added: &str) -> bool {
@@ -532,13 +717,48 @@ fn word_tokens(text: &str) -> Vec<&str> {
 		.collect()
 }
 
+fn resolve_literal_dividers(selection: &str, operation: usize) -> (String, String, Str) {
+	let dividers = selection.match_indices(SELECT_DIVIDER).map(|(at, _)| at).collect::<Vec<_>>();
+	let last = *dividers.last().expect("called for a divided selection");
+	let advice = format!(
+		"Selections containing literal {SELECT_DIVIDER} are ambiguous; use a {REWRITE} block rewrite instead."
+	);
+	if last + SELECT_DIVIDER.len() == selection.len() {
+		return (
+			selection[..last].to_owned(),
+			String::new(),
+			Str::new(format!(
+				"Note: operation {operation}'s trailing {SELECT_DIVIDER} was read as deletion; inner dividers were literal. {advice}"
+			)),
+		);
+	}
+	if dividers.len() % 2 == 1 {
+		let middle = dividers[dividers.len() / 2];
+		return (
+			selection[..middle].to_owned(),
+			selection[middle + SELECT_DIVIDER.len()..].to_owned(),
+			Str::new(format!(
+				"Note: operation {operation}'s middle {SELECT_DIVIDER} was read as the divider; the others were literal. {advice}"
+			)),
+		);
+	}
+	(
+		selection.to_owned(),
+		String::new(),
+		Str::new(format!(
+			"Note: operation {operation}'s even divider count was read as deletion. {advice}"
+		)),
+	)
+}
+
 fn inline_template(
 	pattern: &str,
 	bare_as_desired: bool,
 	operation: usize,
-) -> Result<(String, Vec<Piece>), SloppyError> {
+) -> Result<(String, Vec<Piece>, Vec<Str>), SloppyError> {
 	let mut match_text = String::new();
 	let mut desired = Vec::new();
+	let mut notes = Vec::new();
 	let mut capture = 0;
 	let mut rest = pattern;
 	while let Some(open) = rest.find(SELECT_OPEN) {
@@ -549,14 +769,20 @@ fn inline_template(
 		};
 		let selection = &after[..close];
 		if let Some((old, new)) = selection.split_once(SELECT_DIVIDER) {
-			if new.contains(SELECT_DIVIDER) {
-				return Err(SloppyError::Malformed {
-					operation,
-					reason: "selection has multiple │ markers",
-				});
-			}
-			let local = append_match(old, &mut match_text, &mut capture);
-			append_desired(new, &mut desired, &local);
+			let (old, new) = if new.contains(SELECT_DIVIDER) {
+				let (old, new, note) = resolve_literal_dividers(selection, operation);
+				notes.push(note);
+				(old, new)
+			} else {
+				(old.to_owned(), new.to_owned())
+			};
+			let local = append_match(&old, &mut match_text, &mut capture);
+			desired.extend(pieces_from_rewrite(
+				&new,
+				local.len(),
+				Some(&local),
+				operation,
+			)?);
 		} else if bare_as_desired && !selection.is_empty() {
 			match_text.push_str(GAP);
 			desired.push(Piece::Text(selection.to_owned()));
@@ -570,7 +796,7 @@ fn inline_template(
 		rest = &after[close + SELECT_CLOSE.len()..];
 	}
 	append_plain(rest, &mut match_text, &mut desired, &mut capture);
-	Ok((match_text, coalesce_text(desired)))
+	Ok((match_text, coalesce_text(desired), notes))
 }
 
 fn legacy_selection_template(
@@ -599,7 +825,7 @@ fn legacy_selection_template(
 	let mut capture = 0;
 	append_plain(before, &mut match_text, &mut desired, &mut capture);
 	let local = append_match(old, &mut match_text, &mut capture);
-	desired.extend(pieces_from_rewrite(rewrite, local.len(), Some(&local)));
+	desired.extend(pieces_from_rewrite(rewrite, local.len(), Some(&local), operation)?);
 	append_plain(after_selection, &mut match_text, &mut desired, &mut capture);
 	Ok((match_text, coalesce_text(desired)))
 }
@@ -638,41 +864,52 @@ fn append_match(text: &str, match_text: &mut String, capture: &mut usize) -> Vec
 	local
 }
 
-fn append_desired(text: &str, desired: &mut Vec<Piece>, local: &[usize]) {
-	let mut capture = 0;
-	let mut rest = text;
-	while let Some(gap) = rest.find(GAP) {
-		push_text(desired, &rest[..gap]);
-		if let Some(index) = local.get(capture) {
-			desired.push(Piece::Capture(*index));
-		} else {
-			push_text(desired, GAP);
-		}
-		capture += 1;
-		rest = &rest[gap + GAP.len()..];
-	}
-	push_text(desired, rest);
-}
-
-fn pieces_from_rewrite(rewrite: &str, captures: usize, mapping: Option<&[usize]>) -> Vec<Piece> {
+fn pieces_from_rewrite(
+	rewrite: &str,
+	captures: usize,
+	mapping: Option<&[usize]>,
+	operation: usize,
+) -> Result<Vec<Piece>, SloppyError> {
 	let mut pieces = Vec::new();
 	let mut capture = 0;
 	let mut rest = rewrite;
+	let mut consumed = 0;
 	while let Some(gap) = rest.find(GAP) {
 		push_text(&mut pieces, &rest[..gap]);
 		let mapped = mapping
 			.and_then(|mapping| mapping.get(capture).copied())
 			.or_else(|| (capture < captures).then_some(capture));
 		if let Some(index) = mapped {
-			pieces.push(Piece::Capture(index));
+			let absolute = consumed + gap;
+			let line_end = rewrite[absolute..]
+				.find('\n')
+				.map_or(rewrite.len(), |at| absolute + at);
+			if rewrite[absolute + GAP.len()..line_end].trim().is_empty() {
+				pieces.push(Piece::Capture(index));
+			} else {
+				pieces.push(Piece::CaptureOrGap(index));
+			}
 		} else {
+			let absolute = consumed + gap;
+			let line_start = rewrite[..absolute].rfind('\n').map_or(0, |at| at + 1);
+			let line_end = rewrite[absolute..]
+				.find('\n')
+				.map_or(rewrite.len(), |at| absolute + at);
+			if rewrite[line_start..line_end].trim() == GAP {
+				return Err(SloppyError::Malformed {
+					operation,
+					reason: "REWRITE has a whole-line … with no MATCH gap to re-emit; type the elided lines out",
+				});
+			}
 			push_text(&mut pieces, GAP);
 		}
 		capture += 1;
-		rest = &rest[gap + GAP.len()..];
+		let advance = gap + GAP.len();
+		consumed += advance;
+		rest = &rest[advance..];
 	}
 	push_text(&mut pieces, rest);
-	coalesce_text(pieces)
+	Ok(coalesce_text(pieces))
 }
 
 fn push_text(pieces: &mut Vec<Piece>, text: &str) {
@@ -692,6 +929,7 @@ fn coalesce_text(pieces: Vec<Piece>) -> Vec<Piece> {
 		match piece {
 			Piece::Text(text) => push_text(&mut result, &text),
 			Piece::Capture(index) => result.push(Piece::Capture(index)),
+			Piece::CaptureOrGap(index) => result.push(Piece::CaptureOrGap(index)),
 		}
 	}
 	result
@@ -702,7 +940,7 @@ fn pieces_source(pieces: &[Piece]) -> String {
 	for piece in pieces {
 		match piece {
 			Piece::Text(text) => output.push_str(text),
-			Piece::Capture(_) => output.push_str(GAP),
+			Piece::Capture(_) | Piece::CaptureOrGap(_) => output.push_str(GAP),
 		}
 	}
 	output
@@ -766,10 +1004,28 @@ struct PlannedEdit {
 	operation:   usize,
 }
 
+/// Atomic sloppy application result with non-fatal parser recovery notes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SloppyApply {
+	/// Final source bytes.
+	pub content: String,
+	/// Recovery decisions in authored operation order.
+	pub notes:   Vec<Str>,
+}
+
 /// Applies one section atomically. Operations address the original source;
 /// errors never expose a partially applied result.
 pub fn apply_sloppy(source: &str, input: &str) -> Result<String, SloppyError> {
-	let operations = parse_operations(input)?;
+	Ok(apply_sloppy_detailed(source, input, None)?.content)
+}
+
+/// Applies one path-aware section atomically and returns recovery notes.
+pub fn apply_sloppy_detailed(
+	source: &str,
+	input: &str,
+	path: Option<&str>,
+) -> Result<SloppyApply, SloppyError> {
+	let operations = parse_operations(input, source, path)?;
 	let mut planned = Vec::<PlannedEdit>::new();
 	let mut queue = (0..operations.len()).collect::<VecDeque<_>>();
 	let mut deferred = vec![false; operations.len()];
@@ -801,7 +1057,11 @@ pub fn apply_sloppy(source: &str, input: &str) -> Result<String, SloppyError> {
 	if output == source {
 		return Err(SloppyError::NoChange { operation: operations.len() });
 	}
-	Ok(output)
+	let notes = operations
+		.into_iter()
+		.filter_map(|operation| operation.recovery_note)
+		.collect();
+	Ok(SloppyApply { content: decode_literal_markers(&output), notes })
 }
 
 fn plan_operation(
@@ -894,9 +1154,18 @@ fn render_pieces(pieces: &[Piece], captures: &[String]) -> String {
 					output.push_str(GAP);
 				}
 			},
+			Piece::CaptureOrGap(index) => {
+				if let Some(capture) = captures.get(*index)
+					&& !capture.contains('\n')
+				{
+					output.push_str(capture);
+				} else {
+					output.push_str(GAP);
+				}
+			},
 		}
 	}
-	output
+	decode_literal_markers(&output)
 }
 
 fn minimal_edit(
@@ -1379,11 +1648,12 @@ mod tests {
 	}
 
 	#[test]
-	fn markerless_desired_text_is_rejected() {
-		assert!(matches!(
-			apply_sloppy("if (!entry)\n  fail();\n", "§\nif (entry)\n  fail();"),
-			Err(SloppyError::Malformed { .. })
-		));
+	fn markerless_desired_text_repairs_the_closest_block() {
+		assert_eq!(
+			apply_sloppy("if (!entry)\n  fail();\n", "§\nif (entry)\n  fail();")
+				.expect("closest repair"),
+			"if (entry)\n  fail();\n"
+		);
 	}
 
 	#[test]
@@ -1463,4 +1733,85 @@ mod tests {
 		let input = "§\nalpha ⟪old│new⟫\n§\nbeta ⟪old│new⟫";
 		assert_eq!(apply_sloppy(source, input).expect("atomic"), "alpha new\nbeta new\n");
 	}
+	#[test]
+	fn fails_closed_on_unclaimed_whole_line_rewrite_gap() {
+		let error = apply_sloppy("use a;\nfn f() {}\n", "§\nuse a;\n»\nuse b;\n…\nfn f() {}")
+			.expect_err("stray rewrite gap must fail");
+		assert!(error.to_string().contains("whole-line …"));
+	}
+
+	#[test]
+	fn retry_payload_preserves_prior_operations_and_path() {
+		let error = apply_sloppy_detailed(
+			"const a = 1;\nkeep();\n",
+			"§\nconst a = ⟪1│2⟫;\n§\nkeep();",
+			Some("src/a.rs"),
+		)
+		.expect_err("missing rewrite must return skeleton");
+		let message = error.to_string();
+		assert!(message.contains("§src/a.rs\nconst a = ⟪1│2⟫;\n§\nkeep();\n»\n<new text>"));
+		assert_eq!(message.matches("Copy-ready corrected payload").count(), 1);
+	}
+
+	#[test]
+	fn literal_box_dividers_and_marker_add_lines_are_recovered() {
+		let applied = apply_sloppy_detailed(
+			"row(\"│ a │\", x);\nrun();\ndone();\n",
+			"§\nrow(⟪\"│ a │\", x│\"│ b │\", y⟫);\n§\nrun();\n＋const sel = '⟪a│b⟫';",
+			Some("box.ts"),
+		)
+		.expect("ambiguous box selection has deterministic recovery");
+		assert_eq!(applied.content, "row(\"│ b │\", y);\nrun();\nconst sel = '⟪a│b⟫';\ndone();\n");
+		assert!(applied.notes.iter().any(|note| note.contains("middle")));
+	}
+
+	#[test]
+	fn add_run_above_gap_stays_below_its_preceding_anchor() {
+		let source = "use std::{\n\tfs,\n\titer,\n};\n\nfn main() {}\n";
+		let input = "§\n\tfs,\n＋\tio,\n…\nfn main() {}";
+		assert_eq!(
+			apply_sloppy(source, input).expect("gap anchored add"),
+			"use std::{\n\tfs,\n\tio,\n\titer,\n};\n\nfn main() {}\n"
+		);
+	}
+
+	#[test]
+	fn closest_desired_block_requires_a_decisive_margin() {
+		let applied = apply_sloppy_detailed(
+			"    if (!entry_row)\n      fail();\n",
+			"§\n    if (entry_row)\n      fail();",
+			Some("x.ts"),
+		)
+		.expect("one close block");
+		assert_eq!(applied.content, "    if (entry_row)\n      fail();\n");
+		assert!(applied.notes.iter().any(|note| note.contains("closest matching block")));
+
+		let ambiguous = "if (!left_entry) { fail(); }\nif (!right_entry) { fail(); }\n";
+		assert!(matches!(
+			apply_sloppy(ambiguous, "§\nif (entry) { fail(); }"),
+			Err(SloppyError::Retry { .. })
+		));
+	}
+
+	#[test]
+	fn echoed_line_rewrite_expands_the_bare_selection() {
+		let applied = apply_sloppy_detailed(
+			"  screen = [y -> Blank],  \\* viewport\nnext();\n",
+			"§\n  screen = [y -> ⟪Blank⟫],  \\* viewport\n»\n  screen = [y -> IF y = 1 THEN Row ELSE Blank],  \\* row one",
+			Some("spec.tla"),
+		)
+		.expect("echoed line");
+		assert_eq!(applied.content, "  screen = [y -> IF y = 1 THEN Row ELSE Blank],  \\* row one\nnext();\n");
+	}
+
+	#[test]
+	fn midline_rewrite_ellipsis_does_not_consume_a_multiline_capture() {
+		let source = "function f() {\n  a();\n  b();\n}\n";
+		let input = "§\nfunction f() {\n…\n}\n»\nfunction f() {\n  return `${x}[… ]${y}`;\n}";
+		assert_eq!(
+			apply_sloppy(source, input).expect("literal midline ellipsis"),
+			"function f() {\n  return `${x}[… ]${y}`;\n}\n"
+		);
+	}
+
 }
