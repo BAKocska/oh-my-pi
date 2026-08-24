@@ -97,6 +97,37 @@ impl GitQuery {
 	) -> Result<Bytes, CommandError> {
 		self.bytes(cwd, &["show", spec], cancel).await
 	}
+	/// Streams exact blob stdout frames from one `git show` object spec.
+	///
+	/// `on_stdout` observes bounded chunks as they arrive. The returned bytes
+	/// are the complete bounded stdout so callers can resolve binary and media
+	/// content after progressive text delivery.
+	pub async fn show_path_stream(
+		&self,
+		cwd: &Path,
+		spec: &str,
+		cancel: &CancellationToken,
+		on_stdout: &mut (impl FnMut(Bytes) + Send),
+	) -> Result<Bytes, CommandError> {
+		let output = self
+			.runner
+			.run_stream(
+				cwd,
+				&["show", spec],
+				GitRunOptions { read_only: true, parse_sensitive: true, ..Default::default() },
+				cancel,
+				on_stdout,
+			)
+			.await?;
+		if output.exit_code != 0 {
+			return Err(CommandError::Exit {
+				code:   output.exit_code,
+				stdout: output.stdout,
+				stderr: output.stderr,
+			});
+		}
+		Ok(output.stdout)
+	}
 
 	/// Lists tracked files in-process via gitoxide, falling back to `git
 	/// ls-files -z`.

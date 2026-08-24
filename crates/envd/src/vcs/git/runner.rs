@@ -136,7 +136,26 @@ impl GitRunner {
 		cancel: &CancellationToken,
 	) -> Result<GitRunOutput, GitRunError> {
 		self
-			.run_binary_with_stdin(cwd, SYSTEM_GIT, argv, options, None, cancel)
+			.run_binary_with_stdin(cwd, SYSTEM_GIT, argv, options, None, None, cancel)
+			.await
+	}
+
+	/// Runs one fixed Git argv, delivering each bounded standard-output frame
+	/// to `on_stdout` as Environment produces it.
+	///
+	/// The returned output retains the same independent 8 MiB stdout/stderr
+	/// caps and terminal diagnostics as [`Self::run`]. Frames delivered to the
+	/// callback never include bytes beyond the stdout cap.
+	pub async fn run_stream(
+		&self,
+		cwd: &Path,
+		argv: &[&str],
+		options: GitRunOptions,
+		cancel: &CancellationToken,
+		on_stdout: &mut (impl FnMut(Bytes) + Send),
+	) -> Result<GitRunOutput, GitRunError> {
+		self
+			.run_binary_with_stdin(cwd, SYSTEM_GIT, argv, options, None, Some(on_stdout), cancel)
 			.await
 	}
 
@@ -154,7 +173,7 @@ impl GitRunner {
 		cancel: &CancellationToken,
 	) -> Result<GitRunOutput, GitRunError> {
 		self
-			.run_binary_with_stdin(cwd, SYSTEM_GIT, argv, options, Some(input), cancel)
+			.run_binary_with_stdin(cwd, SYSTEM_GIT, argv, options, Some(input), None, cancel)
 			.await
 	}
 
@@ -168,7 +187,7 @@ impl GitRunner {
 		cancel: &CancellationToken,
 	) -> Result<GitRunOutput, GitRunError> {
 		self
-			.run_binary_with_stdin(cwd, binary, argv, options, None, cancel)
+			.run_binary_with_stdin(cwd, binary, argv, options, None, None, cancel)
 			.await
 	}
 
@@ -179,6 +198,7 @@ impl GitRunner {
 		argv: &[&str],
 		options: GitRunOptions,
 		input: Option<&[u8]>,
+		mut stdout_stream: Option<&mut (dyn FnMut(Bytes) + Send)>,
 		cancel: &CancellationToken,
 	) -> Result<GitRunOutput, GitRunError> {
 		let cwd = match tokio::fs::canonicalize(cwd).await {
@@ -248,7 +268,13 @@ impl GitRunner {
 			};
 			match event {
 				Some(ExecEvent::Output(frame)) if frame.channel == OutputChannel::Stdout as i32 => {
+					let streamed = stdout.remaining().min(frame.data.len());
 					stdout.push(&frame.data);
+					if streamed > 0
+						&& let Some(on_stdout) = stdout_stream.as_deref_mut()
+					{
+						on_stdout(frame.data.slice(..streamed));
+					}
 				},
 				Some(ExecEvent::Output(frame)) if frame.channel == OutputChannel::Stderr as i32 => {
 					stderr.push(&frame.data);
@@ -394,6 +420,13 @@ impl CappedOutput {
 		self.bytes.extend_from_slice(&bytes[..remaining]);
 		self.bytes.extend_from_slice(TRUNCATION_MARKER);
 		self.truncated = true;
+	}
+	fn remaining(&self) -> usize {
+		if self.truncated {
+			0
+		} else {
+			OUTPUT_LIMIT.saturating_sub(self.bytes.len())
+		}
 	}
 
 	pub(super) fn finish(self) -> Bytes {

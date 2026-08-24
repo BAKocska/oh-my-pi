@@ -674,6 +674,18 @@ async fn vcs_commands_queries_and_diff_round_trip_real_repository_bytes() {
 			.unwrap(),
 		Bytes::from_static(b"seed\n")
 	);
+	let mut streamed = Vec::new();
+	let streamed_output = query
+		.show_path_stream(fixture.path(), "HEAD:seed.txt", &cancel, &mut |chunk| {
+			streamed.push(chunk);
+		})
+		.await
+		.unwrap();
+	assert_eq!(streamed_output, Bytes::from_static(b"seed\n"));
+	assert_eq!(
+		streamed.iter().flat_map(|chunk| chunk.iter().copied()).collect::<Vec<_>>(),
+		b"seed\n"
+	);
 	let object_spec = format!("{head}:seed.txt");
 	assert_eq!(
 		query
