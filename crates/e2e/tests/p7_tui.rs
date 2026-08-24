@@ -257,7 +257,6 @@ impl ScriptedGateway {
 			("tts", ""),
 			("report_issue", ""),
 			("vibe", ""),
-			("dyn", ""),
 		] {
 			tools
 				.register(ProofTool::new(name, family), Presentation::Slot, Claims {

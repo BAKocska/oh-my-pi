@@ -655,7 +655,6 @@ fn binary_gateway_tools() -> Arc<Registry> {
 		"tts",
 		"report_issue",
 		"vibe",
-		"dyn",
 	] {
 		registry
 			.register_worker(
