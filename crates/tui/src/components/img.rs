@@ -1,5 +1,6 @@
 use std::{io, str};
 
+use bytes::Bytes;
 use omp_core::IntoStr;
 
 use crate::{
@@ -66,6 +67,8 @@ pub struct Img {
 	props:  Props,
 	slot:   Slot,
 	state:  ImgState,
+	bytes:  Option<Bytes>,
+	dims:   Option<ImageDimensions>,
 	kitty:  Option<(u32, u16, u16)>,
 	/// Cached `src`-interned placeholder box, resolved at most once.
 	auto:   AutoBox,
@@ -80,6 +83,8 @@ impl Img {
 			props:  Props::new(),
 			slot:   next_slot(),
 			state:  ImgState::default(),
+			bytes:  None,
+			dims:   None,
 			kitty:  None,
 			auto:   AutoBox::Unresolved,
 			top:    String::new(),
@@ -87,8 +92,35 @@ impl Img {
 		}
 	}
 
+	/// Creates an image backed by immutable in-memory encoded bytes.
+	///
+	/// Dimensions are probed immediately with [`imagefmt`] while pixel
+	/// decoding remains lazy until layout needs the image.
+	pub fn from_bytes(bytes: Bytes) -> Self {
+		let dims = imagefmt::dimensions(&bytes);
+		Self { bytes: Some(bytes), dims, ..Self::new() }
+	}
+
+	/// Replaces the source with immutable in-memory encoded bytes.
+	pub fn with_bytes(mut self, bytes: Bytes) -> Self {
+		self.dims = imagefmt::dimensions(&bytes);
+		self.bytes = Some(bytes);
+		self.state = ImgState::default();
+		self.kitty = None;
+		self.auto = AutoBox::Unresolved;
+		self
+	}
+
+	/// Returns dimensions detected from an in-memory source.
+	pub const fn dimensions(&self) -> Option<ImageDimensions> {
+		self.dims
+	}
+
 	/// Sets one image property.
 	pub fn with(mut self, prop: Prop, value: impl Into<PropValue>) -> Self {
+		if self.bytes.is_some() && matches!(prop, Prop::W | Prop::H | Prop::Trim) {
+			self.state = ImgState::default();
+		}
 		self.props.set(prop, value);
 		self
 	}
@@ -116,7 +148,7 @@ impl Img {
 	/// on any pixel tier, else a `src`-interned placeholder box on the
 	/// Kitty-placeholder tier. `None` selects the half-block/box fallback.
 	fn cell_box(&mut self, ctx: &UiContext) -> Option<(u32, u16, u16)> {
-		if ctx.graphics == Graphics::Cells {
+		if ctx.graphics == Graphics::Cells || self.bytes.is_some() {
 			return None;
 		}
 		if self.kitty.is_some() {
@@ -140,21 +172,34 @@ impl Img {
 		match self.props.w() {
 			Some(Dim::Cells(cells)) => cells,
 			Some(Dim::Pct(percent)) => (u32::from(available) * u32::from(percent) / 100).max(1) as u16,
-			None => 24,
+			None => {
+				if self.bytes.is_some() {
+					available.max(1)
+				} else {
+					24
+				}
+			},
 		}
 		.min(available.max(1))
 	}
 
 	fn ensure_decoded(&mut self, ctx: &UiContext, available: u16) {
-		if self.state.phase != Load::Unloaded {
-			return;
-		}
 		let source = self
 			.props
 			.str_of(Prop::Src)
 			.map_or("", |value| value.as_str());
 		let width = self.requested_width(available);
+		if self.state.phase != Load::Unloaded {
+			if self.bytes.is_none() || self.state.width == width {
+				return;
+			}
+			self.state = ImgState::default();
+		}
 		let trim = self.props.flag(Prop::Trim);
+		if let Some(bytes) = &self.bytes {
+			self.state = decode_bytes(bytes, width, self.props.h(), trim);
+			return;
+		}
 		if let Some(loader) = &ctx.loader {
 			loader.request(
 				self.slot,
@@ -273,7 +318,11 @@ impl Component for Img {
 				.props
 				.str_of(Prop::Src)
 				.map_or("", |value| value.as_str());
-			let name = source.rsplit('/').next().unwrap_or("image");
+			let name = source
+				.rsplit('/')
+				.next()
+				.filter(|name| !name.is_empty())
+				.unwrap_or("image");
 			let width = self.state.width.min(rect.width);
 			let rows = self.state.rows.min(rect.height);
 			if width == 0 || rows == 0 {
@@ -450,7 +499,28 @@ pub fn decode_source(
 	height_cells: Option<u16>,
 	trim: bool,
 ) -> ImgState {
-	match decode_image(source) {
+	let Some(bytes) = imagereg::source_bytes(source) else {
+		return ImgState {
+			cells: Box::default(),
+			width: width_cells.max(1),
+			rows:  3,
+			phase: Load::Boxed,
+		};
+	};
+	decode_bytes(&bytes, width_cells, height_cells, trim)
+}
+
+/// Decodes and cell-samples immutable in-memory image bytes.
+///
+/// Invalid or dimension-only formats settle to a boxed placeholder rather
+/// than panicking.
+pub fn decode_bytes(
+	bytes: &[u8],
+	width_cells: u16,
+	height_cells: Option<u16>,
+	trim: bool,
+) -> ImgState {
+	match decode_image_bytes(bytes) {
 		Some(DecodedImage::Pixels(mut pixels))
 			if !pixels.is_empty() && pixels.first().is_some_and(|row| !row.is_empty()) =>
 		{
@@ -499,14 +569,34 @@ fn trim_transparent(pixels: Vec<Vec<[u8; 4]>>) -> Vec<Vec<[u8; 4]>> {
 
 fn decode_image(source: &str) -> Option<DecodedImage> {
 	let bytes = imagereg::source_bytes(source)?;
+	decode_image_bytes(&bytes)
+}
+
+fn decode_image_bytes(bytes: &[u8]) -> Option<DecodedImage> {
 	if bytes.starts_with(b"P6") {
-		return decode_ppm(&bytes).map(DecodedImage::Pixels);
+		return decode_ppm(bytes).map(DecodedImage::Pixels);
 	}
-	let dimensions = imagefmt::dimensions(&bytes)?;
+	let dimensions = imagefmt::dimensions(bytes)?;
 	if !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+		if let Ok(image) = image::load_from_memory(bytes) {
+			let pixels = image.into_rgba8();
+			let width = usize::try_from(pixels.width()).ok()?;
+			let rows = pixels
+				.into_raw()
+				.chunks_exact(width.saturating_mul(4))
+				.map(|row| {
+					row.as_chunks::<4>()
+						.0
+						.iter()
+						.map(|pixel| [pixel[0], pixel[1], pixel[2], pixel[3]])
+						.collect()
+				})
+				.collect();
+			return Some(DecodedImage::Pixels(rows));
+		}
 		return Some(DecodedImage::Placeholder(dimensions));
 	}
-	decode_png(&bytes)
+	decode_png(bytes)
 		.map(DecodedImage::Pixels)
 		.or(Some(DecodedImage::Placeholder(dimensions)))
 }
@@ -712,6 +802,23 @@ mod tests {
 		let pixels = decode_png(&bytes).unwrap();
 		assert_eq!(pixels[0][0], [255, 0, 0, 255], "palette index 0 is opaque red");
 		assert_eq!(pixels[1][1], [0, 0, 255, 0], "palette index 1 is transparent blue");
+	}
+
+	#[test]
+	fn in_memory_bytes_probe_dimensions_and_decode_lazily() {
+		let mut encoded = Vec::new();
+		{
+			let mut encoder = png::Encoder::new(&mut encoded, 2, 3);
+			encoder.set_color(png::ColorType::Rgba);
+			encoder.set_depth(png::BitDepth::Eight);
+			let mut writer = encoder.write_header().unwrap();
+			writer.write_image_data(&[255; 2 * 3 * 4]).unwrap();
+		}
+		let mut image = Img::from_bytes(Bytes::from(encoded)).with(Prop::W, 2_u16);
+		assert_eq!(image.dimensions(), Some(ImageDimensions { width: 2, height: 3 }));
+		assert_eq!(image.state.phase, Load::Unloaded);
+		assert_eq!(image.height(&UiContext::default(), 2), 2);
+		assert_eq!(image.state.phase, Load::Ready);
 	}
 
 	#[test]

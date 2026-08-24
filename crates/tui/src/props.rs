@@ -367,6 +367,12 @@ define_props! {
 	Strike("strike") => strike: bool;
 	/// Enables wrapping rows; on text, a value selects the wrapping mode.
 	Wrap("wrap") => wrap: WrapValue;
+	/// Visual treatment for an interactive control.
+	Variant("variant") => variant: Str;
+	/// Marks an interactive control as selected or enabled.
+	Active("active") => active: bool;
+	/// Theme token or CSS color used as a control's semantic base color.
+	Color("color") => color: PropColor;
 	/// Enables text truncation.
 	Truncate("truncate") => truncate: Toggle<Truncate> [toggle Truncate; "Returns the configured truncation side, if truncation is enabled."];
 	/// Crops transparent image margins before cell sampling.
@@ -395,6 +401,14 @@ define_props! {
 	Custom("custom") => custom: bool;
 	/// Obscures input contents.
 	Mask("mask") => mask: bool;
+	/// Initial checked state for a checkbox.
+	Checked("checked") => checked: bool;
+	/// Reference character limit used by the remaining-character counter.
+	Limit("limit") => limit: u16 [copy u16; "Returns the configured input character limit."];
+	/// Draws a focus-sensitive leading rail beside editable text.
+	Rail("rail") => rail: bool;
+	/// Maximum editor viewport height in rows.
+	MaxRows("max-rows") => max_rows: u16 [copy u16; "Returns the configured editor row cap."];
 	/// Marks an option as the recommended default.
 	Recommended("recommended") => recommended: bool;
 	/// Expands a tree node initially.
@@ -447,6 +461,8 @@ define_props! {
 	Partial("partial") => partial: bool [default bool = false; "Returns whether the content is still streaming."];
 	/// Number of unchanged lines retained around each diff change.
 	Context("context") => context: u16 [copy u16; "Returns the configured diff context-line count."];
+	/// Draws the diff pane's density minimap.
+	Minimap("minimap") => minimap: bool;
 }
 
 /// A property value rejected by the key-aware parser.
@@ -724,6 +740,7 @@ impl Props {
 				_ => None,
 			},
 			Prop::Options => self.options.as_ref(),
+			Prop::Variant => self.variant.as_ref(),
 			Prop::Label => self.label.as_ref(),
 			Prop::Desc => self.desc.as_ref(),
 			Prop::Kind => self.kind.as_ref(),
@@ -791,11 +808,13 @@ impl Props {
 			Prop::Bc => self.bc.as_ref(),
 			Prop::Edge => self.edge.as_ref(),
 			Prop::Hover => self.hover.as_ref(),
+			Prop::Color => self.color.as_ref(),
 			_ => None,
 		}
 	}
 
-	fn color(&self, prop: Prop, theme: &Theme) -> Option<Color> {
+	/// Resolves a color-bearing property against the active theme.
+	pub fn color(&self, prop: Prop, theme: &Theme) -> Option<Color> {
 		match self.color_slot(prop)? {
 			PropColor::Solid(value) => Some(*value),
 			PropColor::Token(value) => theme.token(value),
@@ -1098,6 +1117,27 @@ mod tests {
 	}
 
 	#[test]
+	fn control_and_editor_props_keep_typed_storage() {
+		let props = Props::new()
+			.with(Prop::Variant, "pill")
+			.with(Prop::Active, true)
+			.with(Prop::Color, "ok")
+			.with(Prop::Checked, false)
+			.with(Prop::Limit, "72")
+			.with(Prop::Rail, true)
+			.with(Prop::MaxRows, "8")
+			.with(Prop::Minimap, true);
+		assert_eq!(props.get(Prop::Variant), Some(PropValue::Str(Str::new("pill"))));
+		assert_eq!(props.get(Prop::Active), Some(PropValue::Bool(true)));
+		assert_eq!(props.get(Prop::Color), Some(PropValue::Token(Str::new("ok"))));
+		assert_eq!(props.get(Prop::Checked), Some(PropValue::Bool(false)));
+		assert_eq!(props.get(Prop::Limit), Some(PropValue::U16(72)));
+		assert_eq!(props.get(Prop::Rail), Some(PropValue::Bool(true)));
+		assert_eq!(props.get(Prop::MaxRows), Some(PropValue::U16(8)));
+		assert_eq!(props.get(Prop::Minimap), Some(PropValue::Bool(true)));
+	}
+
+	#[test]
 	fn gradients_and_angles_use_standard_color_properties() {
 		let props = Props::new()
 			.with(Prop::Bg, "accent..info")
@@ -1194,7 +1234,7 @@ mod tests {
 			assert_eq!(name.parse(), Ok(prop));
 			count += 1;
 		}
-		assert_eq!(count, 71);
+		assert_eq!(count, 79);
 	}
 
 	#[test]

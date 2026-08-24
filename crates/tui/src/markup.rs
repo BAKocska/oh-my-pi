@@ -58,6 +58,8 @@
 //! appears; the active [`crate::Charset`] picks the glyph
 //! (unicode | nerd | ascii) and unknown names degrade to the bare name.
 //! `<pre>` is a verbatim block for ASCII/half-block art.
+//! `<segmented>` owns `<option value icon label/>` children and exposes one
+//! selected value; `<checkbox checked label/>` exposes a boolean value.
 //! `<table>` holds `<tr>` rows of `<td>` cells and solves every column
 //! once across all rows, so cells align vertically; surplus room goes to
 //! `grow` cells' columns and a deficit shrinks the widest flexible column
@@ -80,10 +82,10 @@ use strum::{EnumString, IntoStaticStr};
 use crate::{
 	component::{Cached, Component},
 	components::{
-		Boxed, Button, Callout, Col, CustomElement, DiffKind, DiffView, EditorPane, Field, Form, Hr,
-		Icon, Img, Input, Latex, Markdown, Pre, Progress, Radio, Row, Scroll, Segment, Select,
-		SelectOption, Spacer, Spinner, Status, Table, TableCell, TableRow, Tabs, TaskStatus,
-		TextLeaf, Todo, TodoTask, Tree, TreeNode, Wizard,
+		Boxed, Button, Callout, Checkbox, Col, CustomElement, DiffKind, DiffView, EditorPane, Field,
+		Form, Hr, Icon, Img, Input, Latex, Markdown, Pre, Progress, Radio, Row, Scroll, Segment,
+		Segmented, Select, SelectOption, Spacer, Spinner, Status, Table, TableCell, TableRow, Tabs,
+		TaskStatus, TextLeaf, Todo, TodoTask, Tree, TreeNode, Wizard,
 	},
 	context::{Charset, UiContext},
 	markdown,
@@ -1043,6 +1045,8 @@ fn is_catalog_tag(name: &str) -> bool {
 			| "select"
 			| "option"
 			| "radio"
+			| "segmented"
+			| "checkbox"
 			| "spinner"
 			| "status"
 			| "segment"
@@ -1079,6 +1083,8 @@ fn is_interactive_tag(name: &str) -> bool {
 		"select"
 			| "option"
 			| "radio"
+			| "segmented"
+			| "checkbox"
 			| "input"
 			| "button"
 			| "scroll"
@@ -1095,7 +1101,7 @@ fn is_interactive_tag(name: &str) -> bool {
 }
 
 fn is_leaf_tag(name: &str) -> bool {
-	matches!(name, "pre" | "hr" | "spacer" | "radio" | "input" | "progress" | "img")
+	matches!(name, "pre" | "hr" | "spacer" | "radio" | "checkbox" | "input" | "progress" | "img")
 }
 
 fn has_matching_close(mut after: &str, name: &str) -> bool {
@@ -1221,6 +1227,7 @@ fn build(tag: &str, props: Props, children: Vec<Cached>, body: &Str) -> Option<B
 		"select" => configured!(Select::new()),
 		"table" => configured!(Table::new()),
 		"radio" => configured!(Radio::new()),
+		"checkbox" => configured!(Checkbox::new()),
 		"spinner" => configured!(Spinner::new().label(body.clone())),
 		"input" => configured!(Input::new()),
 		"button" => configured!(Button::new().child(body.clone())),
@@ -1249,6 +1256,7 @@ fn build(tag: &str, props: Props, children: Vec<Cached>, body: &Str) -> Option<B
 			};
 			configured!(Icon::named(name))
 		},
+		"segmented" => configured!(Segmented::new()),
 		"option" | "segment" | "tab" | "node" | "field" | "step" | "task" | "tr" | "td" => {
 			return None;
 		},
@@ -1411,6 +1419,23 @@ fn finish_element(
 			let title = props.title().cloned().unwrap_or_else(|| Str::new("step"));
 			let children = cached_children(parts, "step")?;
 			Ok(Parsed::Step { title, children, at })
+		},
+		"segmented" => {
+			let mut segmented = Segmented::new();
+			replay_props!(segmented, props);
+			*segmented.props_mut() = props;
+			for part in parts {
+				match part {
+					Parsed::Option { option, .. } => segmented = segmented.option(option),
+					other => return Err(parent_error(other.name(), "segmented", at)),
+				}
+			}
+			Ok(Parsed::Cached {
+				cached: Box::new(Cached::new(Box::new(segmented))),
+				text: None,
+				at,
+				implicit: false,
+			})
 		},
 		"select" => {
 			let mut select = Select::new();

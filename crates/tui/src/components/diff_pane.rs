@@ -1,14 +1,16 @@
 //! Focusable, scrollable presentation and interaction for [`DiffDocument`].
 
-use std::ops::Range;
+use std::{fmt::Write as _, ops::Range};
 
-use omp_core::{IntoStr, Str};
+use bytes::Bytes;
+use omp_core::{IntoStr, Str, StrMut};
 use smallvec::SmallVec;
 use strum::{EnumString, IntoStaticStr};
 use xutf::Text;
 
 use super::{
 	diff_doc::{DiffDocument, DiffMark, DiffRow, DiffRowKind, DiffSide, DiffStyleRun},
+	img::Img,
 	radio::pill,
 };
 use crate::{
@@ -16,6 +18,7 @@ use crate::{
 	component::{Component, EventCtx, Flow, Hit, HitTag, PaintCtx, Slot, next_slot},
 	context::UiContext,
 	frame::{Color, Rect, Style},
+	imagefmt::ImageDimensions,
 	input::{Key, Mouse, UiEvent},
 	props::{Prop, PropValue, Props},
 };
@@ -48,6 +51,8 @@ pub enum DiffPaneState {
 	Binary,
 	/// The selected input exceeds the host's diff limit.
 	TooLarge,
+	/// Encoded old/new images are ready for preview.
+	Asset,
 	/// The document is ready for display.
 	Ready,
 }
@@ -164,11 +169,22 @@ impl Palette {
 	}
 }
 
+struct AssetSide {
+	image:    Img,
+	metadata: Str,
+}
+
+struct AssetPreview {
+	old: Option<AssetSide>,
+	new: Option<AssetSide>,
+}
+
 /// General-purpose interactive old/new text diff viewer.
 pub struct DiffPane {
 	props:         Props,
 	slot:          Slot,
 	document:      Option<DiffDocument>,
+	asset:         Option<AssetPreview>,
 	state:         DiffPaneState,
 	empty_message: Str,
 	mode:          ViewMode,
@@ -192,6 +208,7 @@ impl DiffPane {
 			props:         Props::new(),
 			slot:          next_slot(),
 			document:      None,
+			asset:         None,
 			state:         DiffPaneState::Empty,
 			empty_message: Str::new_static("No changes"),
 			mode:          ViewMode::Split,
@@ -229,6 +246,7 @@ impl DiffPane {
 	/// change.
 	pub fn set_document(&mut self, document: Option<DiffDocument>, state: DiffPaneState) {
 		self.document = document;
+		self.asset = None;
 		self.state = state;
 		self.version = self.version.wrapping_add(1);
 		self.scroll_top = 0;
@@ -245,6 +263,19 @@ impl DiffPane {
 			}) {
 			self.focus_change(first);
 		}
+	}
+
+	/// Replaces the pane contents with old/new encoded image bytes.
+	///
+	/// Added and deleted assets pass bytes for only the present side. The
+	/// lowercase format token is displayed with detected dimensions and size.
+	pub fn set_asset(&mut self, old: Option<Bytes>, new: Option<Bytes>, format: impl IntoStr) {
+		self.set_document(None, DiffPaneState::Asset);
+		let format = format.into_str();
+		self.asset = Some(AssetPreview {
+			old: old.map(|bytes| asset_side(bytes, &format)),
+			new: new.map(|bytes| asset_side(bytes, &format)),
+		});
 	}
 
 	/// Current presentation mode.
@@ -317,6 +348,13 @@ impl DiffPane {
 			new.0 = 0;
 		}
 		Some(DiffSelection { old, new, explicit: self.anchor.is_some() })
+	}
+
+	/// Clears a shift-extended selection while preserving the cursor row.
+	///
+	/// Returns whether an explicit selection was active.
+	pub fn clear_selection(&mut self) -> bool {
+		self.anchor.take().is_some()
 	}
 
 	/// Resolves an action using explicit selection, current hunk, then file
@@ -411,8 +449,10 @@ impl DiffPane {
 		)
 	}
 
-	fn body_width(width: u16) -> u16 {
-		width.saturating_sub(1).max(1)
+	fn body_width(&self, width: u16) -> u16 {
+		width
+			.saturating_sub(if self.props.flag(Prop::Minimap) { 2 } else { 0 })
+			.max(1)
 	}
 
 	fn split_text_width(&self, width: u16) -> u16 {
@@ -420,7 +460,8 @@ impl DiffPane {
 			.document
 			.as_ref()
 			.map_or(3, |document| document.gutter_width);
-		Self::body_width(width)
+		self
+			.body_width(width)
 			.saturating_sub(gutter.saturating_add(1).saturating_mul(2).saturating_add(1))
 			.checked_div(2)
 			.unwrap_or(1)
@@ -432,7 +473,8 @@ impl DiffPane {
 			.document
 			.as_ref()
 			.map_or(3, |document| document.gutter_width);
-		Self::body_width(width)
+		self
+			.body_width(width)
 			.saturating_sub(gutter.saturating_mul(2).saturating_add(3))
 			.max(1)
 	}
@@ -442,7 +484,8 @@ impl DiffPane {
 			.document
 			.as_ref()
 			.map_or(3, |document| document.gutter_width);
-		Self::body_width(width)
+		self
+			.body_width(width)
 			.saturating_sub(gutter.saturating_add(1))
 			.max(1)
 	}
@@ -704,12 +747,86 @@ impl DiffPane {
 		}
 	}
 
+	fn paint_asset(&mut self, pc: &mut PaintCtx<'_>, rect: Rect) {
+		let Some(asset) = &mut self.asset else {
+			return;
+		};
+		match (&mut asset.old, &mut asset.new) {
+			(Some(old), Some(new)) if rect.width > 1 => {
+				let left_width = rect.width.saturating_sub(1) / 2;
+				let right_width = rect.width.saturating_sub(left_width + 1);
+				Self::paint_asset_side(
+					pc,
+					Rect::new(rect.x, rect.y, left_width, rect.height),
+					"Before",
+					old,
+				);
+				pc.frame.fill(
+					Rect::new(rect.x.saturating_add(left_width), rect.y, 1, rect.height),
+					Style::new().fg(pc.ctx.theme.border),
+				);
+				for row in 0..rect.height {
+					pc.frame.put(
+						rect.x.saturating_add(left_width),
+						rect.y.saturating_add(row),
+						"│",
+						Style::new().fg(pc.ctx.theme.border),
+					);
+				}
+				Self::paint_asset_side(
+					pc,
+					Rect::new(rect.x.saturating_add(left_width + 1), rect.y, right_width, rect.height),
+					"After",
+					new,
+				);
+			},
+			(Some(old), _) => Self::paint_asset_side(pc, rect, "Before", old),
+			(_, Some(new)) => Self::paint_asset_side(pc, rect, "After", new),
+			(None, None) => Self::paint_centered(
+				pc,
+				rect,
+				rect.y.saturating_add(rect.height / 2),
+				"No image data",
+				Style::new().fg(pc.ctx.theme.muted),
+			),
+		}
+	}
+
+	fn paint_asset_side(pc: &mut PaintCtx<'_>, rect: Rect, label: &str, side: &mut AssetSide) {
+		if rect.width == 0 || rect.height == 0 {
+			return;
+		}
+		Self::paint_centered(pc, rect, rect.y, label, Style::new().fg(pc.ctx.theme.fg).bold());
+		if rect.height > 1 {
+			Self::paint_centered(
+				pc,
+				rect,
+				rect.y + 1,
+				&side.metadata,
+				Style::new().fg(pc.ctx.theme.muted),
+			);
+		}
+		if rect.width > 2 && rect.height > 2 {
+			side
+				.image
+				.paint(pc, Rect::new(rect.x + 1, rect.y + 2, rect.width - 2, rect.height - 2));
+		}
+	}
+
+	fn paint_centered(pc: &mut PaintCtx<'_>, rect: Rect, y: u16, text: &str, style: Style) {
+		let width = u16::try_from(text.visible_width()).unwrap_or(u16::MAX);
+		let x = rect.x.saturating_add(rect.width.saturating_sub(width) / 2);
+		pc.frame
+			.put_clipped(x, y, rect.x.saturating_add(rect.width).saturating_sub(x), text, style);
+	}
+
 	fn paint_placeholder(&self, pc: &mut PaintCtx<'_>, rect: Rect) {
 		let message = match self.state {
 			DiffPaneState::Empty | DiffPaneState::Ready => self.empty_message.as_str(),
 			DiffPaneState::Loading => "Loading diff…",
 			DiffPaneState::Binary => "Binary file",
 			DiffPaneState::TooLarge => "File too large to diff",
+			DiffPaneState::Asset => "No image data",
 		};
 		let width = u16::try_from(message.visible_width()).unwrap_or(u16::MAX);
 		let x = rect.x.saturating_add(rect.width.saturating_sub(width) / 2);
@@ -793,7 +910,7 @@ impl DiffPane {
 					.then_some(palette.selection)
 					.unwrap_or(Color::Default);
 				pc.frame
-					.fill(Rect::new(rect.x, y, Self::body_width(rect.width), 1), Style::new().bg(bg));
+					.fill(Rect::new(rect.x, y, self.body_width(rect.width), 1), Style::new().bg(bg));
 				if segment == 0 {
 					pc.frame
 						.put(rect.x, y, &source.gutter, Style::new().fg(pc.ctx.theme.muted).bg(bg));
@@ -889,7 +1006,9 @@ impl DiffPane {
 				strong,
 			);
 		} else {
-			let fill = if old {
+			let fill = if kind == DiffRowKind::Context {
+				Color::Default
+			} else if old {
 				palette.fill_del
 			} else {
 				palette.fill_add
@@ -915,10 +1034,10 @@ impl DiffPane {
 		let document = self.document.as_ref().expect("document");
 		let gutter = document.gutter_width;
 		let text_width = self.line_text_width(self.last_width);
-		let side = if side_kind == SideKind::Old {
-			row.old.as_ref()
-		} else {
-			row.new.as_ref()
+		let side = match side_kind {
+			SideKind::Old => row.old.as_ref(),
+			SideKind::New => row.new.as_ref(),
+			SideKind::Both => row.new.as_ref().or(row.old.as_ref()),
 		};
 		let is_del = side_kind == SideKind::Old && row.kind != DiffRowKind::Context;
 		let is_add = side_kind == SideKind::New && row.kind != DiffRowKind::Context;
@@ -940,7 +1059,7 @@ impl DiffPane {
 		let bg = selection.map_or(base, |selection| base.mix(selection, 0.45));
 		let strong = selection.map_or(strong, |selection| strong.mix(selection, 0.35));
 		pc.frame
-			.fill(Rect::new(x, y, Self::body_width(self.last_width), 1), Style::new().bg(bg));
+			.fill(Rect::new(x, y, self.body_width(self.last_width), 1), Style::new().bg(bg));
 		if segment == 0 {
 			if side_kind != SideKind::New
 				&& let Some(old) = &row.old
@@ -998,7 +1117,7 @@ impl DiffPane {
 
 	fn paint_header(&self, pc: &mut PaintCtx<'_>, rect: Rect, y: u16, hunk: usize, selected: bool) {
 		let document = self.document.as_ref().expect("document");
-		let body = Self::body_width(rect.width);
+		let body = self.body_width(rect.width);
 		let style = Style::new().fg(pc.ctx.theme.accent).bg(
 			selected
 				.then_some(pc.ctx.theme.surface)
@@ -1083,15 +1202,9 @@ impl DiffPane {
 		if total == 0 || bands == 0 {
 			return None;
 		}
-		let from = band.saturating_mul(total) / bands;
-		if from >= total {
-			return None;
-		}
-		let to = ((band + 1).saturating_mul(total) / bands)
-			.max(from + 1)
-			.min(total);
+		let range = minimap_bucket_range(total, band, bands)?;
 		let mut best = MapKind::Context;
-		for visual in &self.layout.visuals[from..to] {
+		for visual in &self.layout.visuals[range] {
 			match self.visual_kind(*visual) {
 				Some(MapKind::Del) => return Some(MapKind::Del),
 				Some(MapKind::Add) => best = MapKind::Add,
@@ -1104,7 +1217,7 @@ impl DiffPane {
 	}
 
 	fn paint_minimap(&self, pc: &mut PaintCtx<'_>, rect: Rect) {
-		if rect.width == 0 || rect.height == 0 {
+		if !self.props.flag(Prop::Minimap) || rect.width < 2 || rect.height == 0 {
 			return;
 		}
 		let x = rect.x.saturating_add(rect.width - 1);
@@ -1117,7 +1230,7 @@ impl DiffPane {
 				let base = match kind? {
 					MapKind::Del => pc.ctx.theme.err,
 					MapKind::Add => pc.ctx.theme.ok,
-					MapKind::Change => pc.ctx.theme.err.mix(pc.ctx.theme.ok, 0.5),
+					MapKind::Change => pc.ctx.theme.ok.mix(pc.ctx.theme.err, 0.5),
 					MapKind::Hunk => pc.ctx.theme.accent,
 					MapKind::Context => pc.ctx.theme.panel.mix(pc.ctx.theme.fg, 0.2),
 				};
@@ -1137,7 +1250,7 @@ impl DiffPane {
 			if top.is_none() && bottom.is_none() {
 				continue;
 			}
-			let glyph = pc.ctx.charset.shadow().unwrap_or("|");
+			let glyph = "▀";
 			pc.frame.put(
 				x,
 				rect.y + row,
@@ -1188,6 +1301,10 @@ impl Component for DiffPane {
 		self.rebuild_layout(rect.width);
 		pc.hits
 			.push(Hit { rect, slot: self.slot, tag: HitTag::Wheel });
+		if self.state == DiffPaneState::Asset {
+			self.paint_asset(pc, rect);
+			return;
+		}
 		if self.state != DiffPaneState::Ready || self.document.is_none() {
 			self.paint_placeholder(pc, rect);
 			return;
@@ -1211,7 +1328,7 @@ impl Component for DiffPane {
 			self.paint_visual(pc, rect, y, visual, selected, palette);
 			if !matches!(visual, Visual::Header { .. }) {
 				pc.hits.push(Hit {
-					rect: Rect::new(rect.x, y, Self::body_width(rect.width), 1),
+					rect: Rect::new(rect.x, y, self.body_width(rect.width), 1),
 					slot: self.slot,
 					tag:  HitTag::DiffRow(visual_index as u32),
 				});
@@ -1288,8 +1405,9 @@ impl Component for DiffPane {
 			(HitTag::DiffMinimap, Mouse::Click | Mouse::Drag) => {
 				if rect.height > 0 && !self.layout.visuals.is_empty() {
 					let row = at.1.saturating_sub(rect.y).min(rect.height - 1);
-					let target =
-						(usize::from(row) * self.layout.visuals.len()) / usize::from(rect.height);
+					let target = (usize::from(row).saturating_mul(2).saturating_add(1)
+						* self.layout.visuals.len())
+						/ usize::from(rect.height).saturating_mul(2);
 					self.scroll_top = target.saturating_sub(usize::from(self.last_height / 2));
 					self.clamp_scroll();
 				}
@@ -1315,6 +1433,64 @@ impl Component for DiffPane {
 			_ => Flow::Skip,
 		}
 	}
+}
+
+fn asset_side(bytes: Bytes, format: &str) -> AssetSide {
+	let byte_len = bytes.len();
+	let image = Img::from_bytes(bytes);
+	let metadata = asset_metadata(format, image.dimensions(), byte_len);
+	AssetSide { image, metadata }
+}
+
+fn asset_metadata(format: &str, dimensions: Option<ImageDimensions>, byte_len: usize) -> Str {
+	let mut metadata = StrMut::with_capacity(48);
+	for character in format.chars() {
+		metadata.push(character.to_ascii_uppercase());
+	}
+	if let Some(dimensions) = dimensions {
+		write!(metadata, " · {}×{}", dimensions.width, dimensions.height)
+			.expect("writing image dimensions to memory cannot fail");
+	} else {
+		metadata.push_str(" · dimensions unavailable");
+	}
+	metadata.push_str(" · ");
+	write_byte_size(&mut metadata, byte_len);
+	metadata.freeze()
+}
+
+fn write_byte_size(output: &mut StrMut, bytes: usize) {
+	const KIB: usize = 1024;
+	const MIB: usize = KIB * KIB;
+	if bytes < KIB {
+		write!(output, "{bytes} B").expect("writing a byte size to memory cannot fail");
+	} else if bytes < MIB {
+		write!(output, "{:.1} KiB", bytes as f64 / KIB as f64)
+			.expect("writing a byte size to memory cannot fail");
+	} else {
+		write!(output, "{:.1} MiB", bytes as f64 / MIB as f64)
+			.expect("writing a byte size to memory cannot fail");
+	}
+}
+
+fn minimap_bucket_range(total: usize, band: usize, bands: usize) -> Option<Range<usize>> {
+	if total == 0 || bands == 0 || band >= bands {
+		return None;
+	}
+	let occupied_bands = total.min(bands);
+	if band >= occupied_bands {
+		return None;
+	}
+	let from = band.saturating_mul(total) / occupied_bands;
+	if from >= total {
+		return None;
+	}
+	let to = (band + 1)
+		.saturating_mul(total)
+		.checked_div(occupied_bands)
+		.unwrap_or(total)
+		.max(from + 1)
+		.min(total);
+	Some(from..to)
 }
 
 fn row_map_kind(kind: DiffRowKind) -> MapKind {
@@ -1491,6 +1667,42 @@ mod tests {
 	}
 
 	#[test]
+	fn minimap_buckets_cover_document_ranges_without_gaps() {
+		assert_eq!(minimap_bucket_range(10, 0, 4), Some(0..2));
+		assert_eq!(minimap_bucket_range(10, 1, 4), Some(2..5));
+		assert_eq!(minimap_bucket_range(10, 2, 4), Some(5..7));
+		assert_eq!(minimap_bucket_range(10, 3, 4), Some(7..10));
+		assert_eq!(minimap_bucket_range(10, 4, 4), None);
+		assert_eq!(minimap_bucket_range(1, 0, 8), Some(0..1));
+		assert_eq!(minimap_bucket_range(1, 1, 8), None);
+	}
+
+	#[test]
+	fn minimap_short_document_marks_only_occupied_prefix() {
+		let mut pane = DiffPane::new().with(Prop::Minimap, true);
+		pane.set_document(
+			Some(DiffDocument::build("", "only", "short.rs", &Default::default())),
+			DiffPaneState::Ready,
+		);
+		pane.set_mode(ViewMode::File);
+		let frame = paint(&mut pane, 40, 6).0;
+		assert_eq!(pane.layout.visuals.len(), 1);
+		assert!(frame_row_text(&frame, 0).ends_with('▀'));
+		for row in 1..6 {
+			assert!(!frame_row_text(&frame, row).ends_with('▀'));
+		}
+	}
+
+	#[test]
+	fn minimap_opt_in_paints_half_blocks_and_hit_target() {
+		let mut pane = DiffPane::new().with(Prop::Minimap, true);
+		pane.set_document(Some(document()), DiffPaneState::Ready);
+		let (frame, hits) = paint(&mut pane, 40, 4);
+		assert!(frame_row_text(&frame, 0).ends_with('▀'));
+		assert!(hits.iter().any(|hit| hit.tag == HitTag::DiffMinimap));
+	}
+
+	#[test]
 	fn selection_maps_to_source_ranges() {
 		let mut pane = DiffPane::new();
 		pane.set_document(Some(document()), DiffPaneState::Ready);
@@ -1501,6 +1713,9 @@ mod tests {
 			pane.selection(),
 			Some(DiffSelection { old: (2, 2), new: (2, 2), explicit: true })
 		);
+		assert!(pane.clear_selection());
+		assert!(!pane.clear_selection());
+		assert_eq!(pane.selection().unwrap().explicit, false);
 	}
 
 	#[test]
@@ -1564,6 +1779,42 @@ mod tests {
 			let frame = paint(&mut pane, 40, 3).0;
 			assert!(frame_row_text(&frame, 1).contains(expected));
 		}
+	}
+
+	#[test]
+	fn asset_metadata_includes_format_dimensions_and_byte_size() {
+		assert_eq!(
+			asset_metadata("png", Some(ImageDimensions { width: 2, height: 3 }), 1536),
+			"PNG · 2×3 · 1.5 KiB"
+		);
+		assert_eq!(asset_metadata("svg", None, 42), "SVG · dimensions unavailable · 42 B");
+	}
+
+	#[test]
+	fn asset_mode_paints_split_and_single_side_previews() {
+		let png = || {
+			let mut encoded = Vec::new();
+			{
+				let mut encoder = png::Encoder::new(&mut encoded, 2, 3);
+				encoder.set_color(png::ColorType::Rgba);
+				encoder.set_depth(png::BitDepth::Eight);
+				let mut writer = encoder.write_header().unwrap();
+				writer.write_image_data(&[255; 2 * 3 * 4]).unwrap();
+			}
+			Bytes::from(encoded)
+		};
+		let mut pane = DiffPane::new();
+		pane.set_asset(Some(png()), Some(png()), "png");
+		let split = paint(&mut pane, 60, 6).0;
+		assert!(frame_row_text(&split, 0).contains("Before"));
+		assert!(frame_row_text(&split, 0).contains("After"));
+		assert!(frame_row_text(&split, 1).contains("PNG · 2×3"));
+		assert!(frame_row_text(&split, 0).contains('│'));
+
+		pane.set_asset(None, Some(png()), "png");
+		let single = paint(&mut pane, 60, 6).0;
+		assert!(!frame_row_text(&single, 0).contains("Before"));
+		assert!(frame_row_text(&single, 0).contains("After"));
 	}
 
 	#[test]

@@ -74,6 +74,17 @@ impl SelectOption {
 		child.extend_children(&mut self.preview);
 		self
 	}
+
+	/// Splits common option metadata for compact controls that do not own
+	/// preview or table-cell subtrees.
+	pub(super) fn into_control_parts(self) -> (Props, Str) {
+		let label = if self.label.is_empty() {
+			self.props.str_of(Prop::Label).cloned().unwrap_or_default()
+		} else {
+			self.label
+		};
+		(self.props, label)
+	}
 }
 
 impl Default for SelectOption {

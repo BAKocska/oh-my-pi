@@ -1,6 +1,7 @@
 mod boxed;
 mod button;
 mod callout;
+mod checkbox;
 mod col;
 mod countdown;
 mod custom;
@@ -23,6 +24,7 @@ mod radio;
 mod row;
 mod scene;
 mod scroll;
+mod segmented;
 mod select;
 mod shader;
 mod spinner;
@@ -39,15 +41,16 @@ mod wizard;
 mod tests;
 
 pub use boxed::Boxed;
-pub use button::Button;
+pub use button::{Button, ButtonVariant};
 pub use callout::Callout;
+pub use checkbox::Checkbox;
 pub use col::Col;
 pub use countdown::Countdown;
 pub use custom::CustomElement;
 pub use diff::{DiffKind, DiffLine, DiffView};
 pub use diff_doc::{
 	DiffBuildOptions, DiffDocument, DiffFileLine, DiffHunk, DiffMark, DiffRow, DiffRowKind,
-	DiffSide, DiffStyleRun,
+	DiffSide, DiffStyleRun, DiffWhitespaceMode,
 };
 pub use diff_pane::{
 	DiffActionKind, DiffPane, DiffPaneState, DiffPatchTarget, DiffSelection, DiffTarget, ViewMode,
@@ -70,6 +73,7 @@ pub use radio::Radio;
 pub use row::Row;
 pub use scene::Scene;
 pub use scroll::Scroll;
+pub use segmented::Segmented;
 pub use select::{Select, SelectOption};
 pub use shader::Shader;
 pub use spinner::Spinner;

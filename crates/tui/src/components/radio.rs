@@ -1,10 +1,11 @@
 use omp_core::Str;
 use smallvec::SmallVec;
 
+pub(super) use super::button::paint_pill as pill;
 use crate::{
 	component::{Component, EventCtx, Flow, Hit, HitTag, PaintCtx, Slot, next_slot},
 	context::{Theme, UiContext},
-	frame::{Color, Frame, Rect, Style},
+	frame::{Rect, Style},
 	input::{Key, Mouse},
 	props::{Prop, PropValue, Props},
 	rich::cell_width,
@@ -217,39 +218,6 @@ impl Component for Radio {
 			.get(usize::from(self.state.idx))
 			.map_or(serde_json::Value::Null, |option| serde_json::Value::String(option.to_string()));
 		out.insert(id.to_string(), value);
-	}
-}
-
-pub(super) fn pill(
-	frame: &mut Frame,
-	x: u16,
-	y: u16,
-	label: &str,
-	background: Color,
-	foreground: Color,
-	caps: (&str, &str),
-	highlight: bool,
-) -> u16 {
-	let background = if highlight {
-		brighten(background)
-	} else {
-		background
-	};
-	let cap = Style::new().fg(background);
-	let body = Style::new().fg(foreground).bg(background).bold();
-	let mut x = frame.put(x, y, caps.0, cap);
-	x = frame.put(x, y, label, body);
-	frame.put(x, y, caps.1, cap)
-}
-
-fn brighten(color: Color) -> Color {
-	match color {
-		Color::Rgb(red, green, blue) => Color::Rgb(
-			red.saturating_add((255 - u16::from(red)) as u8 / 5),
-			green.saturating_add((255 - u16::from(green)) as u8 / 5),
-			blue.saturating_add((255 - u16::from(blue)) as u8 / 5),
-		),
-		other => other,
 	}
 }
 

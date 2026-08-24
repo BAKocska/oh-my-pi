@@ -832,6 +832,20 @@ impl Ui {
 		}
 	}
 
+	/// Moves keyboard focus to the named component when it is visible and
+	/// focusable, activating keyboard chrome. Returns whether focus moved.
+	pub fn focus_id(&mut self, id: &str) -> bool {
+		let Some((slot, ..)) = self.snapshot_id(id) else {
+			return false;
+		};
+		if !self.focus_ring().contains(&slot) {
+			return false;
+		}
+		self.set_keyboard(true);
+		self.assign_focus(Some(slot), true);
+		true
+	}
+
 	/// Clears this tree's focus, removing focus chrome and the caret.
 	///
 	/// Raw-frame layer hosts call this when the keyboard returns to the
@@ -2235,6 +2249,9 @@ mod tests {
 		"reverse",
 		"strike",
 		"wrap",
+		"variant",
+		"active",
+		"color",
 		"truncate",
 		"trim",
 		"id",
@@ -2275,6 +2292,11 @@ mod tests {
 		"reveal",
 		"partial",
 		"context",
+		"checked",
+		"limit",
+		"rail",
+		"max-rows",
+		"minimap",
 	];
 
 	fn frame_text(ui: &Ui) -> Vec<String> {

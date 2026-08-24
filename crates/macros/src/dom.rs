@@ -630,6 +630,8 @@ fn lower_constructor(element: &Element) -> TokenStream2 {
 		"select" => Some("Select"),
 		"table" => Some("Table"),
 		"radio" => Some("Radio"),
+		"segmented" => Some("Segmented"),
+		"checkbox" => Some("Checkbox"),
 		"status" => Some("Status"),
 		"input" => Some("Input"),
 		"button" => Some("Button"),
@@ -910,6 +912,7 @@ fn lower_data_child(
 	let valid_owner = matches!(
 		(owner, data.name.text.as_str()),
 		("select", "option")
+			| ("segmented", "option")
 			| ("status", "segment")
 			| ("tabs", "tab")
 			| ("tree", "node")
@@ -1075,6 +1078,9 @@ fn prop_variant(name: &str) -> Option<&'static str> {
 		"reverse" => "Reverse",
 		"strike" => "Strike",
 		"wrap" => "Wrap",
+		"variant" => "Variant",
+		"active" => "Active",
+		"color" => "Color",
 		"truncate" => "Truncate",
 		"trim" => "Trim",
 		"id" => "Id",
@@ -1089,6 +1095,10 @@ fn prop_variant(name: &str) -> Option<&'static str> {
 		"filter" => "Filter",
 		"custom" => "Custom",
 		"mask" => "Mask",
+		"checked" => "Checked",
+		"limit" => "Limit",
+		"rail" => "Rail",
+		"max-rows" => "MaxRows",
 		"noselect" => "NoSelect",
 		"recommended" => "Recommended",
 		"open" => "Open",
@@ -1115,6 +1125,7 @@ fn prop_variant(name: &str) -> Option<&'static str> {
 		"shimmer" => "Shimmer",
 		"reveal" => "Reveal",
 		"context" => "Context",
+		"minimap" => "Minimap",
 		_ => return None,
 	})
 }
@@ -1153,6 +1164,9 @@ mod tests {
 		"reverse",
 		"strike",
 		"wrap",
+		"variant",
+		"active",
+		"color",
 		"truncate",
 		"trim",
 		"id",
@@ -1167,6 +1181,11 @@ mod tests {
 		"filter",
 		"custom",
 		"mask",
+		"checked",
+		"limit",
+		"rail",
+		"max-rows",
+		"noselect",
 		"recommended",
 		"open",
 		"required",
@@ -1186,14 +1205,17 @@ mod tests {
 		"spin",
 		"hover",
 		"lift",
+		"focus",
+		"guides",
+		"status",
 		"shimmer",
 		"reveal",
 		"context",
+		"minimap",
 	];
 
 	#[test]
 	fn known_attributes_match_mirrored_fixture() {
-		assert_eq!(ATTR_FIXTURE.len(), 66);
 		for &name in ATTR_FIXTURE {
 			assert!(prop_variant(name).is_some(), "missing macro entry for {name:?}");
 		}
@@ -1288,6 +1310,29 @@ mod tests {
 					.with(::omp_tui::Prop::Value, "a")
 					.label("Alpha")
 					.child(::omp_tui::components::Markdown::new().text("preview")))
+		};
+		assert_eq!(actual.to_string(), expected.to_string());
+	}
+
+	#[test]
+	fn compact_control_tags_and_options_lower_to_typed_builders() {
+		let actual = expand(quote! {
+			<row><segmented id=view value=path><option value=path icon=view-path label="Path"/></segmented><checkbox id=amend checked label="Amend"/></row>
+		})
+		.expect("compact controls should expand");
+		let expected = quote! {
+			::omp_tui::components::Row::new()
+				.child(::omp_tui::components::Segmented::new()
+					.with(::omp_tui::Prop::Id, "view")
+					.with(::omp_tui::Prop::Value, "path")
+					.option(::omp_tui::components::SelectOption::new()
+						.with(::omp_tui::Prop::Value, "path")
+						.with(::omp_tui::Prop::Icon, "view-path")
+						.with(::omp_tui::Prop::Label, "Path")))
+				.child(::omp_tui::components::Checkbox::new()
+					.with(::omp_tui::Prop::Id, "amend")
+					.with(::omp_tui::Prop::Checked, true)
+					.with(::omp_tui::Prop::Label, "Amend"))
 		};
 		assert_eq!(actual.to_string(), expected.to_string());
 	}

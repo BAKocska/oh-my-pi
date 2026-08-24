@@ -5,6 +5,7 @@ use std::{fmt::Write as _, ops::Range, path::Path};
 use omp_core::{IntoStr, Str, StrMut};
 use similar::{Algorithm, DiffOp, capture_diff_slices};
 use smallvec::SmallVec;
+use strum::{EnumString, IntoStaticStr};
 use xutf::{Text, width_char};
 
 use crate::{
@@ -101,14 +102,28 @@ pub struct DiffHunk {
 	pub rows:      Range<usize>,
 }
 
+/// How [`DiffDocument::build`] treats whitespace and formatting-only changes.
+#[derive(Clone, Copy, Debug, Default, EnumString, Eq, IntoStaticStr, PartialEq)]
+#[strum(serialize_all = "lowercase")]
+pub enum DiffWhitespaceMode {
+	/// Diff source text exactly.
+	#[default]
+	Off,
+	/// Align lines by trimmed contents.
+	Whitespace,
+	/// Keep exact alignment but render formatting- and import-only blocks as
+	/// context.
+	Formatting,
+}
+
 /// Options controlling construction of a [`DiffDocument`].
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct DiffBuildOptions {
-	/// Align lines by their trimmed contents while retaining raw numbering.
-	pub ignore_whitespace: bool,
+	/// Whitespace and formatting-only change handling.
+	pub whitespace: DiffWhitespaceMode,
 	/// Explicit syntax token or extension; the path extension is used when
 	/// absent.
-	pub language:          Option<Str>,
+	pub language:   Option<Str>,
 }
 
 /// Immutable aligned old/new source text and cached display metadata.
@@ -142,12 +157,12 @@ impl DiffDocument {
 		let new_raw = source_lines(new);
 		let old_display: Vec<Str> = old_raw.iter().map(|line| expand_tabs(line)).collect();
 		let new_display: Vec<Str> = new_raw.iter().map(|line| expand_tabs(line)).collect();
-		let old_basis: Vec<&str> = if options.ignore_whitespace {
+		let old_basis: Vec<&str> = if options.whitespace == DiffWhitespaceMode::Whitespace {
 			old_raw.iter().map(|line| line.trim()).collect()
 		} else {
 			old_raw.clone()
 		};
-		let new_basis: Vec<&str> = if options.ignore_whitespace {
+		let new_basis: Vec<&str> = if options.whitespace == DiffWhitespaceMode::Whitespace {
 			new_raw.iter().map(|line| line.trim()).collect()
 		} else {
 			new_raw.clone()
@@ -172,8 +187,6 @@ impl DiffDocument {
 		};
 
 		let mut rows = Vec::new();
-		let mut additions = 0u32;
-		let mut deletions = 0u32;
 		let mut intraline_pairs = 0usize;
 		for operation in capture_diff_slices(Algorithm::Myers, &old_basis, &new_basis) {
 			match operation {
@@ -197,7 +210,6 @@ impl DiffDocument {
 					}
 				},
 				DiffOp::Delete { old_index, old_len, .. } => {
-					deletions = deletions.saturating_add(old_len as u32);
 					for offset in 0..old_len {
 						rows.push(make_row(
 							DiffRowKind::Del,
@@ -212,7 +224,6 @@ impl DiffDocument {
 					}
 				},
 				DiffOp::Insert { new_index, new_len, .. } => {
-					additions = additions.saturating_add(new_len as u32);
 					for offset in 0..new_len {
 						rows.push(make_row(
 							DiffRowKind::Add,
@@ -227,8 +238,6 @@ impl DiffDocument {
 					}
 				},
 				DiffOp::Replace { old_index, old_len, new_index, new_len } => {
-					deletions = deletions.saturating_add(old_len as u32);
-					additions = additions.saturating_add(new_len as u32);
 					let paired = old_len.min(new_len);
 					for offset in 0..paired {
 						let mut old_side =
@@ -271,6 +280,17 @@ impl DiffDocument {
 			}
 		}
 
+		if options.whitespace == DiffWhitespaceMode::Formatting {
+			demote_formatting_blocks(&mut rows, language);
+		}
+		let additions = rows
+			.iter()
+			.map(|row| u32::from(matches!(row.kind, DiffRowKind::Add | DiffRowKind::Change)))
+			.sum();
+		let deletions = rows
+			.iter()
+			.map(|row| u32::from(matches!(row.kind, DiffRowKind::Del | DiffRowKind::Change)))
+			.sum();
 		let hunks = build_hunks(&rows);
 		let mut row_by_new_line = vec![None; new_display.len().saturating_add(1)];
 		for (index, row) in rows.iter().enumerate() {
@@ -520,6 +540,173 @@ fn syntax_runs(lines: &[Str], language: &str) -> Option<Vec<Box<[DiffStyleRun]>>
 	Some(output)
 }
 
+#[derive(Clone, Copy)]
+enum ImportLanguage {
+	TypeScript,
+	Rust,
+	Go,
+}
+
+fn import_language(language: Option<&str>) -> Option<ImportLanguage> {
+	let language = language?;
+	if ["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs", "typescript", "javascript"]
+		.iter()
+		.any(|candidate| language.eq_ignore_ascii_case(candidate))
+	{
+		Some(ImportLanguage::TypeScript)
+	} else if language.eq_ignore_ascii_case("rs") || language.eq_ignore_ascii_case("rust") {
+		Some(ImportLanguage::Rust)
+	} else if language.eq_ignore_ascii_case("go") {
+		Some(ImportLanguage::Go)
+	} else {
+		None
+	}
+}
+
+fn starts_word(line: &str, word: &str) -> bool {
+	line.strip_prefix(word).is_some_and(|rest| {
+		rest
+			.chars()
+			.next()
+			.is_none_or(|character| !character.is_alphanumeric() && !matches!(character, '_' | '$'))
+	})
+}
+
+fn import_starter(language: ImportLanguage, line: &str) -> bool {
+	match language {
+		ImportLanguage::TypeScript => {
+			starts_word(line, "import")
+				|| (starts_word(line, "export")
+					&& line.contains("from")
+					&& (line.contains('"') || line.contains('\'')))
+		},
+		ImportLanguage::Rust => {
+			starts_word(line, "use")
+				|| line
+					.strip_prefix("pub")
+					.and_then(|rest| rest.find("use").map(|at| &rest[at..]))
+					.is_some_and(|rest| starts_word(rest, "use"))
+				|| line.starts_with("extern crate ")
+		},
+		ImportLanguage::Go => starts_word(line, "import"),
+	}
+}
+
+fn import_continuation(language: ImportLanguage, line: &str) -> bool {
+	match language {
+		ImportLanguage::TypeScript => {
+			(line.starts_with('}') && line.contains("from"))
+				|| line.trim_start_matches("type ").chars().all(|character| {
+					character.is_alphanumeric() || matches!(character, '_' | '$' | ',' | ' ' | '\t')
+				})
+		},
+		ImportLanguage::Rust => line.chars().all(|character| {
+			character.is_alphanumeric()
+				|| matches!(character, '_' | ':' | '*' | '{' | '}' | ',' | ';' | ' ' | '\t')
+		}),
+		ImportLanguage::Go => {
+			matches!(line, "(" | ")")
+				|| (line.contains('"')
+					&& line.chars().all(|character| {
+						character.is_alphanumeric()
+							|| matches!(character, '_' | '.' | '"' | '/' | '-' | ' ' | '\t')
+					}))
+		},
+	}
+}
+
+fn removable_import(language: ImportLanguage, line: &str) -> bool {
+	match language {
+		ImportLanguage::TypeScript => {
+			((starts_word(line, "import") || starts_word(line, "export"))
+				&& (line.contains('"') || line.contains('\'')))
+				|| (line.starts_with('}') && line.contains("from"))
+		},
+		ImportLanguage::Rust => import_starter(language, line) && line.ends_with(';'),
+		ImportLanguage::Go => import_starter(language, line) || line == ")" || line.contains('"'),
+	}
+}
+
+fn stripped_block(rows: &[DiffRow], old: bool, remove: Option<ImportLanguage>) -> String {
+	let mut stripped = String::new();
+	for row in rows {
+		let side = if old {
+			row.old.as_ref()
+		} else {
+			row.new.as_ref()
+		};
+		let Some(side) = side else {
+			continue;
+		};
+		let line = side.text.trim();
+		if remove.is_some_and(|language| removable_import(language, line.as_str())) {
+			continue;
+		}
+		stripped.extend(line.chars().filter(|character| !character.is_whitespace()));
+	}
+	stripped
+}
+
+fn importish_block(rows: &[DiffRow], old: bool, language: ImportLanguage, saw: &mut bool) -> bool {
+	for row in rows {
+		let side = if old {
+			row.old.as_ref()
+		} else {
+			row.new.as_ref()
+		};
+		let Some(side) = side else {
+			continue;
+		};
+		let line = side.text.trim();
+		if line.is_empty() {
+			continue;
+		}
+		if import_starter(language, line.as_str()) {
+			*saw = true;
+		} else if !import_continuation(language, line.as_str()) {
+			return false;
+		}
+	}
+	true
+}
+
+fn demote_formatting_blocks(rows: &mut [DiffRow], language: Option<&str>) {
+	let language = import_language(language);
+	let mut start = 0;
+	while start < rows.len() {
+		if rows[start].kind == DiffRowKind::Context {
+			start += 1;
+			continue;
+		}
+		let mut end = start + 1;
+		while end < rows.len() && rows[end].kind != DiffRowKind::Context {
+			end += 1;
+		}
+		let block = &rows[start..end];
+		let whitespace_only = stripped_block(block, true, None) == stripped_block(block, false, None);
+		let import_only = language.is_some_and(|language| {
+			let mut saw = false;
+			let importish = importish_block(block, true, language, &mut saw)
+				&& importish_block(block, false, language, &mut saw);
+			(importish && saw)
+				|| stripped_block(block, true, Some(language))
+					== stripped_block(block, false, Some(language))
+		});
+		if whitespace_only || import_only {
+			for row in &mut rows[start..end] {
+				row.kind = DiffRowKind::Context;
+				if let Some(side) = &mut row.old {
+					side.marks = Box::default();
+				}
+				if let Some(side) = &mut row.new {
+					side.marks = Box::default();
+				}
+			}
+		}
+		start = end;
+	}
+}
+
 fn build_hunks(rows: &[DiffRow]) -> Vec<DiffHunk> {
 	let changes: Vec<usize> = rows
 		.iter()
@@ -616,11 +803,56 @@ mod tests {
 
 	#[test]
 	fn whitespace_ignore_preserves_raw_line_numbers() {
-		let options = DiffBuildOptions { ignore_whitespace: true, language: None };
+		let options =
+			DiffBuildOptions { whitespace: DiffWhitespaceMode::Whitespace, language: None };
 		let doc = DiffDocument::build(" a\nb", "a\n b", "x.txt", &options);
 		assert!(doc.rows.iter().all(|row| row.kind == DiffRowKind::Context));
 		assert_eq!(doc.rows[1].old.as_ref().unwrap().number, 2);
 		assert_eq!(doc.rows[1].new.as_ref().unwrap().number, 2);
+	}
+
+	#[test]
+	fn formatting_mode_demotes_reflow_but_preserves_real_changes() {
+		let options =
+			DiffBuildOptions { whitespace: DiffWhitespaceMode::Formatting, language: None };
+		let reflow = DiffDocument::build("call(a, b);", "call(\n a,\n b\n);", "x.rs", &options);
+		assert!(
+			reflow
+				.rows
+				.iter()
+				.all(|row| row.kind == DiffRowKind::Context)
+		);
+		assert!(reflow.hunks.is_empty());
+		assert_eq!((reflow.additions, reflow.deletions), (0, 0));
+
+		let changed = DiffDocument::build("call(a, b);", "call(a, c);", "x.rs", &options);
+		assert!(
+			changed
+				.rows
+				.iter()
+				.any(|row| row.kind == DiffRowKind::Change)
+		);
+	}
+
+	#[test]
+	fn formatting_mode_demotes_language_import_changes() {
+		let options =
+			DiffBuildOptions { whitespace: DiffWhitespaceMode::Formatting, language: None };
+		for (path, old, new) in [
+			(
+				"x.ts",
+				"import { a } from \"a\";\nconst x = 1;",
+				"import { b } from \"b\";\nconst x = 1;",
+			),
+			("x.rs", "use crate::a;\nfn main() {}", "use crate::b;\nfn main() {}"),
+			("x.go", "import \"fmt\"\nfunc main() {}", "import \"os\"\nfunc main() {}"),
+		] {
+			let doc = DiffDocument::build(old, new, path, &options);
+			assert!(
+				doc.rows.iter().all(|row| row.kind == DiffRowKind::Context),
+				"{path} imports should be demoted"
+			);
+		}
 	}
 
 	#[test]

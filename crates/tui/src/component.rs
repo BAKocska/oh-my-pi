@@ -1636,9 +1636,9 @@ pub enum HitTag {
 	Row(u16),
 	/// Dropdown row `i` of an open form submenu.
 	Sub(u16),
-	/// Chip `i` of a segment or tab bar.
+	/// Chip `i` of a radio, segmented control, or tab bar.
 	Chip(u16),
-	/// Button face or input line.
+	/// Button face, checkbox mark, or input line.
 	Press,
 	/// Scroll viewport row.
 	Wheel,

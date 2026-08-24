@@ -119,6 +119,47 @@ fn select_cell_options_align_and_seeded_filter_prunes() {
 }
 
 #[test]
+fn segmented_and_checkbox_export_keyboard_and_mouse_transitions() {
+	let mut ui = Ui::from_markup(
+		"<col><segmented id=view value=tree><option value=path icon=view-path label=Path/><option \
+		 value=tree icon=view-tree label=Tree/></segmented><checkbox id=amend checked label=\"Amend \
+		 previous commit\"/></col>",
+		60,
+		UiContext::default(),
+	)
+	.unwrap();
+	let ring = ui.focus_ring();
+	let segmented = ring[0];
+	let checkbox = ring[1];
+	assert_eq!(ui.values()["view"], json!("tree"));
+	assert_eq!(ui.values()["amend"], json!(true));
+
+	ui.set_focus_slot(Some(segmented));
+	assert_eq!(ui.handle_key(Key::Left), UiEvent::None);
+	assert_eq!(ui.values()["view"], json!("path"));
+	let tree = ui
+		.hits()
+		.iter()
+		.find(|hit| hit.slot == segmented && hit.tag == HitTag::Chip(1))
+		.copied()
+		.unwrap();
+	ui.handle_mouse(tree.rect.x, tree.rect.y, Mouse::Click);
+	assert_eq!(ui.values()["view"], json!("tree"));
+
+	ui.set_focus_slot(Some(checkbox));
+	assert_eq!(ui.handle_key(Key::Space), UiEvent::None);
+	assert_eq!(ui.values()["amend"], json!(false));
+	let mark = ui
+		.hits()
+		.iter()
+		.find(|hit| hit.slot == checkbox && hit.tag == HitTag::Press)
+		.copied()
+		.unwrap();
+	ui.handle_mouse(mark.rect.x, mark.rect.y, Mouse::Click);
+	assert_eq!(ui.values()["amend"], json!(true));
+}
+
+#[test]
 fn layer_mouse_routing_translates_bands_and_reports_outside() {
 	use crate::{OverlayAnchor, OverlayOptions, Size, markup::Dim};
 	let mut ui = Ui::from_markup("<button id=go>Go</button>", 20, UiContext::default()).unwrap();

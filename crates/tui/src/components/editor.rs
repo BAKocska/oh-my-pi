@@ -193,10 +193,10 @@ const fn field_caps(charset: Charset) -> (char, char) {
 	}
 }
 
-const fn accent_rail(charset: Charset) -> char {
+const fn accent_rail(charset: Charset, focused: bool) -> char {
 	match charset {
 		Charset::Ascii => '|',
-		Charset::Unicode | Charset::NerdFont => '▎',
+		Charset::Unicode | Charset::NerdFont => if focused { '▎' } else { '▏' },
 	}
 }
 
@@ -382,6 +382,12 @@ impl EditInput {
 		{
 			self.editor.set_text(text);
 		}
+		if prop == Prop::Rail
+			&& let PropValue::Bool(enabled) = &value
+		{
+			self.style =
+				if *enabled { ComposerStyle::Rail } else { ComposerStyle::default() };
+		}
 		self.props.set(prop, value);
 		self
 	}
@@ -394,6 +400,24 @@ impl EditInput {
 	/// Registers the completion engine used by this editable leaf.
 	pub fn set_completion(&mut self, completion: Box<dyn Completion>) {
 		self.editor.set_completion(completion);
+	}
+
+	/// Reports whether the cursor is on the first logical line.
+	pub fn cursor_on_first_line(&self) -> bool {
+		self.editor.buffer().cursor_line() == 0
+	}
+
+	/// Reports whether the cursor is on the last logical line.
+	pub fn cursor_on_last_line(&self) -> bool {
+		let buffer = self.editor.buffer();
+		buffer.cursor_line().saturating_add(1) >= buffer.line_count()
+	}
+
+	fn max_rows(&self) -> u16 {
+		match self.props.get(Prop::MaxRows) {
+			Some(PropValue::U16(rows)) => rows.max(1),
+			_ => 18,
+		}
 	}
 
 	const fn text_width(&self, width: u16, charset: Charset) -> u16 {
@@ -670,6 +694,10 @@ impl Component for EditInput {
 
 	fn height(&mut self, ctx: &UiContext, width: u16) -> u16 {
 		let chrome = self.style.layout(ctx.charset);
+		let minimum = 1_u16
+			.saturating_add(chrome.top_rows)
+			.saturating_add(chrome.bottom_rows);
+		let max_rows = self.max_rows().max(minimum);
 		let input_width = self.text_width(width, ctx.charset);
 		let composer = self
 			.editor
@@ -677,10 +705,10 @@ impl Component for EditInput {
 			.max(1)
 			.saturating_add(chrome.top_rows)
 			.saturating_add(chrome.bottom_rows)
-			.min(18);
+			.min(max_rows);
 		composer
 			.saturating_add(self.picker_height(ctx, width))
-			.min(18)
+			.min(max_rows)
 	}
 
 	fn paint(&mut self, pc: &mut PaintCtx<'_>, rect: Rect) {
@@ -810,7 +838,7 @@ impl Component for EditInput {
 				},
 				ComposerStyle::Rail => {
 					pc.frame.fill(Rect::new(rect.x, y, rect.width, 1), surface);
-					let rail = accent_rail(pc.ctx.charset);
+					let rail = accent_rail(pc.ctx.charset, focused);
 					pc.frame
 						.put(rect.x, y, rail.encode_utf8(&mut [0; 4]), accent);
 				},
@@ -1514,6 +1542,9 @@ fn probe_dimensions(source: &str) -> Option<(u32, u32)> {
 
 /// Editor shell with replaceable editable content, status chrome, and an
 /// attachment preview band.
+///
+/// `placeholder` paints muted empty-state text, while `max-rows` caps the
+/// viewport and leaves cursor-following scroll management to the edit buffer.
 pub struct EditorPane {
 	props:       Props,
 	slot:        Slot,
@@ -1752,7 +1783,7 @@ impl EditorPane {
 	/// Sets one editor-shell property.
 	pub fn with(mut self, prop: Prop, value: impl Into<PropValue>) -> Self {
 		let value = value.into();
-		if matches!(prop, Prop::Id | Prop::Value | Prop::Submit | Prop::Placeholder) {
+		if matches!(prop, Prop::Id | Prop::Value | Prop::Submit | Prop::Placeholder | Prop::MaxRows | Prop::Rail) {
 			self.children[0]
 				.comp_mut()
 				.props_mut()
@@ -1769,6 +1800,14 @@ impl EditorPane {
 							.set_text(&UiContext::default(), text.clone());
 					}
 				},
+				Prop::Rail => {
+					let style = if matches!(value, PropValue::Bool(true)) {
+						ComposerStyle::Rail
+					} else {
+						ComposerStyle::default()
+					};
+					self.set_composer_style(style);
+				},
 				_ => {},
 			}
 		} else {
@@ -1780,6 +1819,30 @@ impl EditorPane {
 	/// Sets one editor-shell property from a string.
 	pub fn with_str(self, prop: Prop, value: &str) -> Self {
 		self.with(prop, value)
+	}
+
+	/// Reports whether the default editable leaf's cursor is on its first
+	/// logical line.
+	///
+	/// Returns `false` when the pane's editable leaf was replaced by a custom
+	/// component that cannot expose cursor state.
+	pub fn cursor_on_first_line(&self) -> bool {
+		self.children[0]
+			.comp()
+			.downcast_ref::<EditInput>()
+			.is_some_and(EditInput::cursor_on_first_line)
+	}
+
+	/// Reports whether the default editable leaf's cursor is on its last
+	/// logical line.
+	///
+	/// Returns `false` when the pane's editable leaf was replaced by a custom
+	/// component that cannot expose cursor state.
+	pub fn cursor_on_last_line(&self) -> bool {
+		self.children[0]
+			.comp()
+			.downcast_ref::<EditInput>()
+			.is_some_and(EditInput::cursor_on_last_line)
 	}
 
 	#[cfg(test)]
@@ -2330,6 +2393,40 @@ mod tests {
 	}
 
 	#[test]
+	fn editor_rail_prop_selects_focus_sensitive_rail_chrome() {
+		let pane = EditorPane::new()
+			.with(Prop::Rail, true)
+			.with(Prop::Placeholder, "Description")
+			.with(Prop::MaxRows, 3_u16);
+		assert!(pane.children[0].comp().props().flag(Prop::Rail));
+		assert_eq!(pane.children[0].comp().props().max_rows(), Some(3));
+
+		let ctx = UiContext::default();
+		let mut editor = Cached::new(Box::new(pane));
+		let height = editor.height(&ctx, 20);
+		editor.place(&ctx, Rect::new(0, 0, 20, height));
+		let mut frame = Frame::new(Size::new(20, height));
+		let mut hits = Vec::new();
+		editor.paint(&mut PaintCtx::new(&mut frame, &ctx, &mut hits, &mut Vec::new()));
+		let blurred = frame_row_text(&frame, 0);
+		assert!(blurred.starts_with("▏ Description"), "{blurred:?}");
+		assert!(!blurred.contains("╰─"), "{blurred:?}");
+
+		let mut ui = Ui::from_root(
+			EditorPane::new()
+				.with(Prop::Rail, true)
+				.with(Prop::Placeholder, "Description"),
+			20,
+			UiContext::default(),
+		);
+		let mut renderer = Renderer::new(Vec::new());
+		ui.present(&mut renderer, 10).unwrap();
+		let focused = frame_row_text(ui.frame(), 0);
+		assert!(focused.starts_with("▎ Description"), "{focused:?}");
+		assert!(!focused.contains("╰─"), "{focused:?}");
+	}
+
+	#[test]
 	fn composer_chrome_degrades_to_ascii_glyphs() {
 		let ctx = UiContext { charset: Charset::Ascii, ..UiContext::default() };
 		let box_ui = Ui::from_root(
@@ -2568,6 +2665,40 @@ mod tests {
 			.collect::<Vec<_>>();
 		assert!(painted.iter().any(|r| r.contains('x')));
 		assert!(!painted.iter().any(|r| r.contains("Ask anything")));
+	}
+
+	#[test]
+	fn editor_pane_max_rows_caps_and_scrolls_the_viewport() {
+		let pane = EditorPane::new()
+			.with(Prop::Id, "input")
+			.with(Prop::Value, "one\ntwo\nthree\nfour\nfive\nsix")
+			.with(Prop::MaxRows, 3_u16);
+		let mut ui = Ui::from_root(pane, 20, UiContext::default());
+		ui.focus_first();
+		assert_eq!(ui.height(), 3);
+
+		let mut renderer = Renderer::new(Vec::new());
+		ui.present(&mut renderer, 10).unwrap();
+		let painted = (0..ui.height())
+			.map(|y| frame_row_text(ui.frame(), y))
+			.collect::<Vec<_>>();
+		assert!(painted.iter().any(|row| row.contains("six")));
+		assert!(!painted.iter().any(|row| row.contains("one")));
+	}
+
+	#[test]
+	fn editor_pane_reports_logical_cursor_boundaries() {
+		let mut pane = EditorPane::new().with(Prop::Value, "first\nmiddle\nlast");
+		assert!(!pane.cursor_on_first_line());
+		assert!(pane.cursor_on_last_line());
+
+		pane.replace_external("first\nmiddle\nlast", true);
+		assert!(pane.cursor_on_first_line());
+		assert!(!pane.cursor_on_last_line());
+
+		pane.replace_external("only", true);
+		assert!(pane.cursor_on_first_line());
+		assert!(pane.cursor_on_last_line());
 	}
 
 	#[test]

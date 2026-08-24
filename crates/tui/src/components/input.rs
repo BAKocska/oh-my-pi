@@ -1,4 +1,4 @@
-use std::iter;
+use std::{fmt::Write as _, iter};
 
 use xutf::Text;
 
@@ -16,10 +16,11 @@ use crate::{
 
 #[derive(Default)]
 struct InputState {
-	text:   String,
-	cursor: u16,
-	mask:   bool,
-	masked: String,
+	text:    String,
+	cursor:  u16,
+	mask:    bool,
+	masked:  String,
+	counter: String,
 }
 
 impl InputState {
@@ -34,9 +35,26 @@ impl InputState {
 				.extend(iter::repeat_n('•', self.text.chars().count()));
 		}
 	}
+
+	fn refresh_counter(&mut self, limit: Option<usize>) {
+		self.counter.clear();
+		let Some(limit) = limit else {
+			return;
+		};
+		let len = self.text.chars().count();
+		if len <= limit {
+			let _ = write!(self.counter, "{}", limit - len);
+		} else {
+			let _ = write!(self.counter, "-{}", len - limit);
+		}
+	}
 }
 
 /// An editable, single-line text field.
+///
+/// The `limit` property reserves only the countdown's current width at the
+/// right edge; `rail` replaces the standard cursor prefix with a focus-colored
+/// one-cell rail.
 pub struct Input {
 	props: Props,
 	slot:  Slot,
@@ -78,7 +96,19 @@ impl Input {
 				self.state.mask = self.props.flag(Prop::Mask);
 				self.state.refresh_mask();
 			},
+			Prop::Limit => {},
 			_ => {},
+		}
+		if matches!(prop, Prop::Value | Prop::Limit) {
+			let limit = self.limit();
+			self.state.refresh_counter(limit);
+		}
+	}
+
+	fn limit(&self) -> Option<usize> {
+		match self.props.get(Prop::Limit) {
+			Some(PropValue::U16(limit)) => Some(usize::from(limit)),
+			_ => None,
 		}
 	}
 
@@ -156,6 +186,8 @@ impl Input {
 			_ => return false,
 		}
 		self.state.refresh_mask();
+		let limit = self.limit();
+		self.state.refresh_counter(limit);
 		true
 	}
 }
@@ -198,49 +230,76 @@ impl Component for Input {
 		pc.hits
 			.push(Hit { rect, slot: self.slot, tag: HitTag::Press });
 		let focused = pc.focus == Some(self.slot);
+		let rail = self.props.flag(Prop::Rail);
+		let prefix = if rail {
+			if focused { "▎" } else { "▏" }
+		} else {
+			pc.ctx.charset.cursor()
+		};
+		let prefix_style = if rail {
+			Style::new().fg(if focused {
+				pc.ctx.theme.accent
+			} else {
+				pc.ctx.theme.border
+			})
+		} else if focused {
+			Style::new().fg(pc.ctx.theme.accent)
+		} else {
+			dim(&pc.ctx.theme)
+		};
+		let content_x = pc.frame.put(rect.x, rect.y, prefix, prefix_style);
+		// Rail inputs align content with the editor's `▎ text` column so
+		// stacked rail fields share one text column.
+		let content_x = if rail { content_x.saturating_add(1) } else { content_x };
+		let right = rect.x.saturating_add(rect.width);
+		let counter_width = cell_width(&self.state.counter).min(rect.width);
+		let counter_start = byte_at_column(
+			&self.state.counter,
+			cell_width(&self.state.counter).saturating_sub(counter_width),
+		);
+		let counter = &self.state.counter[counter_start..];
+		let counter_x = right.saturating_sub(counter_width);
+		let available = counter_x.saturating_sub(content_x);
 		let shown = if self.state.mask {
 			&self.state.masked
 		} else {
 			&self.state.text
 		};
-		let x = pc.frame.put(
-			rect.x,
-			rect.y,
-			pc.ctx.charset.cursor(),
-			if focused {
-				Style::new().fg(pc.ctx.theme.accent)
-			} else {
-				dim(&pc.ctx.theme)
-			},
-		);
 		if shown.is_empty() && !focused {
 			if let Some(placeholder) = self.props.str_of(Prop::Placeholder) {
+				let end = byte_at_column(placeholder, available);
 				pc.frame
-					.put(x, rect.y, placeholder, dim(&pc.ctx.theme).italic());
+					.put(content_x, rect.y, &placeholder[..end], dim(&pc.ctx.theme).italic());
 			}
-			return;
-		}
-		let available = rect.width.saturating_sub(3);
-		let total = cell_width(shown);
-		let left = if total > available {
-			self
-				.state
-				.cursor
-				.saturating_sub(available.saturating_sub(8))
-		} else {
-			0
-		};
-		let start = byte_at_column(shown, left);
-		let visible = &shown[start..];
-		if focused {
-			// The real terminal cursor marks the insertion point — one
-			// cursor treatment across every core single-line editor.
-			let split = byte_at_column(visible, self.state.cursor.saturating_sub(left));
-			pc.frame.put(x, rect.y, visible, base(&pc.ctx.theme));
+		} else if available > 0 {
+			let total = cell_width(shown);
+			let cursor_room = available.saturating_sub(u16::from(focused));
+			let left = if total > available || self.state.cursor > cursor_room {
+				self.state.cursor.saturating_sub(cursor_room)
+			} else {
+				0
+			};
+			let start = byte_at_column(shown, left);
+			let visible = &shown[start..];
+			let end = byte_at_column(visible, available);
+			let visible = &visible[..end];
 			pc.frame
-				.set_cursor(x.saturating_add(cell_width(&visible[..split])), rect.y);
-		} else {
-			pc.frame.put(x, rect.y, visible, base(&pc.ctx.theme));
+				.put(content_x, rect.y, visible, base(&pc.ctx.theme));
+			if focused {
+				// The real terminal cursor marks the insertion point — one
+				// cursor treatment across every core single-line editor.
+				let split = byte_at_column(visible, self.state.cursor.saturating_sub(left));
+				pc.frame
+					.set_cursor(content_x.saturating_add(cell_width(&visible[..split])), rect.y);
+			}
+		}
+		if !counter.is_empty() {
+			let style = if self.state.counter.starts_with('-') {
+				Style::new().fg(pc.ctx.theme.warn)
+			} else {
+				dim(&pc.ctx.theme)
+			};
+			pc.frame.put(counter_x, rect.y, counter, style);
 		}
 	}
 
@@ -260,7 +319,7 @@ impl Component for Input {
 
 	fn mouse(
 		&mut self,
-		_ec: &mut EventCtx<'_>,
+		ec: &mut EventCtx<'_>,
 		tag: HitTag,
 		at: (u16, u16),
 		rect: Rect,
@@ -268,7 +327,12 @@ impl Component for Input {
 	) -> Flow {
 		match mouse {
 			Mouse::Click if tag == HitTag::Press => {
-				let column = at.0.saturating_sub(rect.x.saturating_add(2));
+				let prefix_width = if self.props.flag(Prop::Rail) {
+					2
+				} else {
+					cell_width(ec.ctx.charset.cursor())
+				};
+				let column = at.0.saturating_sub(rect.x.saturating_add(prefix_width));
 				self.state.cursor = column.min(cell_width(&self.state.text));
 				Flow::Consumed
 			},
@@ -295,6 +359,8 @@ impl Component for Input {
 		self.state.text.insert_str(at, &paste);
 		self.state.cursor = self.state.cursor.saturating_add(cell_width(&paste));
 		self.state.refresh_mask();
+		let limit = self.limit();
+		self.state.refresh_counter(limit);
 		Flow::Consumed
 	}
 
@@ -345,5 +411,43 @@ mod tests {
 		input.paint(&mut pc, Rect::new(0, 0, 32, 1));
 		assert!(frame_row_text(&frame, 0).contains("hello"));
 		assert_eq!(hits[0].slot, slot);
+	}
+
+	#[test]
+	fn limit_counter_marks_boundary_and_overflow() {
+		let ctx = UiContext::default();
+		for (value, counter, color) in [("abc", "0", ctx.theme.muted), ("abcd", "-1", ctx.theme.warn)]
+		{
+			let mut input = Input::new()
+				.with(Prop::Value, value)
+				.with(Prop::Limit, 3_u16);
+			let mut frame = Frame::new(Size::new(12, 1));
+			let mut hits = Vec::new();
+			let mut wakes = Vec::new();
+			let mut pc = PaintCtx::new(&mut frame, &ctx, &mut hits, &mut wakes);
+			input.paint(&mut pc, Rect::new(0, 0, 12, 1));
+			assert!(frame_row_text(&frame, 0).ends_with(counter));
+			let start = 12 - u16::try_from(counter.len()).unwrap();
+			assert_eq!(frame.cell(start, 0).style.foreground_color(), color);
+		}
+	}
+
+	#[test]
+	fn rail_tracks_focus_with_semantic_colors() {
+		let ctx = UiContext::default();
+		let mut input = Input::new().with(Prop::Rail, true);
+		let slot = input.slot();
+		for (focus, glyph, color) in
+			[(None, "▏", ctx.theme.border), (Some(slot), "▎", ctx.theme.accent)]
+		{
+			let mut frame = Frame::new(Size::new(8, 1));
+			let mut hits = Vec::new();
+			let mut wakes = Vec::new();
+			let mut pc = PaintCtx::new(&mut frame, &ctx, &mut hits, &mut wakes);
+			pc.focus = focus;
+			input.paint(&mut pc, Rect::new(0, 0, 8, 1));
+			assert!(frame_row_text(&frame, 0).starts_with(glyph));
+			assert_eq!(frame.cell(0, 0).style.foreground_color(), color);
+		}
 	}
 }
