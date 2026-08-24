@@ -790,6 +790,12 @@ message TurnError {
     // Provider completed without actionable output (for example thought-only);
     // session-level recovery owns the bounded continuation.
     KIND_EMPTY_OUTPUT = 9;
+    // Canonical token context exceeded the selected model window. Session
+    // compaction owns recovery; model fallback chains must not pre-empt it.
+    KIND_CONTEXT_OVERFLOW = 10;
+    // Provider rejected request bytes or a media budget. Session recovery may
+    // consult configured model fallbacks, but must never retry the same model.
+    KIND_PAYLOAD_REJECTED = 11;
   }
   Kind kind = 1;
   string detail = 2;

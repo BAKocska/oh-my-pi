@@ -43,7 +43,7 @@ pub mod bytes_text;
 ///
 /// This is bumped for every wire-visible schema change and is the revision
 /// compared by the `omp.gateway.v1.Hello` handshake.
-pub const SCHEMA_REV: u32 = 10;
+pub const SCHEMA_REV: u32 = 11;
 
 /// Generated packages under the protobuf `omp` namespace.
 pub mod omp {

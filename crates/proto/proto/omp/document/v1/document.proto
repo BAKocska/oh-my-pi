@@ -855,6 +855,9 @@ message LspServerBinding {
   // UTF-8 JSON InitializeResult.capabilities, retained losslessly for arbitrary
   // passthrough methods and newer LSP versions.
   bytes capabilities_json = 4;
+  // Exact UTF-8 JSON workspace/didChangeConfiguration params retained from
+  // this binding's active initialization configuration.
+  bytes settings_json = 5;
 }
 
 message GetLspBindingsRequest {
