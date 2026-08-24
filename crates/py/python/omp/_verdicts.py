@@ -99,7 +99,7 @@ class Update(Generic[_U]):
 
 @dataclass(frozen=True, slots=True)
 class Done(Generic[_R]):
-    """The terminal result emitted by a streaming device or completed campaign."""
+    """The terminal result emitted by a streaming device or finished operation."""
  
     result: _R | None = None
     useless: bool = False

@@ -66,7 +66,7 @@ _EXECUTABLE_KINDS = frozenset(
         "soft",
         "hard",
         "hook",
-        "campaign",
+        "regime",
         "worker",
         "provider",
         "prompt_slot",
@@ -421,7 +421,7 @@ class DeclarationSnapshot:
     completions: tuple[UIDefinition, ...] = ()
     message_renderers: tuple[UIDefinition, ...] = ()
     verdict_renderers: tuple[UIDefinition, ...] = ()
-    campaigns: tuple[object, ...] = ()
+    regimes: tuple[object, ...] = ()
 
 
 class DeclarationRegistry:
@@ -447,7 +447,7 @@ class DeclarationRegistry:
         "_provider_candidates",
         "_hooks",
         "_hook_definitions",
-        "_campaigns",
+        "_regimes",
         "_prompt_slots",
         "_preludes",
         "_telemetry",
@@ -489,7 +489,7 @@ class DeclarationRegistry:
         self._providers: dict[_ProviderKey, ProviderDefinition] = {}
         self._hooks: dict[_HookKey, object] = {}
         self._hook_definitions: dict[_HookKey, HookDefinition] = {}
-        self._campaigns: dict[str, object] = {}
+        self._regimes: dict[str, object] = {}
         self._telemetry: dict[str, TelemetryDefinition] = {}
         self._exports: dict[int, ExportDefinition] = {}
         self._export_sequence = 0
@@ -585,7 +585,7 @@ class DeclarationRegistry:
         if (
             self._tools
             or self._hooks
-            or self._campaigns
+            or self._regimes
             or self._services
             or self._commands
             or self._completions
@@ -896,16 +896,16 @@ class DeclarationRegistry:
             key[0], key[1], handler, trigger
         )
         return handler
-    def register_campaign(self, campaign_id: str, declaration: object) -> object:
-        """Record one campaign decorator during sequential manifest import."""
+    def register_regime(self, regime_id: str, declaration: object) -> object:
+        """Record one regime decorator during sequential manifest import."""
 
-        self._insert(self._campaigns, campaign_id, declaration, "campaign")
+        self._insert(self._regimes, regime_id, declaration, "regime")
         return declaration
 
-    def campaign_definitions(self) -> tuple[object, ...]:
-        """Return campaign declarations in stable identifier order."""
+    def regime_definitions(self) -> tuple[object, ...]:
+        """Return regime declarations in stable identifier order."""
 
-        return tuple(self._campaigns[key] for key in sorted(self._campaigns))
+        return tuple(self._regimes[key] for key in sorted(self._regimes))
 
     def register_approver(
         self,
@@ -1344,7 +1344,7 @@ class DeclarationRegistry:
         declarations.update(
             ("hook", _manifest_hook_static_key(key)) for key in self._hooks
         )
-        declarations.update(("campaign", key) for key in self._campaigns)
+        declarations.update(("regime", key) for key in self._regimes)
         declarations.update(("service", key[0]) for key in self._services)
         declarations.update(("command", key) for key in self._commands)
         declarations.update(("shortcut", key) for key in self._shortcuts)
@@ -1413,7 +1413,7 @@ class DeclarationRegistry:
                 self._verdict_renderers[key]
                 for key in sorted(self._verdict_renderers, key=repr)
             ),
-            campaigns=self.campaign_definitions(),
+            regimes=self.regime_definitions(),
         )
 
 
@@ -1454,7 +1454,7 @@ class DeclarationRegistry:
             + len(self._verdict_renderers)
             + len(self._shortcuts)
             + len(self._hooks)
-            + len(self._campaigns)
+            + len(self._regimes)
             + len(self._approvers)
             + len(self._services)
             + len(self._entry_kinds)
@@ -1735,7 +1735,7 @@ def project_worker_registry() -> tuple[tuple[WorkerToolDefinition, ...], str]:
         ],
         "entry_kinds": [_worker_wire_value(value) for value in snapshot.entry_kinds],
         "providers": [_worker_wire_value(value) for value in snapshot.providers],
-        "campaigns": [_worker_wire_value(value) for value in snapshot.campaigns],
+        "regimes": [_worker_wire_value(value) for value in snapshot.regimes],
         "commands": [_worker_wire_value(value) for value in snapshot.commands],
         "shortcuts": [_worker_wire_value(value) for value in snapshot.shortcuts],
         "telemetry": [_worker_wire_value(value) for value in snapshot.telemetry],

@@ -47,7 +47,7 @@ for name in omp.__all__:
 for suffix in (
     "agents", "context", "policy", "limits", "telemetry", "provider",
     "env", "ui", "hooks", "events", "prompts", "packages",
-    "campaigns",
+    "regimes",
     "sessions", "journal", "artifacts", "index", "diagnostics", "urls", "devices",
     "scribe",
 ):
@@ -195,84 +195,75 @@ registry_module.configure_manifest(
             "model-request-telemetry", "telemetry", "model_request"
         ),
         executable_declaration(
-            "surface-campaign", "campaign", "surface-campaign"
+            "surface-regime", "regime", "surface-regime"
         ),
         executable_declaration(
-            "composing-campaign", "campaign", "composing-campaign"
+            "scoped-regime", "regime", "scoped-regime"
         ),
         executable_declaration(
-            "react-campaign", "campaign", "react-campaign"
+            "apply-regime", "regime", "apply-regime"
         ),
         executable_declaration(
-            "three-turn-campaign", "campaign", "three-turn-campaign"
+            "three-turn-regime", "regime", "three-turn-regime"
         ),
     ),
 )
 
 @dataclasses.dataclass
-class SurfaceCampaignState:
+class SurfaceRegimeState:
     attempts: int = 0
 
 
-@omp.campaign(
-    "surface-campaign",
-    at=(omp.CONTEXT, omp.SETTLE),
-    ladder=omp.Ladder(3, max_turns=4),
-    scope=omp.CampaignScope.SESSION,
-    state=SurfaceCampaignState,
-    state_family="acme.surface-campaign",
-    claims=("mode", "worktree"),
-    binds=("Toolset",),
+@omp.regime(
+    "surface-regime",
+    on=(omp.CONTEXT, omp.SETTLE),
+    lifetime=omp.RegimeLifetime.SESSION,
+    state=SurfaceRegimeState,
+    max_steps=3,
+    owns=("mode", "worktree"),
+    sets={"toolset": "read-only"},
+    )
+class SurfaceRegime:
+    def apply(self, ctx, next_):
+        ctx.context.append(omp.user_text("surface"))
+
+
+@omp.regime(
+    "scoped-regime",
+    on=omp.CONTEXT,
+    lifetime="session",
+    sets={"model": "surface"},
 )
-class SurfaceCampaign:
-    pass
+class ScopedRegime:
+    def apply(self, ctx, next_):
+        ctx.settings.set("model", "surface")
 
 
-@omp.campaign(
-    "composing-campaign",
-    at=omp.CONTEXT,
-    scope="session",
-    binds=("Model",),
-    composes=True,
-)
-class ComposingCampaign:
-    pass
-
-
-campaign_declarations = {
+regime_declarations = {
     declaration.id: declaration
-    for declaration in registry_module.registry.snapshot().campaigns
+    for declaration in registry_module.registry.snapshot().regimes
 }
-surface_campaign = campaign_declarations["surface-campaign"]
-assert surface_campaign.id == "surface-campaign"
-assert surface_campaign.points == (omp.Point.CONTEXT, omp.Point.SETTLE)
-assert surface_campaign.state.wire_name == "acme.surface-campaign@1"
-assert surface_campaign.claims == ("mode", "worktree")
-assert surface_campaign.binds == ("Toolset",)
-assert not surface_campaign.composes
-assert campaign_declarations["composing-campaign"].composes
-surface_state = SurfaceCampaignState(attempts=2)
-encoded_surface_state = surface_campaign.state.encode(surface_state)
-assert surface_campaign.state.decode(encoded_surface_state) == surface_state
-schema_error = expect_raises(
-    omp.StateSchemaMismatch,
-    lambda: omp.StateVersion(
-        "acme.surface-campaign", 2, SurfaceCampaignState
-    ).decode(encoded_surface_state),
-)
-assert schema_error.expected == "acme.surface-campaign@2"
-assert schema_error.actual == "acme.surface-campaign@1"
-handoff = omp.CampaignDeny("readonly", engage=omp.EngageRequest("surface-campaign"))
-assert omp.Deny is omp.hooks.Deny
-assert omp.CampaignDeny is omp.campaigns.CampaignDeny
-assert omp.Deny is not omp.CampaignDeny
-assert handoff.engage.campaign == "surface-campaign"
+surface_regime = regime_declarations["surface-regime"]
+assert surface_regime.id == "surface-regime"
+assert surface_regime.points == (omp.Point.CONTEXT, omp.Point.SETTLE)
+assert surface_regime.state.family.endswith(".SurfaceRegimeState")
+assert surface_regime.state.revision == 1
+assert surface_regime.owns == ("mode", "worktree")
+assert surface_regime.sets == {"toolset": "read-only"}
+assert regime_declarations["scoped-regime"].sets == {"model": "surface"}
+surface_state = SurfaceRegimeState(attempts=2)
+encoded_surface_state = surface_regime.state.encode(surface_state)
+assert surface_regime.state.decode(encoded_surface_state, 1) == surface_state
+assert not hasattr(omp, "campaign")
+assert not hasattr(omp, "CampaignScope")
+assert not hasattr(omp, "Ladder")
+assert not hasattr(omp, "Verdict")
 
 
-@omp.campaign("react-campaign", at=omp.SETTLE)
-def react_campaign(event):
-    assert event == {"turn": 3}
-    return omp.Continue()
+@omp.regime("apply-regime", on=omp.SETTLE)
+def apply_regime(ctx, next_):
+    assert ctx.event.turn == 3
+    return next_.retry()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -280,48 +271,57 @@ class ThreeTurnState:
     turns: int = 0
 
 
-@omp.campaign(
-    "three-turn-campaign",
-    at=omp.SETTLE,
+@omp.regime(
+    "three-turn-regime",
+    on=omp.SETTLE,
     state=ThreeTurnState,
-    state_family="acme.three-turn",
+    max_steps=3,
 )
-def three_turn_campaign(event, state):
-    next_state = ThreeTurnState(state.turns + 1)
-    verdict = omp.Force("write") if next_state.turns == 3 else omp.Continue()
-    return verdict, next_state
+def three_turn_regime(ctx, next_):
+    next_state = ThreeTurnState(ctx.state.value.turns + 1)
+    ctx.state.replace(next_state)
+    if next_state.turns == 3:
+        return next_.complete()
+    return next_.retry()
 
 
-reacted = asyncio.run(
-    omp.dispatch_campaign_react(
-        "react-campaign",
+applied = asyncio.run(
+    omp.regimes.dispatch_regime_apply(
+        "apply-regime",
         omp.SETTLE,
         b'{"turn":3}',
+        activation_id="apply-1",
     )
 )
-assert reacted["verdict"] == "continue"
+assert applied["control"] == {"kind": "retry", "props": {}}
+assert applied["effects"] == []
 
 
 three_turn_declaration = next(
     declaration
-    for declaration in registry_module.registry.snapshot().campaigns
-    if declaration.id == "three-turn-campaign"
+    for declaration in registry_module.registry.snapshot().regimes
+    if declaration.id == "three-turn-regime"
 )
 three_turn_state = three_turn_declaration.state.encode(ThreeTurnState())
-three_turn_verdicts = []
+three_turn_controls = []
 for turn in range(1, 4):
-    reaction = asyncio.run(
-        omp.dispatch_campaign_react(
-            "three-turn-campaign",
+    draft = asyncio.run(
+        omp.regimes.dispatch_regime_apply(
+            "three-turn-regime",
             omp.SETTLE,
-            b"{}",
+            b'{"state_revision":1}',
             three_turn_state,
+            activation_id="three-turn-1",
+            state_revision=1,
         )
     )
-    three_turn_verdicts.append(reaction["verdict"])
-    three_turn_state = reaction["new_state"]
-assert three_turn_verdicts == ["continue", "continue", "force"]
-assert three_turn_declaration.state.decode(three_turn_state) == ThreeTurnState(3)
+    three_turn_controls.append(draft["control"]["kind"])
+    state_effect = next(
+        effect for effect in draft["effects"] if effect["kind"] == "replace_state"
+    )
+    three_turn_state = state_effect["payload"]
+assert three_turn_controls == ["retry", "retry", "complete"]
+assert three_turn_declaration.state.decode(three_turn_state, 1) == ThreeTurnState(3)
 
 
 class FrozenControlHost:
@@ -425,24 +425,24 @@ class FrozenControlHost:
 
     async def request(self, operation, arguments):
         self.calls.append((operation, arguments))
-        if operation not in {"omp.ui.dynamic_mount", "omp.jobs.register"}:
+        if operation not in {"omp.ui.dynamic_mount", "omp.jobs.register", "omp.regimes.start"}:
             json.dumps(arguments, allow_nan=False)
-        if operation == "omp.campaigns.engage":
+        if operation == "omp.regimes.start":
             return {
-                "id": "eng-1",
-                "campaign": arguments["campaign"],
+                "id": "activation-1",
+                "regime": arguments["regime_id"],
                 "extension": "acme-ext",
-                "state": arguments["state"],
+                "status": "queued" if arguments["queue"] else "active",
             }
-        if operation == "omp.campaigns.active":
+        if operation == "omp.regimes.active":
             return [{
-                "id": "eng-1",
-                "campaign": "surface-campaign",
+                "id": "activation-1",
+                "regime": "surface-regime",
                 "extension": "acme-ext",
-                "state": encoded_surface_state.decode(),
+                "status": "active",
             }]
-        if operation == "omp.campaigns.disengage":
-            return arguments["engagement"] == "eng-1"
+        if operation == "omp.regimes.stop":
+            return arguments["activation_id"] == "activation-1"
         if operation == "omp.telemetry.export.stats":
             return {
                 "sent": 8, "dropped": 1, "failures": 0, "queue_depth": 2,
@@ -672,40 +672,24 @@ class FrozenControlHost:
 
 frozen_host = FrozenControlHost()
 omp._install_control_backend(frozen_host)
-engaged = asyncio.run(omp.campaigns.engage("surface-campaign", state=surface_state))
-assert engaged.state == surface_state
-assert asyncio.run(omp.campaigns.active()) == (engaged,)
-assert asyncio.run(omp.campaigns.disengage("eng-1"))
+activation = asyncio.run(omp.regimes.start("surface-regime", state=surface_state))
+assert (activation.id, activation.regime, activation.status) == (
+    "activation-1", "surface-regime", "active"
+)
+start_call = next(call for call in frozen_host.calls if call[0] == "omp.regimes.start")
+assert start_call[1]["regime_id"] == "surface-regime"
+assert start_call[1]["state_revision"] == 1
+assert json.loads(start_call[1]["state"]) == {"attempts": 2}
+active_regimes = asyncio.run(omp.regimes.active())
+assert len(active_regimes) == 1
+assert active_regimes[0] == omp.RegimeRecord(
+    "activation-1", "surface-regime", "acme-ext", "active"
+)
+assert asyncio.run(activation.stop())
+assert asyncio.run(omp.regimes.stop("activation-1"))
 assert frozen_host.calls[-1] == (
-    "omp.campaigns.disengage", {"engagement": "eng-1"}
+    "omp.regimes.stop", {"activation_id": "activation-1"}
 )
-
-
-mode_claim_error = expect_raises(
-    omp.ModeClaimRequired,
-    lambda: omp.campaign(
-        "stealth-mode",
-        at=omp.CONTEXT,
-        scope="session",
-        binds=("Model",),
-    ),
-)
-assert mode_claim_error.campaign == "stealth-mode"
-assert mode_claim_error.binding == "Model"
-expect_raises(
-    omp.CampaignContractError,
-    lambda: omp.campaign("stream-extension", at=omp.STREAM),
-)
-assert omp.POINT_TABLE == (
-    "context", "tool_choice", "pre_model", "stream", "admission",
-    "batch", "turn_end", "settle", "idle",
-)
-assert omp.VERDICT_TABLE == (
-    "pass", "inject", "patch", "hold", "deny", "continue",
-    "force", "cut", "bind", "done", "exhausted", "escalate",
-)
-assert omp.Continue().inject is None
-assert omp.Force("write").tool == "write"
 assert omp.Done().result is None
 
 
@@ -2795,10 +2779,10 @@ assert "JournalError" in omp.journal.__all__
 
 # FREEZE evaluates deferred availability exactly once and seals the projection.
 snapshot = registry_module.freeze_declarations()
-assert surface_campaign in snapshot.campaigns
+assert surface_regime in snapshot.regimes
 expect_raises(
     omp.LateRegistration,
-    lambda: omp.campaign("late-campaign", at=omp.IDLE),
+    lambda: omp.regime("late-regime", on=omp.IDLE),
 )
 assert bare_definition in snapshot.providers
 assert ("surface_device/inspect/detail", "", 1) in snapshot.tools

@@ -803,10 +803,10 @@ def _freeze_registry_ack() -> dict[str, object]:
     registry = importlib.import_module("omp._registry").registry
     if not registry.sealed:
         registry.freeze()
-    campaigns = importlib.import_module("omp.campaigns")
+    regimes = importlib.import_module("omp.regimes")
     provider = importlib.import_module("omp.provider")
     return {
-        "campaigns": campaigns._sealed_campaign_declaration(
+        "regimes": regimes._sealed_regime_declaration(
             _scope.current().generation
         ),
         "providers": list(provider._sealed_provider_declarations()),
@@ -848,7 +848,9 @@ async def _dispatch_lifecycle_activate(
 
 def _builtin_dispatch(operation: str) -> DispatchHandler | None:
     targets = {
-        "omp.campaigns.react": ("omp.campaigns", "dispatch_campaign_react"),
+        "omp.regimes.apply": ("omp.regimes", "dispatch_regime_apply"),
+        "omp.regimes.start": ("omp.regimes", "dispatch_regime_start"),
+        "omp.regimes.stop": ("omp.regimes", "dispatch_regime_stop"),
         "omp.services.dispatch": ("omp._registry", "dispatch_service"),
         "omp.hooks.dispatch": ("omp.hooks", "_dispatch_hook_callback"),
         "omp.devices.call": ("omp.devices", "_dispatch_device"),
