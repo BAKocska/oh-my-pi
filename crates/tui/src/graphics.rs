@@ -1354,11 +1354,7 @@ mod tests {
 	#[test]
 	fn orca_uses_wide_hangul_compatibility_jamo_only_for_orca() {
 		let orca = detect(
-			&[
-				("TERM_PROGRAM", "Orca"),
-				("TERM", "xterm-256color"),
-				("COLORTERM", "truecolor"),
-			],
+			&[("TERM_PROGRAM", "Orca"), ("TERM", "xterm-256color"), ("COLORTERM", "truecolor")],
 			TerminalPlatform::MacOs,
 		);
 		assert_eq!(orca.id, TerminalId::Orca);

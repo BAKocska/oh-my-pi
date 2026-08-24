@@ -1,8 +1,8 @@
 use std::{
 	cell::RefCell,
 	fs, io, mem,
-	path::Path,
 	ops::Range,
+	path::Path,
 	rc::Rc,
 	sync::Arc,
 	time,
@@ -30,8 +30,8 @@ use crate::{
 	paste::{dropped_paths, is_image_path},
 	props::{Prop, PropValue, Props},
 	rich::cell_width,
-	syntax::{SyntaxRun, highlight_xml, xml_comment_state},
 	spelling::{SpellingAssist, SpellingFeatures},
+	syntax::{SyntaxRun, highlight_xml, xml_comment_state},
 };
 /// Built-in composer chrome selected by the `composer.shape` setting.
 ///
@@ -265,36 +265,36 @@ impl KeywordAccent {
 
 /// Focusable editable leaf used by [`EditorPane`].
 pub struct EditInput {
-	props:          Props,
-	slot:           Slot,
-	editor:         Editor,
-	style:          ComposerStyle,
-	attachments:    Option<Attachments>,
-	dragging:       bool,
-	last_click:     Option<((u16, u16), Instant)>,
-	keyword_accent: KeywordAccent,
-	keyword_spans:  SmallVec<(usize, usize), 8>,
-	spelling:       SpellingAssist,
+	props:             Props,
+	slot:              Slot,
+	editor:            Editor,
+	style:             ComposerStyle,
+	attachments:       Option<Attachments>,
+	dragging:          bool,
+	last_click:        Option<((u16, u16), Instant)>,
+	keyword_accent:    KeywordAccent,
+	keyword_spans:     SmallVec<(usize, usize), 8>,
+	spelling:          SpellingAssist,
 	spelling_features: SpellingFeatures,
-	spelling_mask:  SmallVec<Range<usize>, 8>,
+	spelling_mask:     SmallVec<Range<usize>, 8>,
 }
 
 impl EditInput {
 	/// Creates an empty editor.
 	pub fn new() -> Self {
 		Self {
-			props:          Props::new(),
-			slot:           next_slot(),
-			editor:         Editor::new(EditorOptions::default()),
-			style:          ComposerStyle::Borderless,
-			attachments:    None,
-			dragging:       false,
-			last_click:     None,
-			keyword_accent: KeywordAccent::default(),
-			keyword_spans:  SmallVec::new(),
-			spelling:       SpellingAssist::new(),
+			props:             Props::new(),
+			slot:              next_slot(),
+			editor:            Editor::new(EditorOptions::default()),
+			style:             ComposerStyle::Borderless,
+			attachments:       None,
+			dragging:          false,
+			last_click:        None,
+			keyword_accent:    KeywordAccent::default(),
+			keyword_spans:     SmallVec::new(),
+			spelling:          SpellingAssist::new(),
 			spelling_features: SpellingFeatures::default(),
-			spelling_mask:  SmallVec::new(),
+			spelling_mask:     SmallVec::new(),
 		}
 	}
 
@@ -328,16 +328,24 @@ impl EditInput {
 		self.keyword_spans = self.keyword_accent.matched_spans(self.editor.text());
 		self.refresh_spelling();
 	}
+
 	fn refresh_spelling(&mut self) {
 		if !self.spelling_features.typo_detection {
 			self.spelling.clear();
 			return;
 		}
 		self.spelling_mask.clear();
-		self.spelling_mask.extend(self.editor.atom_ranges().into_iter().map(|(start, end)| start..end));
+		self.spelling_mask.extend(
+			self
+				.editor
+				.atom_ranges()
+				.into_iter()
+				.map(|(start, end)| start..end),
+		);
 		self.spelling_mask.extend(code_ranges(self.editor.text()));
 		self.spelling.check(self.editor.text(), &self.spelling_mask);
 	}
+
 	/// Applies native spelling feature gates.
 	pub fn set_spelling_features(&mut self, features: SpellingFeatures) {
 		self.spelling_features = features;
@@ -624,11 +632,15 @@ fn word_range_at_cursor(text: &str, cursor: usize) -> Option<Range<usize>> {
 	let start = text[..cursor]
 		.char_indices()
 		.rev()
-		.find_map(|(at, character)| (!character.is_alphabetic() && character != '\'').then_some(at + character.len_utf8()))
+		.find_map(|(at, character)| {
+			(!character.is_alphabetic() && character != '\'').then_some(at + character.len_utf8())
+		})
 		.unwrap_or(0);
 	let end = text[cursor..]
 		.char_indices()
-		.find_map(|(offset, character)| (!character.is_alphabetic() && character != '\'').then_some(cursor + offset))
+		.find_map(|(offset, character)| {
+			(!character.is_alphabetic() && character != '\'').then_some(cursor + offset)
+		})
 		.unwrap_or(text.len());
 	(start < end).then_some(start..end)
 }
@@ -951,7 +963,8 @@ impl Component for EditInput {
 	fn key(&mut self, ec: &mut EventCtx<'_>, key: Key) -> Flow {
 		if key == Key::Ctrl('.')
 			&& self.spelling_features.typo_detection
-			&& let Some(range) = word_range_at_cursor(self.editor.text(), self.editor.buffer().cursor())
+			&& let Some(range) =
+				word_range_at_cursor(self.editor.text(), self.editor.buffer().cursor())
 		{
 			self.spelling.request_guesses(self.editor.text(), range);
 			return Flow::Consumed;
@@ -1572,6 +1585,7 @@ impl EditorPane {
 			self.children[0].invalidate();
 		}
 	}
+
 	/// Selects native editor spelling features.
 	pub fn spelling_features(mut self, features: SpellingFeatures) -> Self {
 		self.set_spelling_features(features);

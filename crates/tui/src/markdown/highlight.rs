@@ -79,7 +79,7 @@ const LANG_ALIASES: &[(&[&str], &str)] = &[
 
 /// Semantic styles applied to parsed syntax scopes.
 #[derive(Clone, Copy)]
-pub(super) struct HighlightStyles {
+pub(crate) struct HighlightStyles {
 	base:        Style,
 	comment:     Style,
 	keyword:     Style,
@@ -96,7 +96,7 @@ pub(super) struct HighlightStyles {
 
 impl HighlightStyles {
 	/// Derives syntax categories from the shared semantic palette.
-	pub(super) const fn from_theme(theme: &Theme) -> Self {
+	pub(crate) const fn from_theme(theme: &Theme) -> Self {
 		Self {
 			base:        Style::new().fg(theme.fg),
 			comment:     Style::new().fg(theme.muted).italic(),
@@ -132,12 +132,12 @@ impl HighlightStyles {
 }
 
 /// Reports whether `language` resolves to a bundled syntax.
-pub(super) fn supports_language(language: &str) -> bool {
+pub(crate) fn supports_language(language: &str) -> bool {
 	!language.is_empty() && find_syntax(syntaxes(), language).is_some()
 }
 
 /// Highlights a complete code block while preserving parser state across lines.
-pub(super) fn render(
+pub(crate) fn render(
 	source: &str,
 	language: &str,
 	line_count: usize,

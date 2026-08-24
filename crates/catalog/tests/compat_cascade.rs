@@ -325,10 +325,7 @@ fn cascade_resolves_every_catalog_model_to_oracle_plus_census_overlay() {
 			expected.insert("image_encoding_format".into(), Value::from(encoding));
 		}
 		if model.provider == "venice" {
-			expected.insert(
-				"reasoning_disable_mode".into(),
-				Value::from("venice-disable-thinking"),
-			);
+			expected.insert("reasoning_disable_mode".into(), Value::from("venice-disable-thinking"));
 		}
 		if model.id == "github-copilot/grok-4.6" {
 			expected.insert("thinking_close_max_retries".into(), Value::from(1));
@@ -675,22 +672,13 @@ fn deepseek_image_venice_off_and_opencode_effort_policies_resolve() {
 	};
 
 	let flash = resolve("opencode-go", "deepseek-v4-flash", true);
-	assert_eq!(
-		flash.thinking.get("efforts"),
-		Some(&Value::from(vec!["low", "high", "max"])),
-	);
+	assert_eq!(flash.thinking.get("efforts"), Some(&Value::from(vec!["low", "high", "max"])),);
 	assert_eq!(flash.wire.get("image_encoding_format"), Some(&Value::from("none")));
 	let copilot_grok = resolve("github-copilot", "grok-4.6", true);
-	assert_eq!(
-		copilot_grok.wire.get("thinking_close_max_retries"),
-		Some(&Value::from(1)),
-	);
+	assert_eq!(copilot_grok.wire.get("thinking_close_max_retries"), Some(&Value::from(1)),);
 
 	let ocr = resolve("novita", "deepseek/deepseek-ocr-2", false);
-	assert_eq!(
-		ocr.wire.get("image_encoding_format"),
-		Some(&Value::from("open_ai_url")),
-	);
+	assert_eq!(ocr.wire.get("image_encoding_format"), Some(&Value::from("open_ai_url")),);
 
 	let venice = resolve("venice", "qwen3-235b", true);
 	assert_eq!(
@@ -928,13 +916,11 @@ fn run_policy_case(cascade: &CompatCascade, case: &Case) {
 		if let Some(image_encoding) = image_encoding.as_ref() {
 			expected.insert("image_encoding_format", image_encoding);
 		}
-		let venice_off =
-			(provider == "venice").then(|| Value::from("venice-disable-thinking"));
+		let venice_off = (provider == "venice").then(|| Value::from("venice-disable-thinking"));
 		if let Some(venice_off) = venice_off.as_ref() {
 			expected.insert("reasoning_disable_mode", venice_off);
 		}
-		let retry_cap =
-			(provider == "github-copilot" && model == "grok-4.6").then(|| Value::from(1));
+		let retry_cap = (provider == "github-copilot" && model == "grok-4.6").then(|| Value::from(1));
 		if let Some(retry_cap) = retry_cap.as_ref() {
 			expected.insert("thinking_close_max_retries", retry_cap);
 		}

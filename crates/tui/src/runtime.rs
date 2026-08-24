@@ -485,6 +485,15 @@ pub enum AppEvent {
 		/// Value of the committed option.
 		value: Str,
 	},
+	/// An interactive diff pane requested a host-owned mutation.
+	DiffAction {
+		/// The pane's component `id`.
+		id:     Str,
+		/// Requested mutation.
+		action: crate::DiffActionKind,
+		/// Selection, hunk, or file scope.
+		target: crate::DiffTarget,
+	},
 	/// An ID-carrying filterable select's query changed.
 	Filtered {
 		/// The select's `id`.
@@ -868,11 +877,17 @@ impl App {
 				routed => routed,
 			},
 			InputEvent::Mouse(report) => {
-				let event = self.ui.handle_mouse(report.col, report.row, report.kind);
+				let event =
+					self
+						.ui
+						.handle_mouse_with_mods(report.col, report.row, report.kind, report.mods);
 				match select_event(event) {
 					Ok(event) => Routed::Event(event),
 					Err(UiEvent::Submit) => Routed::Event(AppEvent::Submitted),
 					Err(UiEvent::Pressed(id)) => Routed::Event(AppEvent::Pressed(id)),
+					Err(UiEvent::DiffAction { id, action, target }) => {
+						Routed::Event(AppEvent::DiffAction { id, action, target })
+					},
 					Err(_) if self.ui.has_damage() => Routed::Event(AppEvent::Updated),
 					Err(_) => Routed::Continue,
 				}
@@ -979,6 +994,9 @@ fn route_key_event(
 		event
 		@ (UiEvent::Highlighted { .. } | UiEvent::Changed { .. } | UiEvent::Filtered { .. }) => {
 			Routed::Event(select_event(event).expect("select events map to app events"))
+		},
+		UiEvent::DiffAction { id, action, target } => {
+			Routed::Event(AppEvent::DiffAction { id, action, target })
 		},
 		UiEvent::Copied(text) => Routed::Copy(text),
 		// The claim bit, not global damage, decides whether the key falls

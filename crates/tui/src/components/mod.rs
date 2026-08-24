@@ -5,6 +5,8 @@ mod col;
 mod countdown;
 mod custom;
 mod diff;
+mod diff_doc;
+mod diff_pane;
 /// Editable composer and external-editor lifecycle primitives.
 pub mod editor;
 mod form;
@@ -43,6 +45,13 @@ pub use col::Col;
 pub use countdown::Countdown;
 pub use custom::CustomElement;
 pub use diff::{DiffKind, DiffLine, DiffView};
+pub use diff_doc::{
+	DiffBuildOptions, DiffDocument, DiffFileLine, DiffHunk, DiffMark, DiffRow, DiffRowKind,
+	DiffSide, DiffStyleRun,
+};
+pub use diff_pane::{
+	DiffActionKind, DiffPane, DiffPaneState, DiffPatchTarget, DiffSelection, DiffTarget, ViewMode,
+};
 pub use editor::{
 	Attachment, AttachmentContent, Attachments, ComposerLayout, ComposerStatusAttachment,
 	ComposerStyle, EditInput, EditorPane, KeywordAccent, attachment_color, chip_label,

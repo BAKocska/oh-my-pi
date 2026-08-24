@@ -21,7 +21,7 @@ use crate::{
 	components::{Markdown, hr::truncate_to_width},
 	context::UiContext,
 	frame::{Color, Decor, DecorFill, DecorKind, Frame, Gradient, Rect, Style},
-	input::{Key, Mouse, UiEvent},
+	input::{Key, Mods, Mouse, UiEvent},
 	markup::{Align, Border, Dim},
 	props::{Prop, PropValue, Props},
 	rich,
@@ -1446,6 +1446,8 @@ pub struct EventCtx<'a> {
 	pub width:         u16,
 	/// Visible content rows.
 	pub view_rows:     u16,
+	/// Modifiers attached to the routed input event.
+	pub mods:          Mods,
 	/// Whether the handler requested a relayout; see
 	/// [`EventCtx::request_layout`].
 	pub(crate) layout: bool,
@@ -1453,8 +1455,13 @@ pub struct EventCtx<'a> {
 
 impl<'a> EventCtx<'a> {
 	/// Creates an event context for one routed input event.
-	pub const fn new(ctx: &'a UiContext, width: u16, view_rows: u16) -> Self {
-		Self { ctx, width, view_rows, layout: false }
+	pub fn new(ctx: &'a UiContext, width: u16, view_rows: u16) -> Self {
+		Self { ctx, width, view_rows, mods: Mods::default(), layout: false }
+	}
+
+	/// Creates an event context carrying explicit input modifiers.
+	pub const fn with_mods(ctx: &'a UiContext, width: u16, view_rows: u16, mods: Mods) -> Self {
+		Self { ctx, width, view_rows, mods, layout: false }
 	}
 
 	/// Requests a full relayout after this event.
@@ -1638,6 +1645,14 @@ pub enum HitTag {
 	/// The one-cell scrollbar column of a scroll viewport: click or drag
 	/// jumps the offset.
 	Scrollbar,
+	/// Visual row of an interactive diff pane.
+	DiffRow(u32),
+	/// One-cell density minimap of an interactive diff pane.
+	DiffMinimap,
+	/// Primary action button for hunk `i`.
+	DiffHunkPrimary(u32),
+	/// Destructive discard button for hunk `i`.
+	DiffHunkDiscard(u32),
 	/// Pointer zone of a hover-decorated component; carries no press action.
 	Zone,
 }

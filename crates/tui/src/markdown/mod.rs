@@ -15,7 +15,7 @@ use crate::{
 };
 
 mod graphviz;
-mod highlight;
+pub(crate) mod highlight;
 mod inline;
 mod mermaid;
 mod table;

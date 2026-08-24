@@ -413,6 +413,15 @@ A terminal image with a cell-rendered fallback.
 - **Source:** `src` is a filesystem path to PNG or binary P6 PPM data. `trim` crops fully transparent margins before cell sampling, keeping padded logos visible as tiny thumbnails.
 - **Graphics:** `UiContext::graphics` selects cells, sixel, Kitty placeholders, Kitty direct placements, or iTerm2. For protocol images, pair `Img::kitty(id, rows, cols)` with `Renderer::register_image`.
 
+#### `DiffPane` — Rust-built interactive source diff
+
+`components::DiffPane` presents a `DiffDocument::build(old, new, path, options)` as split,
+inline, tight-hunk, or new-file views. It owns navigation, wrapping, selection, scrolling,
+the density minimap, and optional hunk buttons while leaving stage/unstage/discard semantics
+to the host through `UiEvent::DiffAction`. Drive retained panes through
+`Ui::with_component_mut`; application shortcuts such as mode cycling and hunk navigation remain
+host policy.
+
 #### `Scene` — Rust-built 3D viewport
 
 A deterministic CPU ray tracer rasterized into braille cells and animated on the shared presentation clock.

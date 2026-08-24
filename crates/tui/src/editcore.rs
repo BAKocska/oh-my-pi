@@ -1976,6 +1976,7 @@ impl Editor {
 	pub fn atom_ranges(&self) -> SmallVec<(usize, usize), 4> {
 		self.buffer.atom_ranges()
 	}
+
 	/// Opens a replacement picker for `range`; acceptance replaces that range.
 	pub fn show_replacements(
 		&mut self,
@@ -1998,12 +1999,8 @@ impl Editor {
 		if suggestions.is_empty() {
 			return false;
 		}
-		self.picker = Some(Picker {
-			prefix_start: range.start,
-			suggestions,
-			selected: 0,
-			provided: false,
-		});
+		self.picker =
+			Some(Picker { prefix_start: range.start, suggestions, selected: 0, provided: false });
 		true
 	}
 

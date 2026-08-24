@@ -53,8 +53,17 @@ enum Request {
 
 #[derive(Debug)]
 enum Response {
-	Checked { generation: u64, text: Str, result: SpellingResult },
-	Guesses { generation: u64, text: Str, range: Range<usize>, items: SmallVec<Str, 8> },
+	Checked {
+		generation: u64,
+		text:       Str,
+		result:     SpellingResult,
+	},
+	Guesses {
+		generation: u64,
+		text:       Str,
+		range:      Range<usize>,
+		items:      SmallVec<Str, 8>,
+	},
 }
 
 /// Latest-only asynchronous spelling client. Platform calls always execute on
@@ -84,20 +93,21 @@ impl SpellingAssist {
 			.spawn(move || worker(request_rx, response_tx, worker_pending))
 			.expect("spelling worker thread");
 		Self {
-			request: request_tx,
-			response: response_rx,
+			request:       request_tx,
+			response:      response_rx,
 			pending_check: pending,
-			generation: 0,
-			checked_text: Str::default(),
-			typos: Vec::new(),
-			projected: Vec::new(),
-			language: None,
-			guesses: None,
-			awaiting: false,
+			generation:    0,
+			checked_text:  Str::default(),
+			typos:         Vec::new(),
+			projected:     Vec::new(),
+			language:      None,
+			guesses:       None,
+			awaiting:      false,
 		}
 	}
 
-	/// Schedules a latest-only check and keeps prior ranges projected while it runs.
+	/// Schedules a latest-only check and keeps prior ranges projected while it
+	/// runs.
 	pub fn check(&mut self, text: &str, masked: &[Range<usize>]) {
 		if text.len() > MAX_CHECK_BYTES || text == self.checked_text.as_str() {
 			return;
@@ -106,7 +116,11 @@ impl SpellingAssist {
 		self.awaiting = true;
 		self.projected = project_ranges(&self.checked_text, text, &self.typos);
 		let masked = mask_ranges(text, masked);
-		let request = Request::Check { generation: self.generation, source: text.into_str(), masked: masked.into_str() };
+		let request = Request::Check {
+			generation: self.generation,
+			source:     text.into_str(),
+			masked:     masked.into_str(),
+		};
 		if let Err(flume::TrySendError::Full(request)) = self.request.try_send(request) {
 			*self.pending_check.lock() = Some(request);
 		}
@@ -119,11 +133,7 @@ impl SpellingAssist {
 		}
 		self.generation = self.generation.wrapping_add(1);
 		self.awaiting = true;
-		let request = Request::Guesses {
-			generation: self.generation,
-			text: text.into_str(),
-			range,
-		};
+		let request = Request::Guesses { generation: self.generation, text: text.into_str(), range };
 		if self.request.try_send(request).is_err() {
 			self.awaiting = false;
 		}
@@ -159,8 +169,13 @@ impl SpellingAssist {
 
 	/// Current typo ranges, including edit-projected ranges during recheck.
 	pub fn typo_ranges(&self) -> &[TypoRange] {
-		if self.projected.is_empty() { &self.typos } else { &self.projected }
+		if self.projected.is_empty() {
+			&self.typos
+		} else {
+			&self.projected
+		}
 	}
+
 	/// Clears cached decorations and invalidates outstanding results.
 	pub fn clear(&mut self) {
 		self.generation = self.generation.wrapping_add(1);
@@ -174,6 +189,7 @@ impl SpellingAssist {
 	pub fn language(&self) -> Option<&str> {
 		self.language.as_deref()
 	}
+
 	/// Whether a platform response is still outstanding.
 	pub const fn awaiting(&self) -> bool {
 		self.awaiting
@@ -208,7 +224,9 @@ fn worker(rx: Receiver<Request>, tx: Sender<Response>, pending: Arc<Mutex<Option
 				},
 			};
 			let _ = tx.try_send(response);
-			let Some(next) = pending.lock().take() else { break };
+			let Some(next) = pending.lock().take() else {
+				break;
+			};
 			request = next;
 		}
 	}
@@ -228,7 +246,11 @@ fn project_ranges(previous: &str, next: &str, ranges: &[TypoRange]) -> Vec<TypoR
 	if previous.is_empty() || ranges.is_empty() {
 		return Vec::new();
 	}
-	let prefix = previous.bytes().zip(next.bytes()).take_while(|(a, b)| a == b).count();
+	let prefix = previous
+		.bytes()
+		.zip(next.bytes())
+		.take_while(|(a, b)| a == b)
+		.count();
 	let suffix = previous[prefix..]
 		.bytes()
 		.rev()
@@ -248,7 +270,13 @@ fn project_ranges(previous: &str, next: &str, ranges: &[TypoRange]) -> Vec<TypoR
 			} else if range.start >= old_end {
 				(range.start.checked_add_signed(delta)?, range.end.checked_add_signed(delta)?)
 			} else {
-				(range.start.min(prefix), range.end.checked_add_signed(delta)?.max(next.len() - suffix))
+				(
+					range.start.min(prefix),
+					range
+						.end
+						.checked_add_signed(delta)?
+						.max(next.len() - suffix),
+				)
 			};
 			(start < end && end <= next.len()).then_some(TypoRange { start, end })
 		})
@@ -281,7 +309,9 @@ mod platform {
 	}
 
 	pub fn check(text: &str) -> SpellingResult {
-		let Some(checker) = checker() else { return SpellingResult::default() };
+		let Some(checker) = checker() else {
+			return SpellingResult::default();
+		};
 		let string = NSString::from_str(text);
 		let full = NSRange { location: 0, length: string.length() };
 		let results = unsafe {
@@ -297,29 +327,51 @@ mod platform {
 		};
 		let mut typos = Vec::new();
 		for result in results.iter() {
-			if result.resultType() != NSTextCheckingType::Spelling { continue }
+			if result.resultType() != NSTextCheckingType::Spelling {
+				continue;
+			}
 			let range = result.range();
 			if let Some(range) = utf16_to_bytes(text, range) {
-				if typos.last().is_none_or(|last: &TypoRange| last.end <= range.start) {
+				if typos
+					.last()
+					.is_none_or(|last: &TypoRange| last.end <= range.start)
+				{
 					typos.push(range);
 				}
 			}
 		}
-		let language = checker.languageForWordRange_inString_orthography(full, &string, None)
+		let language = checker
+			.languageForWordRange_inString_orthography(full, &string, None)
 			.map(|value| Str::new(value.to_string()));
 		SpellingResult { typos, language }
 	}
 
 	pub fn guesses(text: &str, range: Range<usize>) -> SmallVec<Str, 8> {
-		let Some(checker) = checker() else { return SmallVec::new() };
+		let Some(checker) = checker() else {
+			return SmallVec::new();
+		};
 		let string = NSString::from_str(text);
-		let Some(ns_range) = bytes_to_utf16(text, range) else { return SmallVec::new() };
-		let language = checker.languageForWordRange_inString_orthography(ns_range, &string, None)
+		let Some(ns_range) = bytes_to_utf16(text, range) else {
+			return SmallVec::new();
+		};
+		let language = checker
+			.languageForWordRange_inString_orthography(ns_range, &string, None)
 			.unwrap_or_else(|| checker.language());
-		checker.guessesForWordRange_inString_language_inSpellDocumentWithTag(
-			ns_range, &string, Some(&*language), 0,
-		).map(|values| values.iter().take(MAX_SUGGESTIONS).map(|value| Str::new(value.to_string())).collect())
-		.unwrap_or_default()
+		checker
+			.guessesForWordRange_inString_language_inSpellDocumentWithTag(
+				ns_range,
+				&string,
+				Some(&*language),
+				0,
+			)
+			.map(|values| {
+				values
+					.iter()
+					.take(MAX_SUGGESTIONS)
+					.map(|value| Str::new(value.to_string()))
+					.collect()
+			})
+			.unwrap_or_default()
 	}
 
 	fn utf16_to_bytes(text: &str, range: NSRange) -> Option<TypoRange> {
@@ -329,19 +381,25 @@ mod platform {
 	}
 
 	fn bytes_to_utf16(text: &str, range: Range<usize>) -> Option<NSRange> {
-		if !text.is_char_boundary(range.start) || !text.is_char_boundary(range.end) { return None }
+		if !text.is_char_boundary(range.start) || !text.is_char_boundary(range.end) {
+			return None;
+		}
 		Some(NSRange {
 			location: text[..range.start].encode_utf16().count(),
-			length: text[range.start..range.end].encode_utf16().count(),
+			length:   text[range.start..range.end].encode_utf16().count(),
 		})
 	}
 
 	fn byte_at_utf16(text: &str, wanted: usize) -> Option<usize> {
 		let mut units = 0;
 		for (byte, character) in text.char_indices() {
-			if units == wanted { return Some(byte) }
+			if units == wanted {
+				return Some(byte);
+			}
 			units += character.len_utf16();
-			if units > wanted { return None }
+			if units > wanted {
+				return None;
+			}
 		}
 		(units == wanted).then_some(text.len())
 	}
@@ -350,9 +408,14 @@ mod platform {
 #[cfg(not(target_os = "macos"))]
 mod platform {
 	use smallvec::SmallVec;
+
 	use super::{Range, SpellingResult, Str};
-	pub fn check(_text: &str) -> SpellingResult { SpellingResult::default() }
-	pub fn guesses(_text: &str, _range: Range<usize>) -> SmallVec<Str, 8> { SmallVec::new() }
+	pub fn check(_text: &str) -> SpellingResult {
+		SpellingResult::default()
+	}
+	pub fn guesses(_text: &str, _range: Range<usize>) -> SmallVec<Str, 8> {
+		SmallVec::new()
+	}
 }
 
 #[cfg(test)]

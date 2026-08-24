@@ -14,7 +14,7 @@ use crate::{
 	components::{EditorPane, Img, ImgState, Row, Scroll, Tabs, Wizard},
 	context::UiContext,
 	frame::{Color, Frame, Rect, Size, Style},
-	input::{Key, Mouse, UiEvent},
+	input::{Key, Mods, Mouse, UiEvent},
 	markup::{self, ParseError},
 	overlay::{self, OverlayBand, OverlayId, OverlayOptions},
 	props::{Prop, PropValue},
@@ -84,6 +84,8 @@ pub struct Ui {
 	/// Last pointer cell in document coordinates, feeding pointer-tracking
 	/// chrome such as the `hover` glow.
 	pub(crate) pointer:  Option<(u16, u16)>,
+	/// Modifiers attached to the mouse event currently being routed.
+	mouse_mods:          Mods,
 	/// Whether the keyboard was the most recent input modality; gates the
 	/// focus-side hover chrome so only one chrome cursor exists.
 	pub(crate) keyboard: bool,
@@ -160,6 +162,7 @@ impl Ui {
 			focus: None,
 			hover: None,
 			pointer: None,
+			mouse_mods: Mods::default(),
 			keyboard: false,
 			hits: Vec::new(),
 			drag: None,
@@ -289,6 +292,28 @@ impl Ui {
 		}
 		self.apply_conds(true);
 		true
+	}
+
+	/// Locates a named component, downcasts it to `T`, and applies `update`.
+	/// A successful typed mutation invalidates the component and returns the
+	/// closure's value; an unknown id or mismatched concrete type returns
+	/// `None`.
+	pub fn with_component_mut<T: Component, R>(
+		&mut self,
+		id: &str,
+		update: impl FnOnce(&mut T) -> R,
+	) -> Option<R> {
+		let (slot, old_measure, old_rect, presented) = self.snapshot_id(id)?;
+		let result = self.root.update_id(id, |cached| {
+			let result = cached.comp_mut().downcast_mut::<T>().map(update);
+			let changed = result.is_some();
+			(result, changed)
+		})??;
+		if presented {
+			self.refresh_slot(slot, old_measure, old_rect);
+		}
+		self.apply_conds(true);
+		Some(result)
 	}
 
 	/// Locates a named component, downcasts it to `T`, and applies `update`.
@@ -819,6 +844,15 @@ impl Ui {
 	/// Routes a mouse gesture in viewport cell coordinates; visible overlays
 	/// occlude the base tree within their bounds.
 	pub fn handle_mouse(&mut self, x: u16, y: u16, mouse: Mouse) -> UiEvent {
+		self.handle_mouse_with_mods(x, y, mouse, Mods::default())
+	}
+
+	/// Routes a mouse gesture with its terminal modifier bits.
+	pub fn handle_mouse_with_mods(&mut self, x: u16, y: u16, mouse: Mouse, mods: Mods) -> UiEvent {
+		self.mouse_mods = mods;
+		for entry in &mut self.overlays {
+			entry.ui.mouse_mods = mods;
+		}
 		if let Some(event) = self.route_overlay_mouse(x, y, mouse) {
 			return event;
 		}
@@ -1391,7 +1425,7 @@ impl Ui {
 			let old_measure = cached.measure(ctx);
 			let old_rect = cached.rect;
 			let (width, view_rows) = event_size(cached);
-			let mut ec = EventCtx::new(ctx, width, view_rows);
+			let mut ec = EventCtx::with_mods(ctx, width, view_rows, self.mouse_mods);
 			let flow = cached
 				.comp_mut()
 				.mouse(&mut ec, hit.tag, at, hit.rect, mouse);

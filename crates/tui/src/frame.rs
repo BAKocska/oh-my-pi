@@ -84,6 +84,20 @@ pub enum Color {
 }
 
 impl Color {
+	/// Linearly blends RGB channels from `self` toward `other`.
+	///
+	/// Non-RGB endpoints cannot be resolved without a palette and therefore
+	/// remain unchanged. `amount` is clamped to `0.0..=1.0`.
+	pub fn mix(self, other: Self, amount: f32) -> Self {
+		let (Self::Rgb(ar, ag, ab), Self::Rgb(br, bg, bb)) = (self, other) else {
+			return self;
+		};
+		let amount = amount.clamp(0.0, 1.0);
+		let channel =
+			|a: u8, b: u8| (f32::from(a) + (f32::from(b) - f32::from(a)) * amount).round() as u8;
+		Self::Rgb(channel(ar, br), channel(ag, bg), channel(ab, bb))
+	}
+
 	/// Parses any CSS color and lowers it to a cell color without
 	/// context: fully transparent values and `currentcolor` become
 	/// [`Color::Default`] (the terminal's pass-through color),

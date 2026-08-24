@@ -107,19 +107,18 @@ const INFERRED_CURSOR_THINKING: &[(&str, &[ThinkingEffort])] = &[
 		ThinkingEffort::Max,
 	]),
 ];
-const REVIEWED_THINKING_CORRECTIONS: &[(&str, &[ThinkingEffort])] =
-	&[
-		("baseten/moonshotai/Kimi-K3", &[
-			ThinkingEffort::Low,
-			ThinkingEffort::High,
-			ThinkingEffort::Max,
-		]),
-		("opencode-go/deepseek-v4-flash", &[
-			ThinkingEffort::Low,
-			ThinkingEffort::High,
-			ThinkingEffort::Max,
-		]),
-	];
+const REVIEWED_THINKING_CORRECTIONS: &[(&str, &[ThinkingEffort])] = &[
+	("baseten/moonshotai/Kimi-K3", &[
+		ThinkingEffort::Low,
+		ThinkingEffort::High,
+		ThinkingEffort::Max,
+	]),
+	("opencode-go/deepseek-v4-flash", &[
+		ThinkingEffort::Low,
+		ThinkingEffort::High,
+		ThinkingEffort::Max,
+	]),
+];
 const CURATED_THINKING_OVERRIDES: &[&str] =
 	&["baseten/moonshotai/Kimi-K3", "nanogpt/linkup-research"];
 /// Frozen-profile members whose compiled thinking intentionally gained a
@@ -1059,7 +1058,10 @@ fn with_reviewed_wire_overrides(
 		policy.tool.supports_tool_choice = Some(false);
 	}
 	if class == "deepseek" {
-		let model = key.split_once('/').map_or(key, |(_, model)| model).to_ascii_lowercase();
+		let model = key
+			.split_once('/')
+			.map_or(key, |(_, model)| model)
+			.to_ascii_lowercase();
 		policy.image.encoding = Some(
 			if model.contains("deepseek-ocr")
 				|| model.contains("janus")
@@ -2830,12 +2832,8 @@ fn every_sparse_wire_profile_has_a_stable_distinct_content_id() {
 			};
 			let expected_policy = with_census_thinking_format(base, provider, class);
 			let expected_policy = with_model_behavior(expected_policy, behavior);
-			let expected_policy = with_reviewed_wire_overrides(
-				expected_policy,
-				model.key.as_str(),
-				provider,
-				class,
-			);
+			let expected_policy =
+				with_reviewed_wire_overrides(expected_policy, model.key.as_str(), provider, class);
 			let actual_policy = compiled
 				.wire_policies
 				.iter()

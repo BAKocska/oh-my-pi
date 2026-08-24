@@ -10,7 +10,10 @@ use std::{
 use omp_core::Str;
 use xutf::{IntoUnicodeNormalized, Text};
 
-use crate::rich::cell_width;
+use crate::{
+	components::{DiffActionKind, DiffTarget},
+	rich::cell_width,
+};
 
 // ---------------------------------------------------------------- events
 
@@ -565,6 +568,7 @@ impl InputDecoder {
 			emit_chord(&self.keymap, chord, out);
 		}
 	}
+
 	fn enter_string_discard(&mut self, now: Instant) {
 		self.string_discard = Some(StringDiscard { bytes: 0, esc_held: false, last: now });
 	}
@@ -1702,6 +1706,15 @@ pub enum UiEvent {
 	/// write (OSC 52 on terminals, a native detached write on the GPU
 	/// host) — widgets never touch the clipboard themselves.
 	Copied(Str),
+	/// An interactive diff pane requested a host-owned mutation.
+	DiffAction {
+		/// The pane's component `id`, or the empty string when unnamed.
+		id:     Str,
+		/// Mutation selected by the host or a hunk button.
+		action: DiffActionKind,
+		/// Source scope resolved by selection/hunk/file precedence.
+		target: DiffTarget,
+	},
 }
 
 /// Grapheme-safe byte offset for a cell-column cursor within `text`.
@@ -1879,8 +1892,7 @@ mod tests {
 
 	use super::{
 		Chord, ChordParseError, InputDecoder, InputEvent, Key, Keymap, Mods, Mouse, MouseButton,
-		MouseReport, TerminalResponse, decode_keys, mods_from_bits,
-		STRING_DISCARD_MAX_BYTES,
+		MouseReport, STRING_DISCARD_MAX_BYTES, TerminalResponse, decode_keys, mods_from_bits,
 	};
 
 	#[test]
@@ -2161,10 +2173,7 @@ mod tests {
 		assert!(events.is_empty());
 		decoder.feed(b"base64\x1b", start + Duration::from_millis(76), &mut events);
 		decoder.feed(b"\\ok", start + Duration::from_millis(77), &mut events);
-		assert_eq!(events, [
-			InputEvent::Key(Key::Char('o')),
-			InputEvent::Key(Key::Char('k')),
-		]);
+		assert_eq!(events, [InputEvent::Key(Key::Char('o')), InputEvent::Key(Key::Char('k')),]);
 	}
 
 	#[test]

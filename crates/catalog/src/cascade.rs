@@ -127,12 +127,7 @@ pub const KNOWN_AXES: &[(&str, AxisSet, &str, AxisKind)] = &[
 	("requires-tool-result-id", AxisSet::Wire, "requires_tool_result_id", AxisKind::Scalar),
 	("signing-endpoint", AxisSet::Wire, "signing_endpoint", AxisKind::Scalar),
 	("stream-idle-timeout-ms", AxisSet::Wire, "stream_idle_timeout_ms", AxisKind::Scalar),
-	(
-		"thinking-close-max-retries",
-		AxisSet::Wire,
-		"thinking_close_max_retries",
-		AxisKind::Scalar,
-	),
+	("thinking-close-max-retries", AxisSet::Wire, "thinking_close_max_retries", AxisKind::Scalar),
 	("supports-developer-role", AxisSet::Wire, "supports_developer_role", AxisKind::Scalar),
 	(
 		"supports-eager-tool-input-streaming",

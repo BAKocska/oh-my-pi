@@ -378,9 +378,12 @@ fn build_operation(
 				desired,
 				has_add,
 				block_rewrite: None,
-				recovery_note: expanded.map(|_| Str::new(
-					"Note: REWRITE restated the whole selection-bearing line, so the full line was replaced.",
-				)),
+				recovery_note: expanded.map(|_| {
+					Str::new(
+						"Note: REWRITE restated the whole selection-bearing line, so the full line was \
+						 replaced.",
+					)
+				}),
 			})
 		},
 		Some(rewrite) if selections.paired > 0 => {
@@ -445,7 +448,8 @@ fn build_operation(
 					has_add,
 					block_rewrite: None,
 					recovery_note: Some(Str::new(format!(
-						"Note: operation {operation} stated desired text without markers; the closest matching block was replaced with it."
+						"Note: operation {operation} stated desired text without markers; the closest \
+						 matching block was replaced with it."
 					))),
 				});
 			}
@@ -460,7 +464,8 @@ fn build_operation(
 			Err(SloppyError::Retry {
 				operation,
 				message: Str::new(format!(
-					"Operation {operation} needs ».\nCopy-ready corrected payload (fill in the new text):\n{}",
+					"Operation {operation} needs ».\nCopy-ready corrected payload (fill in the new \
+					 text):\n{}",
 					corrected.join("\n")
 				)),
 			})
@@ -505,13 +510,21 @@ fn selection_facts(pattern: &str, operation: usize) -> Result<SelectionFacts, Sl
 }
 
 fn expand_echoed_line_selection(pattern: &str, rewrite: &str) -> Option<String> {
-	let rewrite_lines = rewrite.lines().filter(|line| !line.trim().is_empty()).collect::<Vec<_>>();
+	let rewrite_lines = rewrite
+		.lines()
+		.filter(|line| !line.trim().is_empty())
+		.collect::<Vec<_>>();
 	if rewrite_lines.len() != 1 {
 		return None;
 	}
 	let mut lines = pattern.lines().map(str::to_owned).collect::<Vec<_>>();
 	let selected = lines.iter().position(|line| line.contains(SELECT_OPEN))?;
-	if lines.iter().filter(|line| line.contains(SELECT_OPEN)).count() != 1 {
+	if lines
+		.iter()
+		.filter(|line| line.contains(SELECT_OPEN))
+		.count()
+		!= 1
+	{
 		return None;
 	}
 	let line = &lines[selected];
@@ -526,7 +539,9 @@ fn expand_echoed_line_selection(pattern: &str, rewrite: &str) -> Option<String> 
 		return None;
 	}
 	let prefix = &line[..open];
-	if prefix.trim().is_empty() || !normalize_text(rewrite_lines[0]).starts_with(&normalize_text(prefix)) {
+	if prefix.trim().is_empty()
+		|| !normalize_text(rewrite_lines[0]).starts_with(&normalize_text(prefix))
+	{
 		return None;
 	}
 	let unmarked = line.replace(SELECT_OPEN, "").replace(SELECT_CLOSE, "");
@@ -572,9 +587,11 @@ fn closest_desired_block(source: &str, stated: &str) -> Option<String> {
 	if best_score > 0.35 {
 		return None;
 	}
-	if scores.iter().enumerate().any(|(index, score)| {
-		index.abs_diff(best_index) >= count && *score - best_score < 0.1
-	}) {
+	if scores
+		.iter()
+		.enumerate()
+		.any(|(index, score)| index.abs_diff(best_index) >= count && *score - best_score < 0.1)
+	{
 		return None;
 	}
 	let text = lines[best_index..best_index + count].join("\n");
@@ -587,13 +604,15 @@ fn has_add_lines(pattern: &str) -> bool {
 }
 
 fn encode_literal_markers(text: &str) -> String {
-	text.replace(SELECT_OPEN, LITERAL_OPEN)
+	text
+		.replace(SELECT_OPEN, LITERAL_OPEN)
 		.replace(SELECT_CLOSE, LITERAL_CLOSE)
 		.replace(SELECT_DIVIDER, LITERAL_DIVIDER)
 }
 
 fn decode_literal_markers(text: &str) -> String {
-	text.replace(LITERAL_OPEN, SELECT_OPEN)
+	text
+		.replace(LITERAL_OPEN, SELECT_OPEN)
 		.replace(LITERAL_CLOSE, SELECT_CLOSE)
 		.replace(LITERAL_DIVIDER, SELECT_DIVIDER)
 }
@@ -680,7 +699,9 @@ fn embed_add_lines(pattern: &str) -> String {
 }
 
 fn wrap_trailing_add_anchor(output: &mut [String], inserted: &str) -> bool {
-	let Some(previous) = output.last_mut() else { return false };
+	let Some(previous) = output.last_mut() else {
+		return false;
+	};
 	if previous.trim().is_empty()
 		|| previous.contains(GAP)
 		|| previous.contains(SELECT_OPEN)
@@ -689,9 +710,7 @@ fn wrap_trailing_add_anchor(output: &mut [String], inserted: &str) -> bool {
 		return false;
 	}
 	let anchor = mem::take(previous);
-	*previous = format!(
-		"{SELECT_OPEN}{anchor}{SELECT_DIVIDER}{anchor}\n{inserted}{SELECT_CLOSE}"
-	);
+	*previous = format!("{SELECT_OPEN}{anchor}{SELECT_DIVIDER}{anchor}\n{inserted}{SELECT_CLOSE}");
 	true
 }
 
@@ -718,17 +737,22 @@ fn word_tokens(text: &str) -> Vec<&str> {
 }
 
 fn resolve_literal_dividers(selection: &str, operation: usize) -> (String, String, Str) {
-	let dividers = selection.match_indices(SELECT_DIVIDER).map(|(at, _)| at).collect::<Vec<_>>();
+	let dividers = selection
+		.match_indices(SELECT_DIVIDER)
+		.map(|(at, _)| at)
+		.collect::<Vec<_>>();
 	let last = *dividers.last().expect("called for a divided selection");
 	let advice = format!(
-		"Selections containing literal {SELECT_DIVIDER} are ambiguous; use a {REWRITE} block rewrite instead."
+		"Selections containing literal {SELECT_DIVIDER} are ambiguous; use a {REWRITE} block \
+		 rewrite instead."
 	);
 	if last + SELECT_DIVIDER.len() == selection.len() {
 		return (
 			selection[..last].to_owned(),
 			String::new(),
 			Str::new(format!(
-				"Note: operation {operation}'s trailing {SELECT_DIVIDER} was read as deletion; inner dividers were literal. {advice}"
+				"Note: operation {operation}'s trailing {SELECT_DIVIDER} was read as deletion; inner \
+				 dividers were literal. {advice}"
 			)),
 		);
 	}
@@ -738,7 +762,8 @@ fn resolve_literal_dividers(selection: &str, operation: usize) -> (String, Strin
 			selection[..middle].to_owned(),
 			selection[middle + SELECT_DIVIDER.len()..].to_owned(),
 			Str::new(format!(
-				"Note: operation {operation}'s middle {SELECT_DIVIDER} was read as the divider; the others were literal. {advice}"
+				"Note: operation {operation}'s middle {SELECT_DIVIDER} was read as the divider; the \
+				 others were literal. {advice}"
 			)),
 		);
 	}
@@ -777,12 +802,7 @@ fn inline_template(
 				(old.to_owned(), new.to_owned())
 			};
 			let local = append_match(&old, &mut match_text, &mut capture);
-			desired.extend(pieces_from_rewrite(
-				&new,
-				local.len(),
-				Some(&local),
-				operation,
-			)?);
+			desired.extend(pieces_from_rewrite(&new, local.len(), Some(&local), operation)?);
 		} else if bare_as_desired && !selection.is_empty() {
 			match_text.push_str(GAP);
 			desired.push(Piece::Text(selection.to_owned()));
@@ -898,7 +918,8 @@ fn pieces_from_rewrite(
 			if rewrite[line_start..line_end].trim() == GAP {
 				return Err(SloppyError::Malformed {
 					operation,
-					reason: "REWRITE has a whole-line … with no MATCH gap to re-emit; type the elided lines out",
+					reason: "REWRITE has a whole-line … with no MATCH gap to re-emit; type the elided \
+					         lines out",
 				});
 			}
 			push_text(&mut pieces, GAP);
@@ -1784,7 +1805,12 @@ mod tests {
 		)
 		.expect("one close block");
 		assert_eq!(applied.content, "    if (entry_row)\n      fail();\n");
-		assert!(applied.notes.iter().any(|note| note.contains("closest matching block")));
+		assert!(
+			applied
+				.notes
+				.iter()
+				.any(|note| note.contains("closest matching block"))
+		);
 
 		let ambiguous = "if (!left_entry) { fail(); }\nif (!right_entry) { fail(); }\n";
 		assert!(matches!(
@@ -1797,11 +1823,15 @@ mod tests {
 	fn echoed_line_rewrite_expands_the_bare_selection() {
 		let applied = apply_sloppy_detailed(
 			"  screen = [y -> Blank],  \\* viewport\nnext();\n",
-			"§\n  screen = [y -> ⟪Blank⟫],  \\* viewport\n»\n  screen = [y -> IF y = 1 THEN Row ELSE Blank],  \\* row one",
+			"§\n  screen = [y -> ⟪Blank⟫],  \\* viewport\n»\n  screen = [y -> IF y = 1 THEN Row ELSE \
+			 Blank],  \\* row one",
 			Some("spec.tla"),
 		)
 		.expect("echoed line");
-		assert_eq!(applied.content, "  screen = [y -> IF y = 1 THEN Row ELSE Blank],  \\* row one\nnext();\n");
+		assert_eq!(
+			applied.content,
+			"  screen = [y -> IF y = 1 THEN Row ELSE Blank],  \\* row one\nnext();\n"
+		);
 	}
 
 	#[test]
@@ -1813,5 +1843,4 @@ mod tests {
 			"function f() {\n  return `${x}[… ]${y}`;\n}\n"
 		);
 	}
-
 }

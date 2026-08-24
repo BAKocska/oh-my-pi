@@ -64,6 +64,10 @@ pub use component::{
 	Cached, Component, ElementFactory, Elements, EventCtx, Flow, Hit, HitTag, IntoChildren,
 	IntoComponent, PaintCtx, Slot, next_slot,
 };
+pub use components::{
+	DiffActionKind, DiffBuildOptions, DiffDocument, DiffPane, DiffPaneState, DiffPatchTarget,
+	DiffSelection, DiffTarget, ViewMode,
+};
 pub use context::{Appearance, Charset, Graphics, Grid, JamoWidth, Theme, UiContext};
 pub use debug::{FramePngError, frame_png, frame_text, respond_debug_query};
 pub use editcore::{
@@ -87,7 +91,6 @@ pub use input::{
 	Chord, InputDecoder, InputEvent, Key, Keymap, Mods, Mouse, MouseButton, MouseReport,
 	TerminalResponse, UiEvent, decode_keys,
 };
-pub use spelling::{SpellingAssist, SpellingResult, SpellingFeatures, TypoRange};
 pub use markup::{Border, Dim, MarkupOrigin, ParseError, parse_with_origin};
 pub use notify::{
 	Notification, NotificationAction, NotificationBuilder, NotificationSound, Urgency, notify,
@@ -104,7 +107,8 @@ pub use rich::{
 	cell_width, decompose,
 };
 pub use runtime::{App, AppEnv, AppEvent, AppOptions, ImageLoader, UiHandle, is_core_chord};
+pub use spelling::{SpellingAssist, SpellingFeatures, SpellingResult, TypoRange};
 pub use terminal::{AltScreenUse, CursorStyle, Progress, Terminal, TerminalOptions};
 pub use theme::{JsonTheme, ThemeError, session_accent_color};
-pub use tty::TtyOut;
+pub use tty::{TtyOut, overridden as tty_overridden};
 pub use ui::Ui;

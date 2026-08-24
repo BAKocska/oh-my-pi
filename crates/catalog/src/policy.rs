@@ -435,7 +435,7 @@ pub struct ThinkingToggle {
 #[serde(deny_unknown_fields)]
 pub struct ReasoningBodyOverride {
 	/// Typed thinking object.
-	pub thinking:        Option<ThinkingToggle>,
+	pub thinking:          Option<ThinkingToggle>,
 	/// Qwen-compatible thinking switch.
 	pub enable_thinking:   Option<bool>,
 	/// Venice request controls.
@@ -556,9 +556,9 @@ pub struct ContextPolicy {
 #[serde(deny_unknown_fields)]
 pub struct StreamingPolicy {
 	/// Stream framing protocol.
-	pub protocol: Option<StreamProtocol>,
+	pub protocol:                   Option<StreamProtocol>,
 	/// Optional first-event and idle timeouts.
-	pub watchdog: Option<StreamWatchdog>,
+	pub watchdog:                   Option<StreamWatchdog>,
 	/// Maximum retries for a reasoning-only stream close.
 	pub thinking_close_max_retries: Option<u32>,
 }
