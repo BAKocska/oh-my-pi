@@ -87,6 +87,8 @@ class TabState {
 	/** Whether targets for this tab were announced to discovering connections. */
 	announced = false;
 	attaching: Promise<boolean> | null = null;
+	/** Relay-initiated detach in flight; reattach serializes behind it so the new attach never races the pending detach or its onDetach echo. */
+	detaching: Promise<void> | null = null;
 	/** True after the relay put this tab in the omp group; `ompGroupId` holds that group. */
 	grouped = false;
 	/** Group RPC in flight — suppresses duplicate requests from load-time tabUpdated bursts. */
@@ -340,10 +342,7 @@ export class RelayBridge {
 		for (const tabId of touched) {
 			if (this.#sessionHolders(tabId).length > 0) continue;
 			const tab = this.#tabs.get(tabId);
-			if (tab?.attached) {
-				tab.attached = false;
-				void this.#rpc({ op: "detach", tabId }).catch(() => {});
-			}
+			if (tab) this.#detachTab(tab);
 		}
 		this.#log("cdp client closed", { conn: connId });
 	}
@@ -859,10 +858,24 @@ export class RelayBridge {
 		// connection still holds a session on the tab.
 		if (this.#sessionHolders(ref.tabId).length > 0) return;
 		const tab = this.#tabs.get(ref.tabId);
-		if (tab?.attached) {
-			tab.attached = false;
-			void this.#rpc({ op: "detach", tabId: ref.tabId }).catch(() => {});
-		}
+		if (tab) this.#detachTab(tab);
+	}
+
+	/**
+	 * Drop `chrome.debugger` (and its infobar) from a tab nobody drives anymore,
+	 * tracking the in-flight RPC on {@link TabState.detaching} so a concurrent
+	 * reattach serializes behind it instead of racing the detach.
+	 */
+	#detachTab(tab: TabState): void {
+		if (!tab.attached) return;
+		tab.attached = false;
+		const done = this.#rpc({ op: "detach", tabId: tab.tabId })
+			.then(() => {})
+			.catch(() => {})
+			.finally(() => {
+				if (tab.detaching === done) tab.detaching = null;
+			});
+		tab.detaching = done;
 	}
 
 	/** Connections currently holding any session on a tab. */
@@ -885,6 +898,12 @@ export class RelayBridge {
 	}
 
 	async #ensureAttached(tab: TabState): Promise<boolean> {
+		// Serialize behind an in-flight relay-initiated detach: attaching before
+		// the detach RPC (and any onDetach echo) settles races Chrome — the new
+		// attach can fail and ban the tab, or the stale detach event can retract
+		// the freshly created session. Awaiting drains the echo first, since the
+		// extension posts `detached` before the detach RPC result.
+		while (tab.detaching) await tab.detaching;
 		if (tab.attached) return true;
 		if (tab.banned || !this.#ext) return false;
 		if (tab.attaching) return await tab.attaching;

@@ -157,24 +157,37 @@ interface ScriptedExtension {
 	ws: WebSocket;
 	/** Every RPC the relay drove the extension with, in arrival order. */
 	rpcs: RelayRpcRequest[];
+	/** Settle any detach RPCs withheld via the `deferDetach` option (echo + result). */
+	flushDetach(): void;
 }
 
 /** Extension that acknowledges every RPC and records it, so tests can assert relay-driven upstream traffic. */
-async function connectScriptedExtension(port: number, tabs: TabSnapshot[]): Promise<ScriptedExtension> {
+async function connectScriptedExtension(
+	port: number,
+	tabs: TabSnapshot[],
+	opts: { deferDetach?: boolean } = {},
+): Promise<ScriptedExtension> {
 	const rpcs: RelayRpcRequest[] = [];
+	const withheld: Array<{ id: number; tabId: number }> = [];
 	const opened = Promise.withResolvers<void>();
 	const ws = new WebSocket(`ws://127.0.0.1:${port}/ext`);
 	ws.addEventListener("open", () => opened.resolve(), { once: true });
 	ws.addEventListener("error", () => opened.reject(new Error("Extension socket failed to connect")), { once: true });
+	// Mirror Chrome: chrome.debugger.detach() would fire onDetach, which the real
+	// extension forwards as `detached` before the detach RPC result settles.
+	const settleDetach = (id: number, tabId: number): void => {
+		ws.send(JSON.stringify({ t: "detached", tabId, reason: "target_closed" } satisfies ExtToRelayMessage));
+		ws.send(JSON.stringify({ t: "rpcResult", id, ok: true, result: {} } satisfies ExtToRelayMessage));
+	};
 	ws.addEventListener("message", event => {
 		const msg = JSON.parse(String(event.data)) as RelayToExtMessage;
 		if (msg.t !== "rpc") return;
 		const { id, t: _t, ...rpc } = msg;
 		rpcs.push(rpc);
-		// Mirror Chrome: chrome.debugger.detach() would fire onDetach, which the
-		// real extension forwards as `detached` before the RPC settles.
 		if (rpc.op === "detach") {
-			ws.send(JSON.stringify({ t: "detached", tabId: rpc.tabId, reason: "target_closed" } satisfies ExtToRelayMessage));
+			if (opts.deferDetach) withheld.push({ id, tabId: rpc.tabId });
+			else settleDetach(id, rpc.tabId);
+			return;
 		}
 		ws.send(JSON.stringify({ t: "rpcResult", id, ok: true, result: {} } satisfies ExtToRelayMessage));
 	});
@@ -188,7 +201,10 @@ async function connectScriptedExtension(port: number, tabs: TabSnapshot[]): Prom
 			attachedTabIds: [],
 		} satisfies ExtToRelayMessage),
 	);
-	return { ws, rpcs };
+	const flushDetach = (): void => {
+		for (const { id, tabId } of withheld.splice(0)) settleDetach(id, tabId);
+	};
+	return { ws, rpcs, flushDetach };
 }
 
 interface CdpResponse {
@@ -246,16 +262,19 @@ describe("browser relay session detach", () => {
 	// Two tabs so a later attach on tab 2 can serve as a deterministic marker:
 	// the ext socket is FIFO, so once the tab-2 attach round-trips, any upstream
 	// detach the tab-1 release dispatched is already recorded.
-	async function startReadyRelay(): Promise<{ port: number; rpcs: RelayRpcRequest[] }> {
+	async function startReadyRelay(
+		opts: { deferDetach?: boolean } = {},
+	): Promise<{ port: number; rpcs: RelayRpcRequest[]; ext: ScriptedExtension }> {
 		const port = await findFreeCdpPort();
 		relay = startRelayServer({ port });
-		const ext = await connectScriptedExtension(port, [
-			fakeTab(1, "https://one.example/"),
-			fakeTab(2, "https://two.example/"),
-		]);
+		const ext = await connectScriptedExtension(
+			port,
+			[fakeTab(1, "https://one.example/"), fakeTab(2, "https://two.example/")],
+			opts,
+		);
 		extension = ext.ws;
 		await waitForDiscovery(port);
-		return { port, rpcs: ext.rpcs };
+		return { port, rpcs: ext.rpcs, ext };
 	}
 
 	async function openClient(port: number): Promise<CdpClient> {
@@ -303,5 +322,29 @@ describe("browser relay session detach", () => {
 		const reattached = await client.send("Target.attachToTarget", { targetId: "PAGE1", flatten: true });
 		expect(reattached.error).toBeUndefined();
 		expect(typeof reattached.result?.sessionId).toBe("string");
+	});
+
+	it("serializes a reattach behind an in-flight relay-initiated detach", async () => {
+		const { port, rpcs, ext } = await startReadyRelay({ deferDetach: true });
+		const a = await openClient(port);
+		const attached = await a.send("Target.attachToTarget", { targetId: "PAGE1", flatten: true });
+		// Release the last session; the detach RPC is now in flight (withheld).
+		await a.send("Target.detachFromTarget", { sessionId: attached.result?.sessionId });
+
+		// A second client reattaches while the detach is unresolved.
+		const b = await openClient(port);
+		const reattach = b.send("Target.attachToTarget", { targetId: "PAGE1", flatten: true });
+		// Browser.getVersion never parks, so once it replies the relay has already
+		// processed b's attach and is waiting on the pending detach: no new attach
+		// RPC has gone out yet — only the original one.
+		await b.send("Browser.getVersion");
+		expect(rpcs.filter(rpc => rpc.op === "attach" && rpc.tabId === 1)).toHaveLength(1);
+
+		// Settle the detach; the serialized reattach now proceeds and succeeds.
+		ext.flushDetach();
+		const reattached = await reattach;
+		expect(reattached.error).toBeUndefined();
+		expect(typeof reattached.result?.sessionId).toBe("string");
+		expect(rpcs.filter(rpc => rpc.op === "attach" && rpc.tabId === 1)).toHaveLength(2);
 	});
 });
