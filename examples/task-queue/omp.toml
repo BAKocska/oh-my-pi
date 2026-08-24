@@ -15,7 +15,7 @@ summary = "Append a task to the hidden, strictly serialized session queue."
 
 [[declarations]]
 id = "task-queue-drain"
-kind = "campaign"
+kind = "regime"
 module = "task_queue"
 key = "task-queue-drain"
 trigger = "lazy"

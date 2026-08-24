@@ -45,8 +45,8 @@ class _QueueItem:
 
 
 @dataclass(frozen=True, slots=True)
-class QueueCampaignState:
-    """Track the task handed out by the last committed campaign reaction."""
+class QueueRegimeState:
+    """Track the task handed out by the last committed regime draft."""
 
     last_handed_task_id: int | None = None
 
@@ -83,25 +83,29 @@ def _append_task(task: str, *, idempotency_key: str) -> QueueReceipt:
     return QueueReceipt(task_id=entry_id.index, waiting=waiting)
 
 
-_QUEUE_CAMPAIGN = "task-queue-drain"
+_QUEUE_REGIME = "task-queue-drain"
 
 
-@omp.campaign(
-    _QUEUE_CAMPAIGN,
-    at=omp.SETTLE,
-    ladder=omp.Ladder(8),
-    exhaust=omp.Exhaust.SETTLE,
-    scope=omp.CampaignScope.SESSION,
-    state=QueueCampaignState,
-    state_family="examples.task-queue.campaign-state",
-    on_failure=omp.OnFailure.DEFER,
+def _queue_limit(ctx: omp.RegimeContext, next_: omp.Next) -> object:
+    """Complete a drain activation after eight committed hand-offs."""
+
+    del ctx
+    return next_.complete()
+
+
+@omp.regime(
+    _QUEUE_REGIME,
+    on=omp.SETTLE,
+    lifetime="session",
+    state=QueueRegimeState,
+    max_steps=8,
+    on_limit=_queue_limit,
+    on_failure="defer",
 )
-def drain_task_queue(
-    event: dict[str, object], state: QueueCampaignState
-) -> tuple[object, QueueCampaignState]:
+def drain_task_queue(ctx: omp.RegimeContext, next_: omp.Next) -> object:
     """Complete the previously handed task, then hand out at most one task."""
 
-    del event
+    state = ctx.state.value
     tasks = _fold_queue()
     if state.last_handed_task_id is not None:
         handed = next(
@@ -121,30 +125,31 @@ def drain_task_queue(
 
     active = next((item for item in tasks if item.status == "started"), None)
     if active is not None:
-        return (
-            omp.Continue(inject=active.task),
-            replace(state, last_handed_task_id=active.task_id),
+        ctx.context.append(active.task)
+        ctx.state.replace(
+            replace(state, last_handed_task_id=active.task_id)
         )
+        return next_.retry()
 
     next_task = next((item for item in tasks if item.status == "queued"), None)
     if next_task is None:
-        return omp.Done(), replace(state, last_handed_task_id=None)
+        ctx.state.replace(replace(state, last_handed_task_id=None))
+        return next_.complete()
 
     omp.journal.append(
         QueuedTask(event="started", task_id=next_task.task_id),
         idempotency_key=f"task-queue:start:{next_task.task_id}",
     )
-    return (
-        omp.Continue(inject=next_task.task),
-        replace(state, last_handed_task_id=next_task.task_id),
-    )
+    ctx.context.append(next_task.task)
+    ctx.state.replace(replace(state, last_handed_task_id=next_task.task_id))
+    return next_.retry()
 
 
-async def _engage_queue_if_absent() -> None:
-    engagements = await omp.campaigns.active()
-    if any(item.campaign == _QUEUE_CAMPAIGN for item in engagements):
+async def _start_queue_if_absent() -> None:
+    activations = await omp.regimes.active()
+    if any(item.regime == _QUEUE_REGIME for item in activations):
         return
-    await omp.campaigns.engage(_QUEUE_CAMPAIGN, state=QueueCampaignState())
+    await omp.regimes.start(_QUEUE_REGIME, state=QueueRegimeState())
 
 
 @omp.device(
@@ -161,7 +166,7 @@ async def queue_task_device(args: QueueTaskArgs, ctx: omp.Context) -> QueueRecei
         args.task,
         idempotency_key=f"task-queue:device:{ctx.invocation}",
     )
-    await _engage_queue_if_absent()
+    await _start_queue_if_absent()
     return receipt
 
 
@@ -180,6 +185,5 @@ async def queue_task_command(
         invocation.raw,
         idempotency_key=f"task-queue:command:{ctx.invocation}",
     )
-    await _engage_queue_if_absent()
+    await _start_queue_if_absent()
     return ui.Consumed()
-

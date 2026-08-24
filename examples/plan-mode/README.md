@@ -11,7 +11,7 @@ Invoke this extension's soft `plan` tool with `op="on"`, `op="status"`, or `op="
 `op="on"` starts two regimes:
 
 1. `plan-mode` is session-scoped, owns `mode` and `worktree`, and sets scoped `toolset`, `model`, and `prompt` values. Owning `mode` makes it a visible mode; there is no separate mode runtime.
-2. `plan-settle-gate` is a bounded child subscribed to `SETTLE`. It may retry up to three committed nudges before completing quietly.
+2. `plan-settle-gate` is a bounded companion regime subscribed to `SETTLE`. It may retry up to three committed nudges before completing quietly.
 
 At `ADMISSION`, writes select rejection:
 
@@ -21,8 +21,8 @@ def plan(ctx, next_):
         return next_.reject("plan mode is read-only")
 ```
 
-At `SETTLE`, the child stages its instruction through `ctx.context.append(...)` and returns `next_.retry()`. `op="off"` records the typed plan and exits the mode atomically: Core releases resource leases, restores scoped settings, and stops the settlement child.
+At `SETTLE`, the companion stages its instruction through `ctx.context.append(...)` and returns `next_.retry()`. `op="off"` records the typed plan and stops the companion before stopping the mode; mode stop atomically releases its resource leases and restores scoped settings.
 
 Client-side context rewriting and the loopback viewer remain deleted.
 
-See [`docs/py/15-regimes.md`](../../docs/py/15-regimes.md) for modes, children, bounds, and atomic exit.
+See [`docs/py/15-regimes.md`](../../docs/py/15-regimes.md) for modes, bounds, and atomic resource release.

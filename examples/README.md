@@ -17,6 +17,7 @@ distance.
 | `permission-rules/` | `@gotgenes/pi-permission-system` | BashIR rulebook, PRECHECK/APPROVAL, durable tickets | `docs/py/05 §4.1`, `docs/py/06` |
 | `bash-guard/` | `@shinynito/pi-menshen` | BashIR REVIEW, classifier ladder, circuit breaker | `docs/py/05 §4.4`, `docs/py/06` |
 | `goal-loop/` | `@narumitw/pi-goal` | Session `@omp.regime` at SETTLE: `ctx` effects + `next_` control, typed state, explicit start | `docs/py/15`, `docs/py/12` |
+| `regime-retry/` | — | Bounded session regime with durable state, `on_limit`, retry control, and exclusive tool selection | `docs/py/15` |
 | `mcp-devices/` | `pi-mcp-adapter` | MCP servers mounted as `dyn` devices | `docs/py/01` |
 | `edit-dialect/` | `pi-hashline-edit-pro` | second edit dialect `family@rev`, `lift()` | `docs/py/01`, `docs/py/02 §3` |
 | `web-fetch/` | `@mrclrchtr/supi-web` | fetch device, spill → `BlobRef` | `docs/py/02 §1` |
@@ -29,7 +30,7 @@ distance.
 | `todo-journal/` | `@xaccefy/pi-xtodo` | typed entry kinds, journal as the only truth | `docs/py/09 §2` |
 | `cache-monitor/` | `@mrclrchtr/supi-cache` | telemetry subscription, `PromptFingerprint` | `docs/py/09 §3`, `docs/py/10 §2` |
 | `schedules/` | `pi-schedule-prompt` | durable scheduler, owner principal, missed-run policy | `docs/py/12` |
-| `plan-mode/` | `@dreki-gg/pi-plan-mode` | Session mode regime (`owns`/`sets`, ADMISSION `reject()`) with a bounded settlement child | `docs/py/15` |
+| `plan-mode/` | `@dreki-gg/pi-plan-mode` | Session mode regime (`owns`/`sets`, ADMISSION `reject()`) with a bounded settlement companion | `docs/py/15` |
 | `rewind/` | `@ayulab/pi-rewind` | workspace snapshots, `omp.agents.rewind`, undo-snapshot invariant | `docs/py/12` |
 | `subagents/` | `pi-subagents` family (17 pkgs) | `spawn_all` waves, hard `Budget`, steer, `AgentGone`, `subtree_usage` | `docs/py/12` |
 | `usage-report/` | `@tmustier/pi-usage-extension` | `omp.sessions` usage query, statusline spend segment | `docs/py/09 §1`, `docs/py/10 §3` |

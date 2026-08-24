@@ -6,7 +6,7 @@
 
 ## The omp shape
 
-The soft `goal` device keeps `goal_set`, `goal_status`, and `goal_complete` plus typed session snapshots. `goal_set` starts the session-scoped `goal-loop` regime with journaled `GoalState`; `goal_complete` records completion and stops that regime.
+The soft `goal` device keeps `goal_set`, `goal_status`, and `goal_complete` plus typed session snapshots. `goal_set` starts the session-scoped `goal-loop` regime with journaled `GoalRegimeState`; `goal_complete` records completion and stops that regime.
 
 At `SETTLE`, unmet work stages context and selects retry:
 

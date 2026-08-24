@@ -12,7 +12,7 @@ At `SETTLE`, the regime folds the journal. Its typed state remembers the task ha
 
 ```python
 def drain(ctx, next_):
-    task = oldest_waiting(ctx.view)
+    task = oldest_waiting(ctx.event)
     ctx.context.append(task)
     ctx.state.replace(ctx.state.value.with_active(task.id))
     return next_.retry()

@@ -8,7 +8,7 @@ from omp import Context, StateScope, entry_kind, tool
 from omp.agents import ContinuationLedger, continuations, loop_signal
 
 
-_GOAL_CAMPAIGN = "goal-loop"
+_GOAL_REGIME = "goal-loop"
 
 
 @entry_kind("examples.goal_loop.goal", rev="v.1")
@@ -21,8 +21,8 @@ class GoalState:
 
 
 @dataclass(frozen=True, slots=True)
-class GoalCampaignState:
-    """Carry the objective used by the durable settle decision."""
+class GoalRegimeState:
+    """Carry the objective used by the durable settle middleware."""
 
     objective: str
 
@@ -50,44 +50,37 @@ def _ledger_view(ledger: ContinuationLedger) -> dict[str, int | str | None]:
     }
 
 
-async def _disengage_goal_campaigns() -> None:
-    for engagement in await omp.campaigns.active():
-        if engagement.campaign == _GOAL_CAMPAIGN:
-            await omp.campaigns.disengage(engagement.id)
+async def _stop_goal_regimes() -> None:
+    for activation in await omp.regimes.active():
+        if activation.regime == _GOAL_REGIME:
+            await omp.regimes.stop(activation.id)
 
 
-@omp.campaign(
-    _GOAL_CAMPAIGN,
-    at=omp.SETTLE,
-    exhaust=omp.Exhaust.SETTLE,
-    scope=omp.CampaignScope.SESSION,
-    state=GoalCampaignState,
-    state_family="examples.goal-loop.state",
-    on_failure=omp.OnFailure.DEFER,
+@omp.regime(
+    _GOAL_REGIME,
+    on=omp.SETTLE,
+    lifetime="session",
+    state=GoalRegimeState,
+    on_failure="defer",
 )
-async def continue_goal(
-    event: dict[str, object], state: GoalCampaignState
-) -> tuple[object, GoalCampaignState]:
-    """Continue an unmet goal, accepting transient stalls without disengaging."""
+async def continue_goal(ctx: omp.RegimeContext, next_: omp.Next) -> object:
+    """Retry an unmet goal while accepting transient stalls."""
 
+    state = ctx.state.value
     current = await _current_goal()
     if current is None or current.met or current.objective != state.objective:
-        return omp.Done(), state
+        return next_.complete()
 
     signal = await loop_signal()
     if signal.stalled:
-        return omp.Pass(), state
+        return None
 
-    return (
-        omp.Continue(
-            inject=(
-                "Continue working toward the registered objective. Only mark it complete "
-                "after verifying the result.\n"
-                f"<objective>{state.objective}</objective>"
-            )
-        ),
-        state,
+    ctx.context.append(
+        "Continue working toward the registered objective. Only mark it complete "
+        "after verifying the result.\n"
+        f"<objective>{state.objective}</objective>"
     )
+    return next_.retry()
 
 
 @tool("goal", kind="soft", rev=1)
@@ -100,10 +93,10 @@ async def goal(args: GoalArgs, ctx: Context) -> dict[str, object]:
             raise ValueError("goal_set requires a non-empty objective")
         state = GoalState(objective=objective, met=False)
         await omp.state.append(state, scope=StateScope.SESSION)
-        await _disengage_goal_campaigns()
-        await omp.campaigns.engage(
-            _GOAL_CAMPAIGN,
-            state=GoalCampaignState(objective=objective),
+        await _stop_goal_regimes()
+        await omp.regimes.start(
+            _GOAL_REGIME,
+            state=GoalRegimeState(objective=objective),
         )
     elif args.op == "goal_complete":
         current = await _current_goal()
@@ -111,7 +104,7 @@ async def goal(args: GoalArgs, ctx: Context) -> dict[str, object]:
             return {"active": False, "met": False, "goal": None}
         state = GoalState(objective=current.objective, met=True)
         await omp.state.append(state, scope=StateScope.SESSION)
-        await _disengage_goal_campaigns()
+        await _stop_goal_regimes()
     else:
         state = await _current_goal()
 

@@ -8,7 +8,7 @@ capabilities = []
 
 [[declarations]]
 id = "plan-mode"
-kind = "campaign"
+kind = "regime"
 module = "plan_mode"
 key = "plan-mode"
 trigger = "lazy"
@@ -16,10 +16,10 @@ api = 1
 failure = "fail-closed"
 
 [[declarations]]
-id = "plan-decision-gate"
-kind = "campaign"
+id = "plan-settle-gate"
+kind = "regime"
 module = "plan_mode"
-key = "plan-decision-gate"
+key = "plan-settle-gate"
 trigger = "lazy"
 api = 1
 failure = "fail-open"

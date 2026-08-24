@@ -2,7 +2,7 @@ id = "examples.goal-loop"
 entry = "goal_loop"
 kind = "extension"
 version = "0.1.0"
-description = "A session-scoped autonomous goal campaign with durable settle control."
+description = "A session-scoped autonomous goal regime with durable settle control."
 requires = []
 capabilities = []
 
@@ -12,7 +12,7 @@ kind = "soft"
 
 [[declarations]]
 id = "goal-loop"
-kind = "campaign"
+kind = "regime"
 module = "goal_loop"
 key = "goal-loop"
 trigger = "lazy"
