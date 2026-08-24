@@ -9,6 +9,7 @@ Most applications use `dom!` for their initial tree, stable `id` attributes for 
 - `components` and the `dom!` macro define retained layout, text, navigation, data, and input trees; runtime `markup` and typed builders provide alternate construction paths.
 - `Ui`, `App`, and the event/input modules retain widget state and route keyboard, mouse, paste, resize, and application events.
 - `Frame` and `Renderer` turn component output into differential terminal updates, while `terminal`, `graphics`, `notify`, and protocol-specific modules manage lifecycle and terminal capabilities.
+`Renderer::retire` is the explicit finalized-row scrolling path. `Renderer::replay_frames` handles width-sensitive logical-history replay atomically from ordered frame segments, so total history is not limited by one `Frame`'s `u16` height: it moves the suffix that fits into leading blank viewport rows, buffers the prefix remainder with the completed viewport, and makes one synchronous writer call. `HistoryReplay::Append` preserves the existing native epoch; `HistoryReplay::Rebuild` includes the destructive history reset in the same buffered transaction. Writer failure poisons the renderer and never admits a retry against uncertain physical history.
 - `editcore`, `rich`, `markdown`, `latex`, `syntax`, `scene`, and `shader` provide editing and richer content pipelines. `build.rs` validates `icons.tsv` and generates the icon lookup catalog.
 
 ## Philosophy

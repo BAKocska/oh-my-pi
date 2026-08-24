@@ -82,10 +82,25 @@ pub struct PaintStats {
 /// Measurements from one explicit retirement transaction.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RetireStats {
-	/// Number of finalized rows appended to native history.
-	pub rows:  u16,
+	/// Number of transaction rows appended to native history.
+	pub rows:  usize,
 	/// Number of bytes written to the terminal.
 	pub bytes: usize,
+}
+
+/// Native-history behavior for one buffered replay transaction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HistoryReplay {
+	/// Retain native history and append the replay remainder.
+	Append,
+	/// Clear the native-history epoch before writing the replay remainder.
+	Rebuild,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HistoryReset {
+	Keep,
+	Rebuild,
 }
 
 /// A layer with its band already resolved, ready to composite.
@@ -220,6 +235,35 @@ impl ComposedFrame<'_> {
 	}
 }
 
+struct FrameSegments<'a> {
+	frames: &'a [Frame],
+	starts: Vec<usize>,
+	rows:   usize,
+}
+
+impl<'a> FrameSegments<'a> {
+	fn new(frames: &'a [Frame], rows: usize) -> Self {
+		let mut starts = Vec::with_capacity(frames.len());
+		let mut total = 0_usize;
+		for frame in frames {
+			starts.push(total);
+			total = total.saturating_add(usize::from(frame.size().height));
+		}
+		debug_assert!(rows <= total);
+		Self { frames, starts, rows }
+	}
+
+	fn locate(&self, index: usize) -> (&Frame, u16) {
+		debug_assert!(index < self.rows);
+		let segment = self
+			.starts
+			.partition_point(|start| *start <= index)
+			.saturating_sub(1);
+		let local = index - self.starts[segment];
+		(&self.frames[segment], u16::try_from(local).expect("frame-local row fits u16"))
+	}
+}
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 struct Window {
 	top:    u16,
@@ -267,8 +311,9 @@ impl RegisteredImage {
 ///
 /// [`Renderer::present`] and [`Renderer::repaint`] are history-neutral: tall
 /// frames are bottom-clipped and no presentation path scrolls.
-/// [`Renderer::retire`] is the sole source of terminal scrolling and appends
-/// exactly the finalized rows supplied by the caller.
+/// [`Renderer::retire`] appends finalized rows. [`Renderer::replay`] performs
+/// the same streaming realization for a bottom-prepared logical-history
+/// snapshot; both serialize the complete transaction before one writer call.
 pub struct Renderer<W: Write> {
 	writer:            W,
 	previous:          Option<Frame>,
@@ -524,8 +569,8 @@ impl<W: Write> Renderer<W> {
 	/// Explicitly appends finalized rows to native history and leaves `viewport`
 	/// visible.
 	///
-	/// This is the renderer's only scrolling operation. It streams `finalized ||
-	/// viewport` in one synchronized transaction, scrolls exactly
+	/// It streams `finalized || viewport` through the shared retirement/replay
+	/// transaction, scrolls exactly
 	/// `finalized.size().height` times, and emits no trailing line feed.
 	///
 	/// # Errors
@@ -540,6 +585,107 @@ impl<W: Write> Renderer<W> {
 		viewport_height: u16,
 		layers: &[Layer<'_>],
 	) -> io::Result<RetireStats> {
+		self.retire_transaction(
+			std::slice::from_ref(finalized),
+			usize::from(finalized.size().height),
+			viewport,
+			viewport_height,
+			layers,
+			HistoryReset::Keep,
+		)
+	}
+
+	/// Replays a complete logical history with a bottom-first split and one
+	/// synchronous writer call.
+	///
+	/// Stable history rows that fit into leading blank viewport rows are moved
+	/// into the final viewport first. Only the prefix remainder scrolls into
+	/// native history. [`HistoryReplay::Rebuild`] prefixes the same buffered
+	/// transaction with the destructive history reset.
+	///
+	/// # Errors
+	///
+	/// Rejects invalid or stale viewport geometry. Writer failure poisons the
+	/// renderer.
+	pub fn replay(
+		&mut self,
+		history: &Frame,
+		viewport: &Frame,
+		viewport_height: u16,
+		layers: &[Layer<'_>],
+		mode: HistoryReplay,
+	) -> io::Result<RetireStats> {
+		self.replay_frames(std::slice::from_ref(history), viewport, viewport_height, layers, mode)
+	}
+
+	/// Replays ordered logical-history frame segments with a bottom-first split
+	/// and one synchronous writer call.
+	///
+	/// Segments avoid a whole-history `Frame` and therefore permit histories
+	/// whose total rendered height exceeds `u16::MAX`.
+	///
+	/// # Errors
+	///
+	/// Rejects invalid, mixed-width, or stale viewport geometry. Writer failure
+	/// poisons the renderer.
+	pub fn replay_frames(
+		&mut self,
+		frames: &[Frame],
+		viewport: &Frame,
+		viewport_height: u16,
+		layers: &[Layer<'_>],
+		mode: HistoryReplay,
+	) -> io::Result<RetireStats> {
+		self.validate_frame(viewport, viewport_height)?;
+		if frames
+			.iter()
+			.any(|frame| frame.size().width != viewport.size().width)
+		{
+			return Err(io::Error::new(
+				io::ErrorKind::InvalidInput,
+				"history and viewport frames must have equal widths",
+			));
+		}
+		let total = frames
+			.iter()
+			.map(|frame| usize::from(frame.size().height))
+			.sum::<usize>();
+		let history = FrameSegments::new(frames, total);
+		let leading = (0..viewport.size().height)
+			.take_while(|&row| {
+				(0..viewport.size().width)
+					.all(|column| matches!(viewport.cell(column, row).content(), CellContent::Blank))
+			})
+			.count();
+		let moved = leading.min(total);
+		let remainder = total - moved;
+		let mut final_viewport = viewport.clone();
+		for target in 0..moved {
+			let (source, row) = history.locate(remainder + target);
+			final_viewport.blit(
+				source,
+				row,
+				1,
+				0,
+				u16::try_from(target).expect("moved rows fit viewport"),
+			);
+		}
+		let reset = match mode {
+			HistoryReplay::Append => HistoryReset::Keep,
+			HistoryReplay::Rebuild => HistoryReset::Rebuild,
+		};
+		self.retire_transaction(frames, remainder, &final_viewport, viewport_height, layers, reset)
+	}
+
+	fn retire_transaction(
+		&mut self,
+		finalized: &[Frame],
+		finalized_rows: usize,
+		viewport: &Frame,
+		viewport_height: u16,
+		layers: &[Layer<'_>],
+		reset: HistoryReset,
+	) -> io::Result<RetireStats> {
 		self.validate_frame(viewport, viewport_height)?;
 		if alt_screen_active() {
 			return Err(io::Error::new(
@@ -553,12 +699,26 @@ impl<W: Write> Renderer<W> {
 				"retirement viewport height does not match viewport_height",
 			));
 		}
-		if finalized.size().width != viewport.size().width {
+		if finalized
+			.iter()
+			.any(|frame| frame.size().width != viewport.size().width)
+		{
 			return Err(io::Error::new(
 				io::ErrorKind::InvalidInput,
 				"finalized and viewport frames must have equal widths",
 			));
 		}
+		let available_rows = finalized
+			.iter()
+			.map(|frame| usize::from(frame.size().height))
+			.sum::<usize>();
+		if finalized_rows > available_rows {
+			return Err(io::Error::new(
+				io::ErrorKind::InvalidInput,
+				"finalized row limit exceeds supplied frame segments",
+			));
+		}
+		let finalized = FrameSegments::new(finalized, finalized_rows);
 		if self.retire_requires_present(viewport.size().width, viewport_height) {
 			return Err(io::Error::new(
 				io::ErrorKind::InvalidInput,
@@ -567,10 +727,19 @@ impl<W: Write> Renderer<W> {
 		}
 
 		self.sync_screen_buffer();
+		let mut reset_prefix = String::new();
+		if reset == HistoryReset::Rebuild {
+			for (&id, image) in &mut self.images {
+				append_delete_image(&mut reset_prefix, id, self.tmux_passthrough);
+				image.uploaded = false;
+				image.placed.clear();
+				image.direct_visible = false;
+			}
+			reset_prefix.push_str(RESET_HISTORY);
+		}
 		let window = Window { top: 0, height: viewport_height };
 		let resolved = resolve_layers(layers, viewport.size());
 		let stored = store_layers(&resolved, window, viewport.size().width);
-		let finalized_view = ComposedFrame { base: finalized, layers: &[] };
 		let viewport_view = ComposedFrame { base: viewport, layers: &stored };
 		let cursor = compose_cursor(viewport, &stored, window, viewport.size().width);
 		let images = self.image_prefix(viewport, &resolved, window);
@@ -602,13 +771,13 @@ impl<W: Write> Renderer<W> {
 			self.tmux_passthrough,
 		);
 
-		let finalized_rows = finalized.size().height;
 		let mut output = mem::take(&mut self.output_scratch);
 		output.clear();
 		if self.sync_output {
 			output.push_str(SYNC_OUTPUT_BEGIN);
 		}
 		output.push_str(HIDE_CURSOR);
+		output.push_str(&reset_prefix);
 		append_fixed_screen_modes(&mut output, viewport_height);
 		output.push_str(&images);
 
@@ -616,27 +785,26 @@ impl<W: Write> Renderer<W> {
 		// boundaries use armed autowrap only above the bottom row, where wrapping
 		// cannot scroll.
 		for screen_row in 0..viewport_height {
-			let index = screen_row;
+			let index = usize::from(screen_row);
 			let _ = write!(output, "\x1b[{};1H", screen_row + 1);
 			output.push_str(esc!(erase_line));
-			let joined = index > 0 && retirement_joinable(finalized, viewport, index - 1, index);
+			let joined =
+				index > 0 && retirement_joinable(&finalized, &viewport_view, index - 1, index);
 			if joined {
 				let _ = write!(output, "\x1b[{};1H", screen_row);
 				output.push_str(esc!(autowrap));
 				arm_retirement_boundary(
 					&mut output,
-					&finalized_view,
+					&finalized,
 					&viewport_view,
-					finalized_rows,
 					index - 1,
 					self.graphics,
 					self.hyperlinks,
 				);
 				emit_retirement_row(
 					&mut output,
-					&finalized_view,
+					&finalized,
 					&viewport_view,
-					finalized_rows,
 					index,
 					self.graphics,
 					self.hyperlinks,
@@ -645,9 +813,8 @@ impl<W: Write> Renderer<W> {
 			} else {
 				emit_retirement_row(
 					&mut output,
-					&finalized_view,
+					&finalized,
 					&viewport_view,
-					finalized_rows,
 					index,
 					self.graphics,
 					self.hyperlinks,
@@ -656,24 +823,24 @@ impl<W: Write> Renderer<W> {
 		}
 
 		// T has F + H rows, so exactly F rows remain and each iteration scrolls once.
-		for index in viewport_height..finalized_rows.saturating_add(viewport_height) {
+		for index in
+			usize::from(viewport_height)..finalized_rows.saturating_add(usize::from(viewport_height))
+		{
 			let _ = write!(output, "\x1b[{};1H", viewport_height);
-			if retirement_joinable(finalized, viewport, index - 1, index) {
+			if retirement_joinable(&finalized, &viewport_view, index - 1, index) {
 				output.push_str(esc!(autowrap));
 				arm_retirement_boundary(
 					&mut output,
-					&finalized_view,
+					&finalized,
 					&viewport_view,
-					finalized_rows,
 					index - 1,
 					self.graphics,
 					self.hyperlinks,
 				);
 				emit_retirement_row(
 					&mut output,
-					&finalized_view,
+					&finalized,
 					&viewport_view,
-					finalized_rows,
 					index,
 					self.graphics,
 					self.hyperlinks,
@@ -685,9 +852,8 @@ impl<W: Write> Renderer<W> {
 				output.push_str(esc!(erase_line));
 				emit_retirement_row(
 					&mut output,
-					&finalized_view,
+					&finalized,
 					&viewport_view,
-					finalized_rows,
 					index,
 					self.graphics,
 					self.hyperlinks,
@@ -1260,48 +1426,81 @@ fn emit_absolute_window(
 	output.push_str(esc!(!autowrap));
 }
 
-fn retirement_joinable(finalized: &Frame, viewport: &Frame, previous: u16, current: u16) -> bool {
-	let finalized_rows = finalized.size().height;
+fn retirement_joinable(
+	finalized: &FrameSegments<'_>,
+	viewport: &ComposedFrame<'_>,
+	previous: usize,
+	current: usize,
+) -> bool {
 	if current != previous.saturating_add(1) {
 		return false;
 	}
-	if current < finalized_rows {
-		return finalized.soft_wrap(previous);
+	if current < finalized.rows {
+		let (previous_frame, previous_row) = finalized.locate(previous);
+		let (current_frame, current_row) = finalized.locate(current);
+		return ptr::eq(previous_frame, current_frame)
+			&& current_row == previous_row.saturating_add(1)
+			&& previous_frame.soft_wrap(previous_row);
 	}
-	previous >= finalized_rows && viewport.soft_wrap(previous - finalized_rows)
+	previous >= finalized.rows
+		&& viewport
+			.base
+			.soft_wrap(u16::try_from(previous - finalized.rows).expect("viewport row fits u16"))
 }
 
-#[allow(clippy::too_many_arguments, reason = "row source and terminal state are independent")]
 fn emit_retirement_row(
 	output: &mut String,
-	finalized: &ComposedFrame<'_>,
+	finalized: &FrameSegments<'_>,
 	viewport: &ComposedFrame<'_>,
-	finalized_rows: u16,
-	index: u16,
+	index: usize,
 	graphics: Graphics,
 	hyperlinks: bool,
 ) {
-	if index < finalized_rows {
-		encode_frame_row(output, finalized, index, graphics, hyperlinks);
+	if index < finalized.rows {
+		let (frame, row) = finalized.locate(index);
+		encode_frame_row(
+			output,
+			&ComposedFrame { base: frame, layers: &[] },
+			row,
+			graphics,
+			hyperlinks,
+		);
 	} else {
-		encode_frame_row(output, viewport, index - finalized_rows, graphics, hyperlinks);
+		encode_frame_row(
+			output,
+			viewport,
+			u16::try_from(index - finalized.rows).expect("viewport row fits u16"),
+			graphics,
+			hyperlinks,
+		);
 	}
 }
 
-#[allow(clippy::too_many_arguments, reason = "row source and terminal state are independent")]
 fn arm_retirement_boundary(
 	output: &mut String,
-	finalized: &ComposedFrame<'_>,
+	finalized: &FrameSegments<'_>,
 	viewport: &ComposedFrame<'_>,
-	finalized_rows: u16,
-	index: u16,
+	index: usize,
 	graphics: Graphics,
 	hyperlinks: bool,
 ) {
-	if index < finalized_rows {
-		arm_wrap_boundary(output, finalized, index, graphics, hyperlinks);
+	if index < finalized.rows {
+		let (frame, row) = finalized.locate(index);
+		arm_wrap_boundary(
+			output,
+			&ComposedFrame { base: frame, layers: &[] },
+			row,
+			graphics,
+			hyperlinks,
+		);
 	} else {
-		arm_wrap_boundary(output, viewport, index - finalized_rows, graphics, hyperlinks);
+		arm_wrap_boundary(
+			output,
+			viewport,
+			u16::try_from(index - finalized.rows).expect("viewport row fits u16"),
+			graphics,
+			hyperlinks,
+		);
 	}
 }
 
@@ -2234,11 +2433,15 @@ fn push_color_code(output: &mut String, first: &mut bool, color: Color, backgrou
 
 #[cfg(test)]
 mod tests {
-	use std::{io, mem};
+	use std::{
+		io::{self, Write},
+		mem,
+	};
 
 	use super::{
-		ConptyChunks, MAX_CONPTY_WRITE_CHUNK_BYTES, MAX_OUTPUT_BACKLOG_BYTES, OutputBacklogGuard,
-		RESET_HISTORY, Renderer, ResolvedLayer, SYNC_OUTPUT_BEGIN, SYNC_OUTPUT_END,
+		ConptyChunks, HistoryReplay, MAX_CONPTY_WRITE_CHUNK_BYTES, MAX_OUTPUT_BACKLOG_BYTES,
+		OutputBacklogGuard, RESET_HISTORY, Renderer, ResolvedLayer, SYNC_OUTPUT_BEGIN,
+		SYNC_OUTPUT_END,
 	};
 	use crate::{Color, Frame, Graphics, Size, Style, test_support::TerminalModel};
 
@@ -2256,6 +2459,82 @@ mod tests {
 			String::from_utf8(mem::take(renderer.writer_mut())).expect("renderer emits UTF-8");
 		terminal.apply(&output);
 		output
+	}
+
+	#[derive(Default)]
+	struct CountingWriter {
+		writes: usize,
+		bytes:  Vec<u8>,
+	}
+
+	impl Write for CountingWriter {
+		fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+			self.writes += 1;
+			self.bytes.extend_from_slice(bytes);
+			Ok(bytes.len())
+		}
+
+		fn flush(&mut self) -> io::Result<()> {
+			Ok(())
+		}
+	}
+
+	#[test]
+	fn replay_moves_the_history_suffix_into_leading_viewport_space() {
+		let mut renderer = Renderer::new(Vec::new());
+		let mut terminal = TerminalModel::new(16, 3);
+		let stats = renderer
+			.replay(
+				&frame(16, &["history-1", "history-2", "history-3"]),
+				&frame(16, &["", "", "live"]),
+				3,
+				&[],
+				HistoryReplay::Append,
+			)
+			.unwrap();
+		apply(&mut renderer, &mut terminal);
+
+		assert_eq!(stats.rows, 1);
+		assert_eq!(terminal.history, ["history-1"]);
+		assert_eq!(terminal.visible_rows(), ["history-2", "history-3", "live"]);
+	}
+
+	#[test]
+	fn segmented_replay_exceeds_u16_rows_in_one_writer_call() {
+		let segments = (0..257)
+			.map(|_| Frame::new(Size::new(1, 256)))
+			.collect::<Vec<_>>();
+		let mut renderer = Renderer::new(CountingWriter::default());
+		let stats = renderer
+			.replay_frames(&segments, &frame(1, &["x"]), 1, &[], HistoryReplay::Append)
+			.unwrap();
+
+		assert_eq!(stats.rows, 257 * 256);
+		assert_eq!(renderer.into_inner().writes, 1);
+	}
+
+	#[test]
+	fn replay_uses_exactly_one_writer_call() {
+		let mut renderer = Renderer::new(CountingWriter::default());
+		renderer
+			.replay(
+				&frame(8, &["history-1", "history-2"]),
+				&frame(8, &["", "live"]),
+				2,
+				&[],
+				HistoryReplay::Rebuild,
+			)
+			.unwrap();
+
+		let writer = renderer.into_inner();
+		assert_eq!(writer.writes, 1);
+		assert!(writer.bytes.starts_with(SYNC_OUTPUT_BEGIN.as_bytes()));
+		assert!(
+			writer
+				.bytes
+				.windows(RESET_HISTORY.len())
+				.any(|bytes| bytes == RESET_HISTORY.as_bytes())
+		);
 	}
 
 	#[test]

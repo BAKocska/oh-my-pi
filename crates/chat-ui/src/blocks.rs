@@ -1,6 +1,7 @@
 //! Ordered live-block allocation and retirement scheduling.
 //!
-//! Every block receives a monotonic [`BlockOrdinal`] and moves through
+//! Every block receives a monotonic [`BlockOrdinal`], permanently declares a
+//! [`BlockMode`], and moves through
 //! [`BlockPhase::Queued`], [`BlockPhase::Active`],
 //! [`BlockPhase::FinalizedPending`], and [`BlockPhase::Committed`]. The
 //! scheduler treats sampled painted heights as authoritative: it first asks
@@ -11,11 +12,13 @@
 //! Finalization immediately hands a block's presentation to its settled
 //! semantic snapshot: the block stops sampling, and the scene renders the
 //! snapshot in the live viewport until ordered retirement moves it into
-//! native history. [`Blocks::retirement_batch`] exposes only the maximal
-//! finalized prefix at the monotonic commit frontier. Allocation never
-//! changes that frontier, and retirement never selects a block across an
-//! unfinished predecessor. Display replay is owned separately by the scene
-//! and never rewinds this logical frontier.
+//! native history. An append-only producer may expose complete semantic rows,
+//! but [`Blocks::stable_head`] offers only the current uncommitted head and
+//! [`Blocks::mark_emitted`] accepts exactly its next row. Final retirement then
+//! consumes only the suffix after that emitted count.
+//! [`Blocks::retirement_batch`] exposes only the maximal finalized prefix at
+//! the monotonic commit frontier. Allocation never changes that frontier, and
+//! display replay is owned separately by the scene and never rewinds it.
 
 use std::ops::Range;
 
@@ -27,6 +30,16 @@ pub struct BlockOrdinal(
 	/// Zero-based sequence number, never reused by this scheduler.
 	pub u64,
 );
+
+/// Permanent terminal-history contract declared when a block is created.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum BlockMode {
+	/// The block remains wholly viewport-owned until final retirement.
+	#[default]
+	Mutable,
+	/// Complete semantic rows may retire naturally from the uncommitted head.
+	AppendOnly,
+}
 
 /// Lifecycle state of one ordered block.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -89,8 +102,10 @@ impl Plan {
 
 #[derive(Clone, Copy, Debug)]
 struct BlockRecord {
-	phase:  BlockPhase,
-	target: u16,
+	phase:   BlockPhase,
+	mode:    BlockMode,
+	emitted: u64,
+	target:  u16,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -114,12 +129,13 @@ impl Blocks {
 		Self { records: Vec::new(), frontier: 0 }
 	}
 
-	/// Creates one queued block and returns its never-reused ordinal.
-	pub fn create(&mut self) -> BlockOrdinal {
+	/// Creates one queued block with a permanent presentation mode and returns
+	/// its never-reused ordinal.
+	pub fn create(&mut self, mode: BlockMode) -> BlockOrdinal {
 		let ordinal = BlockOrdinal(self.records.len() as u64);
 		self
 			.records
-			.push(BlockRecord { phase: BlockPhase::Queued, target: 0 });
+			.push(BlockRecord { phase: BlockPhase::Queued, mode, emitted: 0, target: 0 });
 		ordinal
 	}
 
@@ -261,6 +277,44 @@ impl Blocks {
 		plan
 	}
 
+	/// Returns the append-only uncommitted head and its next semantic-row
+	/// index when a producer has exposed a longer stable prefix.
+	#[must_use]
+	pub fn stable_head(&self, stable_rows: u64) -> Option<(BlockOrdinal, u64)> {
+		let ordinal = BlockOrdinal(self.frontier);
+		let record = self.record(ordinal)?;
+		let eligible = record.mode == BlockMode::AppendOnly
+			&& matches!(record.phase, BlockPhase::Active | BlockPhase::FinalizedPending);
+		if eligible {
+			debug_assert!(
+				stable_rows >= record.emitted,
+				"append-only stable prefixes must never shrink below emitted rows"
+			);
+		}
+		(eligible && record.emitted < stable_rows).then_some((ordinal, record.emitted))
+	}
+
+	/// Acknowledges successful natural emission of exactly the next stable row.
+	///
+	/// Returns `false` without changing state unless `ordinal` is the current
+	/// append-only head and `emitted` is its next row count.
+	pub fn mark_emitted(&mut self, ordinal: BlockOrdinal, emitted: u64) -> bool {
+		if ordinal.0 != self.frontier {
+			return false;
+		}
+		let Some(record) = self.record_mut(ordinal) else {
+			return false;
+		};
+		if record.mode != BlockMode::AppendOnly
+			|| !matches!(record.phase, BlockPhase::Active | BlockPhase::FinalizedPending)
+			|| emitted != record.emitted.saturating_add(1)
+		{
+			return false;
+		}
+		record.emitted = emitted;
+		true
+	}
+
 	/// Returns the maximal retirement-ready contiguous range starting at the
 	/// commit frontier.
 	#[must_use]
@@ -300,6 +354,7 @@ impl Blocks {
 		for ordinal in start..safe_end {
 			let record = &mut self.records[ordinal as usize];
 			record.phase = BlockPhase::Committed;
+			record.emitted = 0;
 			record.target = 0;
 		}
 		self.frontier = safe_end;
@@ -315,6 +370,19 @@ impl Blocks {
 	#[must_use]
 	pub fn phase(&self, ordinal: BlockOrdinal) -> Option<BlockPhase> {
 		self.record(ordinal).map(|record| record.phase)
+	}
+
+	/// Returns the permanent presentation mode of a known ordinal.
+	#[must_use]
+	pub fn mode(&self, ordinal: BlockOrdinal) -> Option<BlockMode> {
+		self.record(ordinal).map(|record| record.mode)
+	}
+
+	/// Returns the number of stable semantic rows already emitted for a known
+	/// ordinal.
+	#[must_use]
+	pub fn emitted(&self, ordinal: BlockOrdinal) -> Option<u64> {
+		self.record(ordinal).map(|record| record.emitted)
 	}
 
 	fn overflow_plan(
@@ -463,9 +531,9 @@ mod tests {
 	#[test]
 	fn full_one_row_live_region_backpressures_next_create() {
 		let mut blocks = Blocks::new();
-		let first = blocks.create();
-		let second = blocks.create();
-		let waiting = blocks.create();
+		let first = blocks.create(BlockMode::Mutable);
+		let second = blocks.create(BlockMode::Mutable);
+		let waiting = blocks.create(BlockMode::Mutable);
 		let plan = blocks.tick(2, |_| 0, |_| 4);
 		assert_eq!(plan.admitted.as_slice(), &[first, second]);
 
@@ -479,9 +547,9 @@ mod tests {
 	#[test]
 	fn finalization_releases_the_live_row_to_the_next_waiter() {
 		let mut blocks = Blocks::new();
-		let first = blocks.create();
-		let second = blocks.create();
-		let waiting = blocks.create();
+		let first = blocks.create(BlockMode::Mutable);
+		let second = blocks.create(BlockMode::Mutable);
+		let waiting = blocks.create(BlockMode::Mutable);
 		blocks.tick(2, |_| 0, |_| 3);
 		assert!(blocks.finalize(first));
 
@@ -499,11 +567,11 @@ mod tests {
 	#[test]
 	fn queue_pressure_collapses_across_observed_bridge_rows() {
 		let mut blocks = Blocks::new();
-		let donor = blocks.create();
+		let donor = blocks.create(BlockMode::Mutable);
 		blocks.tick(5, |_| 0, |_| 5);
 		let expanded = blocks.tick(5, |_| 1, |_| 5);
 		assert_eq!(expanded.target(donor), Some(5));
-		let waiting = blocks.create();
+		let waiting = blocks.create(BlockMode::Mutable);
 
 		let to_two = blocks.tick(5, |_| 5, |_| 5);
 		assert_eq!(to_two.target(donor), Some(2));
@@ -521,8 +589,8 @@ mod tests {
 	#[test]
 	fn later_finalization_hides_behind_unfinished_head() {
 		let mut blocks = Blocks::new();
-		let head = blocks.create();
-		let later = blocks.create();
+		let head = blocks.create(BlockMode::Mutable);
+		let later = blocks.create(BlockMode::Mutable);
 		blocks.tick(2, |_| 0, |_| 1);
 		assert!(blocks.finalize(later));
 		let sampled = [1, 1];
@@ -538,8 +606,8 @@ mod tests {
 	#[test]
 	fn head_completion_exposes_one_contiguous_ordered_batch() {
 		let mut blocks = Blocks::new();
-		let head = blocks.create();
-		let later = blocks.create();
+		let head = blocks.create(BlockMode::Mutable);
+		let later = blocks.create(BlockMode::Mutable);
 		blocks.tick(2, |_| 0, |_| 1);
 		assert!(blocks.finalize(later));
 		assert!(blocks.retirement_batch().is_none());
@@ -556,8 +624,8 @@ mod tests {
 	#[test]
 	fn concurrent_lagging_shrink_and_expand_never_overgrant_rows() {
 		let mut budget = Blocks::new();
-		let growing = budget.create();
-		let occupying = budget.create();
+		let growing = budget.create(BlockMode::Mutable);
+		let occupying = budget.create(BlockMode::Mutable);
 		budget.tick(5, |_| 0, |_| 4);
 		let prior_grant = budget.tick(5, |_| 1, |_| 4);
 		assert_eq!(prior_grant.target(growing), Some(4));
@@ -568,9 +636,9 @@ mod tests {
 		assert_eq!(revoked.target(occupying), Some(4));
 
 		let mut blocks = Blocks::new();
-		let a = blocks.create();
-		let b = blocks.create();
-		let c = blocks.create();
+		let a = blocks.create(BlockMode::Mutable);
+		let b = blocks.create(BlockMode::Mutable);
+		let c = blocks.create(BlockMode::Mutable);
 		blocks.tick(6, |_| 0, |_| 4);
 		let expanded = blocks.tick(6, |_| 1, |_| 4);
 		assert_eq!(
@@ -582,7 +650,7 @@ mod tests {
 			6
 		);
 
-		let waiting = blocks.create();
+		let waiting = blocks.create(BlockMode::Mutable);
 		let sampled = [3, 1, 1, 0];
 		let shrinking = blocks.tick(6, |ordinal| sample_from(&sampled, ordinal), |_| 4);
 		assert_eq!(shrinking.admitted.as_slice(), &[waiting]);
@@ -604,11 +672,42 @@ mod tests {
 	}
 
 	#[test]
+	fn append_only_emission_is_monotonic_and_head_only() {
+		let mut blocks = Blocks::new();
+		let head = blocks.create(BlockMode::AppendOnly);
+		let later = blocks.create(BlockMode::AppendOnly);
+		blocks.tick(2, |_| 0, |_| 1);
+
+		assert_eq!(blocks.stable_head(2), Some((head, 0)));
+		assert!(!blocks.mark_emitted(later, 1));
+		assert!(blocks.mark_emitted(head, 1));
+		assert_eq!(blocks.emitted(head), Some(1));
+		assert!(!blocks.mark_emitted(head, 1));
+		assert!(!blocks.mark_emitted(head, 3));
+		assert_eq!(blocks.emitted(head), Some(1));
+		assert_eq!(blocks.stable_head(2), Some((head, 1)));
+		assert!(blocks.finalize(head));
+		blocks.mark_committed(1);
+		assert_eq!(blocks.mode(head), Some(BlockMode::AppendOnly));
+	}
+
+	#[test]
+	fn mutable_blocks_never_offer_stable_rows() {
+		let mut blocks = Blocks::new();
+		let head = blocks.create(BlockMode::Mutable);
+		blocks.tick(1, |_| 0, |_| 1);
+
+		assert!(blocks.stable_head(3).is_none());
+		assert!(!blocks.mark_emitted(head, 1));
+		assert_eq!(blocks.emitted(head), Some(0));
+	}
+
+	#[test]
 	fn resize_below_active_count_uses_recent_rows_without_committing() {
 		let mut blocks = Blocks::new();
-		let first = blocks.create();
-		let second = blocks.create();
-		let third = blocks.create();
+		let first = blocks.create(BlockMode::Mutable);
+		let second = blocks.create(BlockMode::Mutable);
+		let third = blocks.create(BlockMode::Mutable);
 		blocks.tick(3, |_| 0, |_| 1);
 		let plan = blocks.tick(2, |_| 1, |_| 1);
 		let overflow = plan.overflow.as_ref().expect("active overflow");
@@ -624,7 +723,11 @@ mod tests {
 	#[test]
 	fn failure_timeout_and_cancel_finalizations_unblock_frontier() {
 		let mut blocks = Blocks::new();
-		let outcomes = [blocks.create(), blocks.create(), blocks.create()];
+		let outcomes = [
+			blocks.create(BlockMode::Mutable),
+			blocks.create(BlockMode::Mutable),
+			blocks.create(BlockMode::Mutable),
+		];
 		blocks.tick(3, |_| 0, |_| 1);
 		for ordinal in outcomes.into_iter().rev() {
 			assert!(blocks.finalize(ordinal));
@@ -636,8 +739,8 @@ mod tests {
 	#[should_panic(expected = "commit must advance across one contiguous finalized prefix")]
 	fn non_contiguous_commit_panics_in_debug_builds() {
 		let mut blocks = Blocks::new();
-		blocks.create();
-		blocks.create();
+		blocks.create(BlockMode::Mutable);
+		blocks.create(BlockMode::Mutable);
 		assert!(blocks.finalize(BlockOrdinal(1)));
 		blocks.mark_committed(2);
 	}
@@ -713,7 +816,7 @@ mod tests {
 			for (operation, choice, lag) in steps {
 				match operation % 5 {
 					0 => {
-						let ordinal = blocks.create();
+						let ordinal = blocks.create(BlockMode::Mutable);
 						prop_assert_eq!(ordinal, reference.create());
 						prop_assert_eq!(ordinal.0 as usize, sampled.len());
 						sampled.push(0);

@@ -12,9 +12,9 @@ use flume::{Receiver, Sender};
 use omp_core::{Str, sf};
 use omp_executor::Executor;
 use omp_tui::{
-	AltScreenUse, CursorStyle, DebugOp, DebugQuery, Frame, Icon, InputEvent, Key, Layer, Mouse,
-	MouseReport, Notification, Pasted, Renderer, Size, Terminal, TerminalEvent, TerminalOptions,
-	TtyOut, UiContext, Urgency, detect,
+	AltScreenUse, Chord, CursorStyle, DebugOp, DebugQuery, Frame, HistoryReplay, Icon, InputEvent,
+	Key, Keymap, Layer, Mods, Mouse, MouseReport, Notification, Pasted, Renderer, Size, Terminal,
+	TerminalEvent, TerminalOptions, TtyOut, UiContext, Urgency, detect,
 	paste::{self, Clipboard, ClipboardRead},
 };
 use smallvec::SmallVec;
@@ -123,9 +123,11 @@ impl Default for HostOptions {
 /// retired into native scrollback (written at the old width).
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ResizeScrollback {
-	/// Replay the finalized transcript at the new width below retained history.
+	/// Replay the logical transcript at the new width below retained history
+	/// in one buffered transaction.
 	Append,
-	/// Erase native scrollback, then replay one current-width transcript.
+	/// Erase native scrollback and replay one current-width transcript in the
+	/// same buffered transaction.
 	#[default]
 	Rebuild,
 	/// Repaint only the mutable viewport; scrollback keeps its old width.
@@ -401,6 +403,7 @@ struct ChatHost {
 	approval_queue:          VecDeque<ApprovalTicketView>,
 	autoqa_queue:            VecDeque<ConsentRequest>,
 	suppress_history_replay: bool,
+	saved_git_keymap:        Option<Keymap>,
 }
 
 impl ChatHost {
@@ -433,6 +436,7 @@ impl ChatHost {
 			approval_queue: VecDeque::new(),
 			autoqa_queue: VecDeque::new(),
 			suppress_history_replay: false,
+			saved_git_keymap: None,
 		}
 	}
 
@@ -1599,8 +1603,8 @@ async fn run_chat(
 								if !resize.is_some_and(|state| state.settled(now)) { continue; }
 								host.chat.set_right_inset(host.sidebar.reserved(viewport));
 								// A settled width change leaves native scrollback rows
-								// wrapped at the old width; refresh them through a
-								// separate replay cursor without changing commit state.
+								// wrapped at the old width; refresh them through one
+								// buffered replay without changing commit state.
 								if viewport.width != settled_width {
 									settled_width = viewport.width;
 									let mode = if resize_scrollback == ResizeScrollback::Rebuild
@@ -2218,7 +2222,7 @@ enum Retirement {
 }
 
 fn start_pending_replay<W: Write>(
-	renderer: &mut Renderer<W>,
+	_renderer: &mut Renderer<W>,
 	host: &mut ChatHost,
 	pending: &mut Option<ResizeScrollback>,
 ) -> io::Result<()> {
@@ -2228,10 +2232,12 @@ fn start_pending_replay<W: Write>(
 	let Some(mode) = pending.take() else {
 		return Ok(());
 	};
-	if mode == ResizeScrollback::Rebuild {
-		renderer.reset_history()?;
-	}
-	host.chat.begin_replay();
+	let mode = match mode {
+		ResizeScrollback::Append => HistoryReplay::Append,
+		ResizeScrollback::Rebuild => HistoryReplay::Rebuild,
+		ResizeScrollback::Preserve => return Ok(()),
+	};
+	host.chat.begin_replay(mode);
 	Ok(())
 }
 
@@ -2275,7 +2281,14 @@ fn paint_host<W: Write>(
 			PaintKind::Presented
 		});
 	};
-	renderer.retire(&batch.frame, rendered.frame, viewport.height, &layers)?;
+	if let Some((mode, frames)) = batch.replay_plan() {
+		renderer.replay_frames(frames, rendered.frame, viewport.height, &layers, mode)?;
+	} else if batch.frame.size().height == 0 {
+		host.chat.mark_retired(&batch);
+		return Ok(PaintKind::Retired);
+	} else {
+		renderer.retire(&batch.frame, rendered.frame, viewport.height, &layers)?;
+	}
 	host.chat.mark_retired(&batch);
 	Ok(PaintKind::Retired)
 }
@@ -2287,6 +2300,19 @@ fn open_overlay(
 	viewport: Size,
 	_resize: &mut Option<ResizeState>,
 ) -> io::Result<()> {
+	if matches!(host.overlay.as_ref(), Some(Overlay::Git(_))) && host.saved_git_keymap.is_none() {
+		host.saved_git_keymap = Some(terminal.keymap().clone());
+		terminal.edit_keymap(|keymap| {
+			for mods in [Mods { alt: true, ..Mods::default() }, Mods {
+				alt: true,
+				super_key: true,
+				..Mods::default()
+			}] {
+				keymap.bind(Chord::new(Key::Up, mods), Key::JumpPrevious);
+				keymap.bind(Chord::new(Key::Down, mods), Key::JumpNext);
+			}
+		});
+	}
 	let alt_enter = terminal.stage_alt_enter(AltScreenUse::Interactive);
 	let rendered = host.chat.render(viewport);
 	let mut layers = rail_layers(&mut host.sidebar, viewport);
@@ -2309,6 +2335,9 @@ fn close_overlay(
 	viewport: Size,
 	_resize: &mut Option<ResizeState>,
 ) -> io::Result<()> {
+	if let Some(saved) = host.saved_git_keymap.take() {
+		terminal.edit_keymap(|keymap| *keymap = saved);
+	}
 	let rendered = host.chat.render(viewport);
 	let layers = rail_layers(&mut host.sidebar, viewport);
 	let alt_exit = terminal.stage_alt_leave().unwrap_or("");

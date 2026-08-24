@@ -739,7 +739,6 @@ async fn production_registry_advertises_and_dispatches_all_native_adapters() {
 		("ast_edit", "1".to_owned()),
 		("ast_grep", "1".to_owned()),
 		("debug", "1".to_owned()),
-		("dyn", "1".to_owned()),
 		("edit", "hl.1".to_owned()),
 		("eval", "1".to_owned()),
 		("fetch", "1".to_owned()),

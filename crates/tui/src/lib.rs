@@ -65,8 +65,8 @@ pub use component::{
 	IntoComponent, PaintCtx, Slot, next_slot,
 };
 pub use components::{
-	DiffActionKind, DiffBuildOptions, DiffDocument, DiffPane, DiffPaneState, DiffPatchTarget,
-	DiffSelection, DiffTarget, ViewMode,
+	ButtonVariant, DiffActionKind, DiffBuildOptions, DiffDocument, DiffPane, DiffPaneState,
+	DiffPatchTarget, DiffSelection, DiffTarget, DiffWhitespaceMode, ViewMode,
 };
 pub use context::{Appearance, Charset, Graphics, Grid, JamoWidth, Theme, UiContext};
 pub use debug::{FramePngError, frame_png, frame_text, respond_debug_query};
@@ -101,7 +101,9 @@ pub use overlay::{Layer, OverlayAnchor, OverlayBand, OverlayId, OverlayMargin, O
 pub use paste::{Pasted, PastedImage};
 pub use props::{Prop, PropValue, Props};
 pub use pump::{DebugOp, DebugQuery, TerminalEvent};
-pub use renderer::{OutputState, PaintStats, Renderer, RetireStats, file_link_target};
+pub use renderer::{
+	HistoryReplay, OutputState, PaintStats, Renderer, RetireStats, file_link_target,
+};
 pub use rich::{
 	Clip, Measure, Pipeline, Prefix, Prefixed, Restyle, RichSink, RichText, Rows, Tee, Wrap,
 	cell_width, decompose,

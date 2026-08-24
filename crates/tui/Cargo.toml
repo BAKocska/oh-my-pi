@@ -28,6 +28,7 @@ workspace = true
 [dependencies]
 async-io = { workspace = true }
 arboard = { workspace = true }
+bytes = { workspace = true }
 flume = { workspace = true }
 futures-lite = { workspace = true }
 image = { workspace = true }

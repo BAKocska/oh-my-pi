@@ -23,7 +23,6 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &[
 	"ask",
 	"checkpoint",
 	"computer",
-	"dyn",
 	"edit",
 	"eval",
 	"fetch",

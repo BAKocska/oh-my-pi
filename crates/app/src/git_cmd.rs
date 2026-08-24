@@ -12,7 +12,8 @@ use clap::Args;
 use miette::{IntoDiagnostic as _, miette};
 use omp_chat_ui::git::{GitIntent, GitWorkbench, GitWorkbenchEvent};
 use omp_tui::{
-	Frame, InputEvent, Key, Renderer, Size, Terminal, TerminalEvent, TerminalOptions, TtyOut,
+	Chord, Frame, InputEvent, Key, Mods, Renderer, Size, Terminal, TerminalEvent, TerminalOptions,
+	TtyOut,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -57,6 +58,7 @@ pub async fn run(args: GitArgs) -> miette::Result<()> {
 	let mut renderer = Renderer::new(TtyOut::new().into_diagnostic()?);
 	renderer.apply_caps(&terminal.caps()).into_diagnostic()?;
 	terminal.enter_alt().into_diagnostic()?;
+	let previous_keymap = install_git_keymap(&mut terminal);
 	let mut viewport = terminal.size().into_diagnostic()?;
 	let context = terminal_ui_context(&terminal.caps());
 	let mut workbench = GitWorkbench::open(snapshot, &context);
@@ -64,8 +66,11 @@ pub async fn run(args: GitArgs) -> miette::Result<()> {
 	if let Some(intent) = workbench.initial_intent()
 		&& dispatch(&session, &mut workbench, intent, &update_tx).await
 	{
+		cancel.cancel();
+		terminal.edit_keymap(|keymap| *keymap = previous_keymap);
 		return Ok(());
 	}
+	spawn_deferred_stats(&session, &update_tx);
 	let mut refresh = tokio::time::interval(Duration::from_secs(2));
 	refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 	refresh.tick().await;
@@ -81,10 +86,18 @@ pub async fn run(args: GitArgs) -> miette::Result<()> {
 				}
 			},
 			_ = refresh.tick() => {
-				if let Some(snapshot) = session.poll_refresh().await.map_err(|error| miette!(error))?
-					&& apply_update(&session, &mut workbench, omp_chat_ui::git::GitUpdate::Snapshot(snapshot), &update_tx).await
-				{
-					break;
+				if let Some(snapshot) = session.poll_refresh().await.map_err(|error| miette!(error))? {
+					let close = apply_update(
+						&session,
+						&mut workbench,
+						omp_chat_ui::git::GitUpdate::Snapshot(snapshot),
+						&update_tx,
+					)
+					.await;
+					spawn_deferred_stats(&session, &update_tx);
+					if close {
+						break;
+					}
 				}
 			},
 			event = terminal.next() => match event.into_diagnostic()? {
@@ -122,7 +135,22 @@ pub async fn run(args: GitArgs) -> miette::Result<()> {
 		}
 	}
 	cancel.cancel();
+	terminal.edit_keymap(|keymap| *keymap = previous_keymap);
 	Ok(())
+}
+
+fn install_git_keymap(terminal: &mut Terminal) -> omp_tui::Keymap {
+	let alt = Mods { alt: true, ..Default::default() };
+	let super_alt = Mods { alt: true, super_key: true, ..Default::default() };
+	let mut previous = None;
+	terminal.edit_keymap(|keymap| {
+		previous = Some(keymap.clone());
+		for mods in [alt, super_alt] {
+			keymap.bind(Chord::new(Key::Up, mods), Key::JumpPrevious);
+			keymap.bind(Chord::new(Key::Down, mods), Key::JumpNext);
+		}
+	});
+	previous.expect("terminal keymap was captured before Git bindings")
 }
 
 async fn route_event(
@@ -163,13 +191,31 @@ async fn dispatch(
 		if result.close {
 			return true;
 		}
+		let mut snapshot_delivered = false;
 		for update in result.updates {
+			snapshot_delivered |= matches!(&update, omp_chat_ui::git::GitUpdate::Snapshot(_));
 			if let Some(intent) = workbench.apply(update) {
 				intents.push_back(intent);
 			}
 		}
+		if snapshot_delivered {
+			spawn_deferred_stats(session, updates);
+		}
 	}
 	false
+}
+
+fn spawn_deferred_stats(
+	session: &GitSession,
+	updates: &flume::Sender<omp_chat_ui::git::GitUpdate>,
+) {
+	let session = session.clone();
+	let updates = updates.clone();
+	drop(tokio::spawn(async move {
+		if let Ok(Some(snapshot)) = session.deferred_stats().await {
+			let _ = updates.send(omp_chat_ui::git::GitUpdate::Snapshot(snapshot));
+		}
+	}));
 }
 
 async fn apply_update(
@@ -190,7 +236,7 @@ fn paint(
 	viewport: Size,
 ) -> io::Result<()> {
 	let base = Frame::new(Size::new(viewport.width, viewport.height.max(1)));
-	
+
 	renderer.repaint("", base, viewport.height, &[workbench.layer(viewport)])?;
 	Ok(())
 }

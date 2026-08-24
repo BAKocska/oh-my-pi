@@ -1,8 +1,7 @@
 //! Cursor compatibility bridge with environment-enforced filesystem safety.
 //!
-//! Cursor frame names are translated into calls to the stable `dyn` tool.  The
-//! bridge never manufactures URL-shaped device identities and never bypasses
-//! environment admission.
+//! Cursor frame names are translated into direct device invocations. The bridge
+//! preserves nested device arguments and never bypasses environment admission.
 
 use std::{
 	collections::BTreeMap,
@@ -14,7 +13,8 @@ use omp_core::{Str, sf};
 use serde_json::{Map, Value, json};
 use thiserror::Error;
 
-/// Filesystem mutation policy applied before a translated write reaches `dyn`.
+/// Filesystem mutation policy applied before a translated write reaches its
+/// device.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WritePolicy {
 	/// Mutations are forbidden.
@@ -25,13 +25,12 @@ pub enum WritePolicy {
 	Workspace,
 }
 
-/// A validated invocation of the stable dynamic-device transport.
+/// A translated invocation naming its target device directly.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DynDispatch {
-	/// Always `dyn`; exposed so adapters cannot accidentally invoke a device as
-	/// a core tool.
-	pub tool:      Str,
-	/// Flattened arguments accepted by the `dyn` tool.
+pub struct DeviceDispatch {
+	/// Target device name.
+	pub device:    Str,
+	/// Nested arguments accepted by the target device.
 	pub arguments: Value,
 }
 
@@ -57,13 +56,13 @@ pub enum BridgeError {
 	},
 }
 
-/// Translates legacy and modern Cursor frames into a `dyn` invocation.
-pub fn translate(frame: &str, arguments: &Value) -> Result<DynDispatch, BridgeError> {
+/// Translates legacy and modern Cursor frames into a device invocation.
+pub fn translate(frame: &str, arguments: &Value) -> Result<DeviceDispatch, BridgeError> {
 	let args = arguments
 		.as_object()
 		.ok_or_else(|| BridgeError::Invalid(sf!("arguments must be an object")))?;
 	if let Some(replace) = cursor_replace_arguments(frame, args) {
-		return Ok(dyn_dispatch("edit", translate_edit(replace)?));
+		return Ok(device_dispatch("edit", translate_edit(replace)?));
 	}
 	let (device, translated) = match frame {
 		"read" | "piRead" => ("read", translate_read(args)?),
@@ -78,15 +77,11 @@ pub fn translate(frame: &str, arguments: &Value) -> Result<DynDispatch, BridgeEr
 		"mcp" | "piMcp" | "mcpResource" => ("mcp", Value::Object(args.clone())),
 		other => return Err(BridgeError::Unsupported(Str::from(other))),
 	};
-	Ok(dyn_dispatch(device, translated))
+	Ok(device_dispatch(device, translated))
 }
 
-fn dyn_dispatch(device: &str, mut translated: Value) -> DynDispatch {
-	let object = translated
-		.as_object_mut()
-		.expect("translations return objects");
-	object.insert("do_".into(), Value::String(format!("invoke/{device}")));
-	DynDispatch { tool: sf!("dyn"), arguments: translated }
+fn device_dispatch(device: &str, arguments: Value) -> DeviceDispatch {
+	DeviceDispatch { device: Str::from(device), arguments }
 }
 
 /// Translates a frame and enforces mutation policy before returning a write
@@ -96,12 +91,9 @@ pub fn translate_checked(
 	arguments: &Value,
 	root: &Path,
 	policy: WritePolicy,
-) -> Result<DynDispatch, BridgeError> {
+) -> Result<DeviceDispatch, BridgeError> {
 	let mut call = translate(frame, arguments)?;
-	if matches!(
-		call.arguments.get("do_").and_then(Value::as_str),
-		Some("invoke/write" | "invoke/edit")
-	) {
+	if matches!(call.device.as_str(), "write" | "edit") {
 		let raw = call
 			.arguments
 			.get("path")
@@ -457,10 +449,10 @@ impl TodoSync {
 mod tests {
 	use super::*;
 	#[test]
-	fn modern_read_uses_dyn() {
+	fn modern_read_names_device_and_preserves_arguments() {
 		let call = translate("piRead", &json!({"path":"a","start":2,"lines":3})).unwrap();
-		assert_eq!(call.tool.as_str(), "dyn");
-		assert_eq!(call.arguments["do_"], "invoke/read");
+		assert_eq!(call.device.as_str(), "read");
+		assert_eq!(call.arguments, json!({"path":"a","offset":2,"limit":3}));
 	}
 	#[test]
 	fn cursor_str_replace_variants_project_onto_replace_edit() {
@@ -475,7 +467,7 @@ mod tests {
 				}),
 			)
 			.unwrap();
-			assert_eq!(call.arguments["do_"], "invoke/edit", "{name}");
+			assert_eq!(call.device.as_str(), "edit", "{name}");
 			assert_eq!(call.arguments["path"], "src/lib.rs", "{name}");
 			assert_eq!(call.arguments["old"], "before", "{name}");
 			assert_eq!(call.arguments["new"], "after", "{name}");
@@ -492,7 +484,7 @@ mod tests {
 			}),
 		)
 		.unwrap();
-		assert_eq!(call.arguments["do_"], "invoke/edit");
+		assert_eq!(call.device.as_str(), "edit");
 		assert_eq!(call.arguments["old"], "a");
 		assert_eq!(call.arguments["new"], "b");
 
@@ -501,7 +493,11 @@ mod tests {
 			&json!({"tool_name":"edit","args":{"path":"src/lib.rs","input":"hashline"}}),
 		)
 		.unwrap();
-		assert_eq!(call.arguments["do_"], "invoke/mcp");
+		assert_eq!(call.device.as_str(), "mcp");
+		assert_eq!(
+			call.arguments,
+			json!({"tool_name":"edit","args":{"path":"src/lib.rs","input":"hashline"}})
+		);
 	}
 	#[test]
 	fn streaming_retains_partial_escape() {

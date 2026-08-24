@@ -83,6 +83,14 @@ pub enum Key {
 	ShiftEnter,
 	/// Alt/Shift+Up: restore the newest queued follow-up to the composer.
 	RestoreQueue,
+	/// Jump to the previous structural landmark (hunk, match, section) in
+	/// the focused view. No default chord; hosts bind e.g. `Alt+Up` via
+	/// [`Keymap::bind`].
+	JumpPrevious,
+	/// Jump to the next structural landmark (hunk, match, section) in the
+	/// focused view. No default chord; hosts bind e.g. `Alt+Down` via
+	/// [`Keymap::bind`].
+	JumpNext,
 	/// Ctrl+Shift+P: cycle backward through the host's model roster.
 	CyclePrevious,
 	/// Alt+Shift+P: toggle the host's planning mode.

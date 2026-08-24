@@ -2711,6 +2711,16 @@ where
 			send_backend(&backend, BackendEvent::OpenGitWorkbench(snapshot));
 			self.state.git =
 				Some(GitWorkbenchBackend { session: session.clone(), cancel: cancel.clone() });
+			let stats_session = session.clone();
+			let stats_backend = backend.clone();
+			drop(tokio::spawn(async move {
+				if let Ok(Some(snapshot)) = stats_session.deferred_stats().await {
+					send_backend(
+						&stats_backend,
+						BackendEvent::Git(omp_chat_ui::git::GitUpdate::Snapshot(snapshot)),
+					);
+				}
+			}));
 			drop(tokio::spawn(async move {
 				let mut interval = tokio::time::interval(Duration::from_secs(2));
 				interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -2724,6 +2734,11 @@ where
 									send_backend(&backend, BackendEvent::Git(
 										omp_chat_ui::git::GitUpdate::Snapshot(snapshot),
 									));
+									if let Ok(Some(snapshot)) = session.deferred_stats().await {
+										send_backend(&backend, BackendEvent::Git(
+											omp_chat_ui::git::GitUpdate::Snapshot(snapshot),
+										));
+									}
 								},
 								Ok(None) => {},
 								Err(error) => {
@@ -4875,8 +4890,16 @@ where
 				let backend = backend.clone();
 				drop(tokio::spawn(async move {
 					let result = session.handle(intent).await;
+					let mut snapshot_delivered = false;
 					for update in result.updates {
+						snapshot_delivered |= matches!(&update, omp_chat_ui::git::GitUpdate::Snapshot(_));
 						send_backend(&backend, BackendEvent::Git(update));
+					}
+					if snapshot_delivered && let Ok(Some(snapshot)) = session.deferred_stats().await {
+						send_backend(
+							&backend,
+							BackendEvent::Git(omp_chat_ui::git::GitUpdate::Snapshot(snapshot)),
+						);
 					}
 				}));
 			}

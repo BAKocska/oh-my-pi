@@ -98,6 +98,27 @@ impl Color {
 		Self::Rgb(channel(ar, br), channel(ag, bg), channel(ab, bb))
 	}
 
+	/// Returns BT.709 perceptual luminance in the range `0.0..=1.0`.
+	///
+	/// Terminal-default and indexed colors need palette context and therefore
+	/// report zero; theme-derived control colors are always RGB at this seam.
+	pub fn luminance(self) -> f32 {
+		let Self::Rgb(red, green, blue) = self else {
+			return 0.0;
+		};
+		(0.2126 * f32::from(red) + 0.7152 * f32::from(green) + 0.0722 * f32::from(blue)) / 255.0
+	}
+
+	/// Derives a readable label color by blending this fill toward black or
+	/// white.
+	pub fn contrast_label(self) -> Self {
+		if self.luminance() > 0.5 {
+			self.mix(Self::Rgb(0, 0, 0), 0.82)
+		} else {
+			self.mix(Self::Rgb(255, 255, 255), 0.92)
+		}
+	}
+
 	/// Parses any CSS color and lowers it to a cell color without
 	/// context: fully transparent values and `currentcolor` become
 	/// [`Color::Default`] (the terminal's pass-through color),
@@ -1312,6 +1333,21 @@ mod tests {
 			rect,
 			kind: DecorKind::Fill { fill: DecorFill::Solid(Color::Default), rounded: false },
 		}
+	}
+	#[test]
+	fn luminance_and_contrast_label_follow_git_control_math() {
+		assert!((Color::Rgb(255, 255, 255).luminance() - 1.0).abs() < f32::EPSILON);
+		assert!((Color::Rgb(255, 0, 0).luminance() - 0.2126).abs() < 0.000_001);
+		assert_eq!(
+			Color::Rgb(200, 220, 240).contrast_label(),
+			Color::Rgb(36, 40, 43),
+			"light fills blend 82% toward black"
+		);
+		assert_eq!(
+			Color::Rgb(20, 40, 60).contrast_label(),
+			Color::Rgb(236, 238, 239),
+			"dark fills blend 92% toward white"
+		);
 	}
 
 	#[test]

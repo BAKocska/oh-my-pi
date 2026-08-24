@@ -67,6 +67,19 @@ impl GitSession {
 		self.model.lock().await.refresh(&self.cancel).await
 	}
 
+	/// Loads line counts for the current fast snapshot, returning the
+	/// stats-enriched follow-up snapshot once.
+	pub async fn deferred_stats(
+		&self,
+	) -> Result<Option<omp_chat_ui::git::GitSnapshot>, GitModelError> {
+		self
+			.model
+			.lock()
+			.await
+			.load_deferred_stats(&self.cancel)
+			.await
+	}
+
 	/// Applies one UI intent through the same path used by both workbench hosts.
 	pub async fn handle(&self, intent: GitIntent) -> GitIntentResult {
 		match intent {

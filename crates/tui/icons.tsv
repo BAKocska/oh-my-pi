@@ -185,6 +185,7 @@ comet	object.comet	comet	☄	
 comment	comm.comment	//	💬	
 comments	comm.comments	///	🗨	
 commit	git.commit	commit	●	
+commit-node	git.commitNode	-o-	-○-	󰜘
 compass	object.compass	N	🧭	
 completed	status.completed	[x]	✓	
 compress	action.compress	><	🗜	
@@ -312,6 +313,7 @@ ferry	object.ferry	ferry	⛴	󰈓
 fever-thermometer	object.feverThermometer	fever	🤒	
 field-hockey	object.fieldHockey	hock	🏑	
 file	icon.file	[F]	📄	
+file-diff	git.fileDiff	[F]	▤	
 file-download	file.download	[dl]	📥	
 file-lock	file.lock	[lock]	🔒	
 file-upload	file.upload	[ul]	📤	
@@ -430,6 +432,7 @@ hourglass	object.hourglass	hour	⌛	
 houses	object.houses	homes	🏘	
 hr-char	md.hrChar	-	─	─
 html	lang.html	html	🌐	
+hunk	git.hunk	[-]	⊟	
 ice-cream	object.iceCream	icecrm	🍨	
 ice-cube	object.iceCube	ice	🧊	
 ice-skate	object.iceSkate	skate	⛸	󰴵
@@ -444,6 +447,7 @@ infinity	object.infinity	inf	♾	
 info	object.info	info	ℹ	
 info-status	status.info	[i]	ⓘ	
 ini	lang.ini	ini	⚙	
+inline	git.inline	[=]	≡	
 input	icon.input	in:	⤵	
 input-numbers	action.inputNumbers	123	🔢	
 input-symbols	object.inputSymbols	@#$	🔣	󱔁
@@ -886,6 +890,7 @@ speaker-low	device.speakerLow	vol-	🔈	
 speedboat-sailboat	object.speedboatSailboat	boat	🚤	󰻈
 spider	object.spider	spider	🕷	
 spider-web	object.spiderWeb	web	🕸	󰯊
+split	git.split	[|]	◫	
 spoon	object.spoon	spoon	🥄	
 sport-utility-car-sports	object.sportUtilityCarSports	SUV	🚙	󰞬
 sports-medal	object.sportsMedal	medal	🏅	
@@ -1021,6 +1026,8 @@ vertical-traffic-light	object.verticalTrafficLight	light	🚦	
 video	comm.video	cam	📹	
 video-file	file.video	[vid]	🎥	
 videocassette	device.videocassette	VHS	📼	󰨛
+view-path	view.path	Path	☰	
+view-tree	view.tree	Tree	└	
 violin	object.violin	violin	🎻	󰘏
 virgo	object.virgo	Virgo	♍	󰪈
 volcano	object.volcano	volc	🌋	
@@ -1051,6 +1058,7 @@ white-flag	object.whiteFlag	flag	🏳	
 white-flower	object.whiteFlower	flower	💮	󰉊
 white-small-square	object.whiteSmallSquare	[ ]	▫	󰨕
 white-square	object.whiteSquare	[ ]	⬜	
+whitespace	view.whitespace	ws	¶	
 wifi	device.wifi	wifi	📶	
 wind-face	object.windFace	wind	🌬	
 window-object	object.windowObject	window	🪟	
@@ -1061,6 +1069,7 @@ wolf-pack	object.wolfPack	wolf	🐺	
 womans-clothes	object.womansClothes	wear	👚	󰾐
 womans-hat	object.womansHat	hat	👒	󰥯
 womens-room	user.womensRoom	women	🚺	
+word-wrap	view.wordWrap	wrap	⏎	
 worktree	icon.worktree	[wt]	🌳	
 wrench	object.wrench	wrench	🔧	
 write	tool.write	+f	✎	

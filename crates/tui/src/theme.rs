@@ -7,6 +7,17 @@ use serde::Deserialize;
 use thiserror::Error;
 
 use crate::{Appearance, Color, Theme};
+impl Theme {
+	/// Returns a canvas-adjacent selection fill, dimmed for an unfocused pane.
+	pub fn selection_bg(&self, dim: bool) -> Color {
+		self.panel.mix(self.fg, if dim { 0.08 } else { 0.14 })
+	}
+
+	/// Tints the panel surface toward `base` by `amount`.
+	pub fn tint_bg(&self, base: Color, amount: f32) -> Color {
+		self.panel.mix(base, amount)
+	}
+}
 
 /// Parsed named theme with dark and optional light variants.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -423,6 +434,14 @@ fn relative_luminance([red, green, blue]: [u8; 3]) -> f64 {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	#[test]
+	fn selection_and_tint_backgrounds_use_panel_mix_math() {
+		let theme =
+			Theme { panel: Color::Rgb(10, 20, 30), fg: Color::Rgb(210, 220, 230), ..Theme::default() };
+		assert_eq!(theme.selection_bg(false), Color::Rgb(38, 48, 58));
+		assert_eq!(theme.selection_bg(true), Color::Rgb(26, 36, 46));
+		assert_eq!(theme.tint_bg(Color::Rgb(110, 120, 130), 0.18), Color::Rgb(28, 38, 48));
+	}
 
 	#[test]
 	fn json_theme_selects_dark_and_light_variants() {

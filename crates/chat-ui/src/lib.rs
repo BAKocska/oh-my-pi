@@ -43,7 +43,7 @@ pub mod slots;
 use std::{sync::Arc, time::Instant};
 
 pub use agent_hub::{AgentHub, AgentHubEvent};
-pub use blocks::{BlockOrdinal, BlockPhase, BlockTarget, Blocks, Overflow, Plan};
+pub use blocks::{BlockMode, BlockOrdinal, BlockPhase, BlockTarget, Blocks, Overflow, Plan};
 pub mod image_overlay;
 pub use extension_inspector::{
 	ExtensionCatalogSource, ExtensionDetail, ExtensionDisposition, ExtensionInspector,

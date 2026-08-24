@@ -3,6 +3,7 @@
 use std::{
 	collections::HashMap,
 	path::{Path, PathBuf},
+	str,
 };
 
 use bytes::Bytes;
@@ -30,6 +31,9 @@ use tokio_util::sync::CancellationToken;
 
 const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
+const BINARY_SNIFF_BYTES: usize = 512;
+const LFS_POINTER_MAX_BYTES: usize = 1024;
+const LFS_VERSION: &str = "version https://git-lfs.github.com/spec/v1";
 
 /// Failures produced while reading or mutating an interactive Git repository.
 #[derive(Debug, thiserror::Error)]
@@ -73,20 +77,31 @@ pub enum GitModelError {
 		#[source]
 		source: std::io::Error,
 	},
+	/// A local Git LFS object could not be inspected or read.
+	#[error("failed to read Git LFS object {path:?}")]
+	LfsIo {
+		/// Object that could not be read.
+		path:   PathBuf,
+		/// Underlying filesystem failure.
+		#[source]
+		source: std::io::Error,
+	},
 }
 
 /// Environment-backed state for one Git workbench.
 pub struct GitModel {
-	cwd:         PathBuf,
-	repository:  Repository,
-	runner:      GitRunner,
-	diff:        GitDiff,
-	query:       GitQuery,
-	commands:    GitCommands,
-	mutation:    GitMutation,
-	pinned_sha:  Option<Str>,
-	fingerprint: Option<[u8; 32]>,
-	head:        Option<GitCommitInfo>,
+	cwd:               PathBuf,
+	repository:        Repository,
+	runner:            GitRunner,
+	diff:              GitDiff,
+	query:             GitQuery,
+	commands:          GitCommands,
+	mutation:          GitMutation,
+	pinned_sha:        Option<Str>,
+	fingerprint:       Option<[u8; 32]>,
+	stats_fingerprint: Option<[u8; 32]>,
+	snapshot:          Option<GitSnapshot>,
+	head:              Option<GitCommitInfo>,
 }
 
 impl GitModel {
@@ -128,6 +143,8 @@ impl GitModel {
 			runner,
 			pinned_sha,
 			fingerprint: None,
+			stats_fingerprint: None,
+			snapshot: None,
 			head: None,
 		})
 	}
@@ -151,13 +168,15 @@ impl GitModel {
 			let head = self.load_commit(sha.as_str(), cancel).await?;
 			self.fingerprint = Some(fingerprint);
 			self.head = Some(head.clone());
-			return Ok(Some(GitSnapshot {
+			let snapshot = GitSnapshot {
 				branch:   None,
 				unstaged: Vec::new(),
 				staged:   Vec::new(),
 				head:     Some(head),
 				pinned:   true,
-			}));
+			};
+			self.snapshot = Some(snapshot.clone());
+			return Ok(Some(snapshot));
 		}
 
 		let status_output = self
@@ -182,17 +201,61 @@ impl GitModel {
 			return Ok(None);
 		}
 
-		let (worktree_stats, staged_stats) =
-			tokio::try_join!(self.numstat(false, cancel), self.numstat(true, cancel),)?;
-		let (unstaged, staged) = rows_from_status(&entries, &worktree_stats, &staged_stats);
-		if self.head.as_ref().map(|head| head.sha.as_str()) != head_sha.as_deref() {
+		let (unstaged, staged) = rows_from_status(&entries, &[], &[]);
+		let clean = unstaged.is_empty() && staged.is_empty();
+		let previous_clean = self
+			.snapshot
+			.as_ref()
+			.is_some_and(|snapshot| snapshot.unstaged.is_empty() && snapshot.staged.is_empty());
+		if self.head.as_ref().map(|head| head.sha.as_str()) != head_sha.as_deref()
+			|| (clean && !previous_clean)
+		{
 			self.head = match head_sha.as_deref() {
-				Some(sha) => Some(self.load_commit(sha, cancel).await?),
+				Some(sha) if clean => Some(self.load_commit(sha, cancel).await?),
+				Some(sha) => Some(self.load_commit_metadata(sha, cancel).await?),
 				None => None,
 			};
 		}
 		self.fingerprint = Some(fingerprint);
-		Ok(Some(GitSnapshot { branch, unstaged, staged, head: self.head.clone(), pinned: false }))
+		self.stats_fingerprint = None;
+		let snapshot =
+			GitSnapshot { branch, unstaged, staged, head: self.head.clone(), pinned: false };
+		self.snapshot = Some(snapshot.clone());
+		Ok(Some(snapshot))
+	}
+
+	/// Populates changed-line counts after the fast status snapshot has been
+	/// delivered, returning a second snapshot when counts were loaded.
+	pub async fn load_deferred_stats(
+		&mut self,
+		cancel: &CancellationToken,
+	) -> Result<Option<GitSnapshot>, GitModelError> {
+		let Some(fingerprint) = self.fingerprint else {
+			return Ok(None);
+		};
+		let Some(snapshot) = self.snapshot.as_ref() else {
+			return Ok(None);
+		};
+		if snapshot.pinned
+			|| (snapshot.unstaged.is_empty() && snapshot.staged.is_empty())
+			|| self.stats_fingerprint == Some(fingerprint)
+		{
+			return Ok(None);
+		}
+		let (worktree_stats, staged_stats) =
+			tokio::try_join!(self.numstat(false, cancel), self.numstat(true, cancel),)?;
+		if self.fingerprint != Some(fingerprint) {
+			return Ok(None);
+		}
+		let mut snapshot = self
+			.snapshot
+			.clone()
+			.expect("snapshot remains present while its fingerprint is current");
+		apply_counts(&mut snapshot.unstaged, &worktree_stats);
+		apply_counts(&mut snapshot.staged, &staged_stats);
+		self.stats_fingerprint = Some(fingerprint);
+		self.snapshot = Some(snapshot.clone());
+		Ok(Some(snapshot))
 	}
 
 	/// Invalidates fingerprint deduplication and returns a fresh snapshot.
@@ -246,13 +309,28 @@ impl GitModel {
 				(old, new, false)
 			},
 		};
-		let binary = old.contains(&0) || new.contains(&0);
-		Ok(GitFileContents {
-			old_text: String::from_utf8_lossy(&old).as_ref().to_str(),
-			new_text: String::from_utf8_lossy(&new).as_ref().to_str(),
-			binary,
-			too_large,
-		})
+		let old = self.resolve_lfs(old).await?;
+		let new = self.resolve_lfs(new).await?;
+		let media = media_format(path, &old, &new);
+		let binary = is_binary(&old.bytes) || is_binary(&new.bytes);
+		let (old_text, new_text, old_bytes, new_bytes) = if media.is_some() {
+			(
+				Str::new_static(""),
+				Str::new_static(""),
+				(!old.bytes.is_empty() && !old.lfs_missing).then_some(old.bytes),
+				(!new.bytes.is_empty() && !new.lfs_missing).then_some(new.bytes),
+			)
+		} else if binary {
+			(Str::new_static(""), Str::new_static(""), None, None)
+		} else {
+			(
+				String::from_utf8_lossy(&old.bytes).as_ref().to_str(),
+				String::from_utf8_lossy(&new.bytes).as_ref().to_str(),
+				None,
+				None,
+			)
+		};
+		Ok(GitFileContents { old_text, new_text, binary, too_large, old_bytes, new_bytes, media })
 	}
 
 	/// Stages one file, or every change when no path is supplied.
@@ -356,13 +434,13 @@ impl GitModel {
 		sha: &str,
 		cancel: &CancellationToken,
 	) -> Result<GitCommitInfo, GitModelError> {
-		let metadata = self.query.commit_metadata(&self.cwd, sha, cancel).await?;
-		let base = metadata.parents.first().map_or(EMPTY_TREE, Str::as_str);
+		let mut commit = self.load_commit_metadata(sha, cancel).await?;
+		let base = commit.parents.first().map_or(EMPTY_TREE, Str::as_str);
 		let output = self
 			.runner
 			.run(
 				&self.cwd,
-				&["diff", "--numstat", "-z", base, metadata.hash.as_str()],
+				&["diff", "--numstat", "-z", base, commit.sha.as_str()],
 				GitRunOptions { read_only: true, parse_sensitive: true, ..Default::default() },
 				cancel,
 			)
@@ -370,24 +448,33 @@ impl GitModel {
 		if output.exit_code != 0 {
 			return Err(GitModelError::Exit { code: output.exit_code });
 		}
-		let files = diff::parse_numstat(output.stdout)?
+		commit.files = diff::parse_numstat(output.stdout)?
 			.into_iter()
 			.map(commit_row)
 			.collect();
+		Ok(commit)
+	}
+
+	async fn load_commit_metadata(
+		&self,
+		sha: &str,
+		cancel: &CancellationToken,
+	) -> Result<GitCommitInfo, GitModelError> {
+		let metadata = self.query.commit_metadata(&self.cwd, sha, cancel).await?;
 		let (subject, body) = metadata
 			.body
 			.as_str()
 			.split_once('\n')
 			.unwrap_or((metadata.body.as_str(), ""));
 		Ok(GitCommitInfo {
-			sha: metadata.hash,
-			subject: subject.to_str(),
-			body: body.trim().to_str(),
-			author_name: metadata.author_name,
+			sha:          metadata.hash,
+			subject:      subject.to_str(),
+			body:         body.trim().to_str(),
+			author_name:  metadata.author_name,
 			author_email: metadata.author_email,
-			author_date: metadata.author_date,
-			parents: metadata.parents,
-			files,
+			author_date:  metadata.author_date,
+			parents:      metadata.parents,
+			files:        Vec::new(),
 		})
 	}
 
@@ -423,6 +510,122 @@ impl GitModel {
 		}
 		Ok((Bytes::from(bytes), false))
 	}
+
+	async fn resolve_lfs(&self, bytes: Bytes) -> Result<LoadedSide, GitModelError> {
+		let Some(pointer) = parse_lfs_pointer(&bytes) else {
+			return Ok(LoadedSide { bytes, lfs_missing: false });
+		};
+		if pointer.size > MAX_FILE_BYTES {
+			return Ok(LoadedSide { bytes, lfs_missing: true });
+		}
+		let path = self
+			.repository
+			.common_dir
+			.join("lfs")
+			.join("objects")
+			.join(&pointer.oid[..2])
+			.join(&pointer.oid[2..4])
+			.join(&pointer.oid);
+		let object = match tokio::fs::read(&path).await {
+			Ok(object) => object,
+			Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+				return Ok(LoadedSide { bytes, lfs_missing: true });
+			},
+			Err(source) => return Err(GitModelError::LfsIo { path, source }),
+		};
+		if u64::try_from(object.len()).ok() != Some(pointer.size) {
+			return Ok(LoadedSide { bytes, lfs_missing: true });
+		}
+		Ok(LoadedSide { bytes: Bytes::from(object), lfs_missing: false })
+	}
+}
+
+struct LoadedSide {
+	bytes:       Bytes,
+	lfs_missing: bool,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct LfsPointer {
+	oid:  Str,
+	size: u64,
+}
+
+fn parse_lfs_pointer(bytes: &[u8]) -> Option<LfsPointer> {
+	if bytes.len() > LFS_POINTER_MAX_BYTES {
+		return None;
+	}
+	let text = str::from_utf8(bytes).ok()?;
+	let mut lines = text.lines();
+	if lines.next()? != LFS_VERSION {
+		return None;
+	}
+	let mut oid = None;
+	let mut size = None;
+	for line in lines {
+		if let Some(value) = line.strip_prefix("oid sha256:")
+			&& value.len() == 64
+			&& value
+				.bytes()
+				.all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+		{
+			oid = Some(value.to_str());
+		} else if let Some(value) = line.strip_prefix("size ") {
+			size = value.parse().ok();
+		}
+	}
+	Some(LfsPointer { oid: oid?, size: size? })
+}
+
+fn media_format(path: &str, old: &LoadedSide, new: &LoadedSide) -> Option<Str> {
+	let visible_side =
+		(!old.bytes.is_empty() && !old.lfs_missing) || (!new.bytes.is_empty() && !new.lfs_missing);
+	if !visible_side {
+		return None;
+	}
+	if looks_like_svg(&old.bytes) || looks_like_svg(&new.bytes) {
+		return Some(Str::new_static("svg"));
+	}
+	let extension = Path::new(path).extension()?.to_str()?.to_ascii_lowercase();
+	let (token, format) = match extension.as_str() {
+		"svg" => return Some(Str::new_static("svg")),
+		"png" => ("png", image::ImageFormat::Png),
+		"jpg" | "jpeg" => ("jpeg", image::ImageFormat::Jpeg),
+		"gif" => ("gif", image::ImageFormat::Gif),
+		"webp" => ("webp", image::ImageFormat::WebP),
+		"bmp" => ("bmp", image::ImageFormat::Bmp),
+		_ => return None,
+	};
+	(has_image_format(old, format) || has_image_format(new, format)).then(|| token.to_str())
+}
+
+fn has_image_format(side: &LoadedSide, expected: image::ImageFormat) -> bool {
+	!side.lfs_missing && image::guess_format(&side.bytes).is_ok_and(|format| format == expected)
+}
+
+fn looks_like_svg(bytes: &[u8]) -> bool {
+	let header = &bytes[..bytes.len().min(BINARY_SNIFF_BYTES)];
+	if is_binary(header) {
+		return false;
+	}
+	let Ok(text) = str::from_utf8(header) else {
+		return false;
+	};
+	let lowercase = text.to_ascii_lowercase();
+	let mut rest = lowercase.as_str();
+	while let Some(index) = rest.find("<svg") {
+		let after = &rest[index + 4..];
+		if after.starts_with('>') || after.starts_with(char::is_whitespace) {
+			return true;
+		}
+		rest = after;
+	}
+	false
+}
+
+fn is_binary(bytes: &[u8]) -> bool {
+	omp_tools::read::is_probably_binary_header(&bytes[..bytes.len().min(BINARY_SNIFF_BYTES)])
+		|| str::from_utf8(bytes).is_err()
 }
 
 fn fingerprint(head: &[u8], status: &[u8]) -> [u8; 32] {
@@ -443,6 +646,9 @@ fn empty_contents() -> GitFileContents {
 		new_text:  Str::new_static(""),
 		binary:    false,
 		too_large: false,
+		old_bytes: None,
+		new_bytes: None,
+		media:     None,
 	}
 }
 
@@ -486,6 +692,16 @@ fn rows_from_status(
 		}
 	}
 	(unstaged, staged)
+}
+
+fn apply_counts(rows: &mut [GitFileRow], entries: &[NumstatEntry]) {
+	let counts = count_map(entries);
+	for row in rows {
+		if let Some((additions, deletions)) = counts.get(row.path.as_bytes()).copied() {
+			row.additions = additions;
+			row.deletions = deletions;
+		}
+	}
 }
 
 fn count_map(entries: &[NumstatEntry]) -> HashMap<&[u8], (Option<u64>, Option<u64>)> {
@@ -586,7 +802,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn real_repository_refresh_deduplicates_until_status_changes() {
+	async fn real_repository_refresh_emits_fast_then_stats_snapshots() {
 		let fixture = tempfile::tempdir().expect("temporary repository");
 		fixture_git(fixture.path(), &["init", "-b", "main"]);
 		fixture_git(fixture.path(), &["config", "user.name", "OMP Test"]);
@@ -615,8 +831,97 @@ mod tests {
 			.expect("changed snapshot");
 		assert_eq!(changed.unstaged.len(), 1);
 		assert_eq!(changed.unstaged[0].path.as_str(), "tracked.txt");
-		assert_eq!(changed.unstaged[0].additions, Some(1));
+		assert_eq!(changed.unstaged[0].additions, None);
+		let head = changed
+			.head
+			.as_ref()
+			.expect("dirty snapshots retain HEAD metadata");
+		assert_eq!(head.subject.as_str(), "seed");
+		assert_eq!(head.author_name.as_str(), "OMP Test");
+
+		let with_stats = model
+			.load_deferred_stats(&cancel)
+			.await
+			.unwrap()
+			.expect("dirty snapshot receives deferred stats");
+		assert_eq!(with_stats.unstaged[0].additions, Some(1));
+		assert!(model.load_deferred_stats(&cancel).await.unwrap().is_none());
 		assert!(model.refresh(&cancel).await.unwrap().is_none());
+	}
+
+	#[test]
+	fn lfs_pointer_parser_requires_canonical_version_oid_and_size() {
+		let oid = "0123456789abcdef".repeat(4);
+		let pointer = format!("{LFS_VERSION}\r\noid sha256:{oid}\r\nsize 1234\r\n");
+		assert_eq!(
+			parse_lfs_pointer(pointer.as_bytes()),
+			Some(LfsPointer { oid: oid.to_str(), size: 1234 })
+		);
+		assert!(parse_lfs_pointer(format!("{LFS_VERSION}\noid sha256:{oid}\n").as_bytes()).is_none());
+		assert!(
+			parse_lfs_pointer(
+				format!("{LFS_VERSION}\noid sha256:{}\nsize 1\n", oid.to_ascii_uppercase()).as_bytes()
+			)
+			.is_none()
+		);
+	}
+
+	#[tokio::test]
+	async fn staged_media_resolves_local_lfs_object_bytes() {
+		let fixture = tempfile::tempdir().expect("temporary repository");
+		fixture_git(fixture.path(), &["init", "-b", "main"]);
+		fixture_git(fixture.path(), &["config", "user.name", "OMP Test"]);
+		fixture_git(fixture.path(), &["config", "user.email", "omp@example.invalid"]);
+		fs::write(fixture.path().join("seed.txt"), "seed\n").expect("seed file");
+		fixture_git(fixture.path(), &["add", "seed.txt"]);
+		fixture_git(fixture.path(), &["commit", "-m", "seed"]);
+
+		let oid = "0123456789abcdef".repeat(4);
+		let object = b"\x89PNG\r\n\x1a\nlocal-lfs-image";
+		let pointer = format!("{LFS_VERSION}\noid sha256:{oid}\nsize {}\n", object.len());
+		fs::write(fixture.path().join("image.png"), pointer).expect("LFS pointer");
+		fixture_git(fixture.path(), &["add", "image.png"]);
+		let object_dir = fixture
+			.path()
+			.join(".git/lfs/objects")
+			.join(&oid[..2])
+			.join(&oid[2..4]);
+		fs::create_dir_all(&object_dir).expect("LFS object directory");
+		fs::write(object_dir.join(&oid), object).expect("LFS object");
+
+		let cancel = CancellationToken::new();
+		let mut model = GitModel::open(fixture.path(), None, &cancel).await.unwrap();
+		let _ = model.refresh(&cancel).await.unwrap();
+		let contents = model
+			.contents(GitArea::Staged, "image.png", None, &cancel)
+			.await
+			.unwrap();
+		assert_eq!(contents.media, Some(Str::new_static("png")));
+		assert_eq!(contents.new_bytes.as_deref(), Some(&object[..]));
+	}
+
+	#[test]
+	fn media_sniff_classifies_extensions_svg_content_and_binary_headers() {
+		let empty = || LoadedSide { bytes: Bytes::new(), lfs_missing: false };
+		let side = |bytes: &'static [u8]| LoadedSide {
+			bytes:       Bytes::from_static(bytes),
+			lfs_missing: false,
+		};
+		assert_eq!(
+			media_format("art.JPG", &empty(), &side(b"\xff\xd8\xff")),
+			Some(Str::new_static("jpeg"))
+		);
+		assert_eq!(
+			media_format(
+				"art.dat",
+				&empty(),
+				&side(b"<?xml version=\"1.0\"?><SVG viewBox=\"0 0 1 1\">")
+			),
+			Some(Str::new_static("svg"))
+		);
+		assert_eq!(media_format("notes.txt", &empty(), &side(b"plain text")), None);
+		assert!(is_binary(b"plain\0binary"));
+		assert!(!is_binary(b"plain UTF-8 text"));
 	}
 
 	#[test]
