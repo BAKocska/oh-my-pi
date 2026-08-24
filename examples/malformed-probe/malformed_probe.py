@@ -157,42 +157,6 @@ def _surface_absence(
     )
 
 
-def _reserved_parameter_observation(name: str) -> Observation:
-    """Exercise the same metadata extractor used by device registration without mutation."""
-
-    from omp._registry import _extract_arg_specs
-
-    if name == "do_":
-        @dataclass(frozen=True, slots=True)
-        class Reserved:
-            do_: Annotated[str, omp.Field()]
-    else:
-        @dataclass(frozen=True, slots=True)
-        class Reserved:
-            future_: Annotated[str, omp.Field()]
-
-    try:
-        specs = _extract_arg_specs(lambda args, ctx: None, Reserved)
-    except Exception as error:
-        message = str(error)
-        return Observation(
-            f"device declaration reserved {name}",
-            name,
-            "refused",
-            _exception_name(error),
-            message,
-            name in message or "reserved" in message.lower(),
-        )
-    return Observation(
-        f"device declaration reserved {name}",
-        name,
-        "accepted",
-        None,
-        f"derived argument paths: {tuple(spec.path for spec in specs)!r}",
-        False,
-    )
-
-
 def _duration_observation() -> Observation:
     if omp.Duration.__module__ != "_omp":
         return Observation(
@@ -382,13 +346,7 @@ async def _run_probe(
         )
     )
 
-    observations.extend(
-        (
-            _duration_observation(),
-            _reserved_parameter_observation("do_"),
-            _reserved_parameter_observation("future_"),
-        )
-    )
+    observations.append(_duration_observation())
 
     if include_unreachable:
         finalization_cases = (
@@ -513,11 +471,6 @@ async def _run_probe(
         _capture_tml_error(), "at", None
     ) == 6:
         findings.append("TmlError.at counts Unicode code points, not documented UTF-8 bytes")
-    if any(
-        by_boundary[f"device declaration reserved {name}"].disposition == "accepted"
-        for name in ("do_", "future_")
-    ):
-        findings.append("reserved parameter names survive device schema derivation")
     if include_unreachable and (
         not hasattr(omp, "IncomingParams")
         or any(
@@ -608,12 +561,6 @@ def smoke() -> MalformedProbeReport:
     ):
         assert rows[boundary].exception == "omp.ui.ShortcutError"
         assert rows[boundary].names_rule
-
-    for name in ("do_", "future_"):
-        row = rows[f"device declaration reserved {name}"]
-        assert row.exception == "omp.devices.SchemaError"
-        assert name in row.message
-        assert "reserved-name rule" in row.message
 
     for label in (
         "duplicate canonical key",

@@ -8,7 +8,7 @@
 
 One accepted picker result becomes one tuple of `omp.AvailabilityDelta` values and one `await omp.devices.set_availability(*deltas)` call. It never unregisters or re-registers tools. Core therefore owns the atomic transition, journal item, catalog notice, and `TurnBoundary` delivery; `Immediate` is specifically forbidden because a catalog change must not preempt a running call (`docs/py/01-devices.md` §“Availability transitions” and §“one notification, and no gate at all”, lines 2058–2099). The complete selected-path snapshot is appended to SESSION-scoped `omp.state` and restored on `extension_activate`.
 
-Each row makes the cost asymmetry explicit. A granted schema-slot tool shows the catalog's schema byte and token counts. A `dyn` device shows `0 B · 0 tokens`: catalog and docs are content read on demand, not a model-facing request schema (`docs/py/01-devices.md` §Purpose, lines 61–78, and §`dyn`, lines 1145–1164). This asymmetry is the lesson, not a display shortcut.
+Each row makes the cost asymmetry explicit. A granted schema-slot tool shows the catalog's schema byte and token counts. An `xd` device shows `0 B · 0 tokens`: catalog and docs are content read on demand, not a model-facing request schema (`docs/py/01-devices.md` §Purpose and §“The `xd` shell builtin”). This asymmetry is the lesson, not a display shortcut.
 
 The overlay also states the accounting caveat from `docs/py/08-context.md` open question 5, lines 2091–2102: an availability change's notice is a message-list item, but whether its cost should also be exposed as `catalog_notice_tokens` remains unresolved. The picker therefore reports catalog schema cost only and does not invent that fourth counter.
 

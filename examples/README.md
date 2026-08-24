@@ -18,7 +18,7 @@ distance.
 | `bash-guard/` | `@shinynito/pi-menshen` | BashIR REVIEW, classifier ladder, circuit breaker | `docs/py/05 §4.4`, `docs/py/06` |
 | `goal-loop/` | `@narumitw/pi-goal` | Session `@omp.regime` at SETTLE: `ctx` effects + `next_` control, typed state, explicit start | `docs/py/15`, `docs/py/12` |
 | `regime-retry/` | — | Bounded session regime with durable state, `on_limit`, retry control, and exclusive tool selection | `docs/py/15` |
-| `mcp-devices/` | `pi-mcp-adapter` | MCP servers mounted as `dyn` devices | `docs/py/01` |
+| `mcp-devices/` | `pi-mcp-adapter` | MCP servers mounted as devices behind the `xd` shell builtin | `docs/py/01` |
 | `edit-dialect/` | `pi-hashline-edit-pro` | second edit dialect `family@rev`, `lift()` | `docs/py/01`, `docs/py/02 §3` |
 | `web-fetch/` | `@mrclrchtr/supi-web` | fetch device, spill → `BlobRef` | `docs/py/02 §1` |
 | `code-intel/` | `@mrclrchtr/supi-code-intelligence` | LSP over `omp.env` docs, `place="env"` fan-out | `docs/py/02 §2`, `docs/py/11 §1`, `docs/py/04 §3` |
@@ -40,7 +40,7 @@ distance.
 | `ghost-suggestions/` | `@mrclrchtr/supi-prompt-suggestions` | declarative completions + ghost hints | `docs/py/07 §5.4` |
 | `model-fallback/` | `pi-model-fallback` | `provider_error` → typed `Failover`, core cooldowns, declared chains | `docs/py/13` |
 | `intercom/` | `pi-intercom` | `omp.agents` messaging + `@omp.service` RPC, broker deleted | `docs/py/11 §3`, `docs/py/12` |
-| `computer-use/` | `@amaster.ai/pi-computer-use` | 49 tools → one device, `dyn` sub-paths, streaming `Update`, driver worker | `docs/py/00 §2`, `docs/py/01` |
+| `computer-use/` | `@amaster.ai/pi-computer-use` | 49 tools → one device, `xd` sub-paths, streaming `Update`, driver worker | `docs/py/00 §2`, `docs/py/01` |
 | `sidebar/` | `@esso0428/pi-sidebar` | rail slot, min-size/collapse, keyed patches, user-owned layout | `docs/py/07 §5.3` |
 | `prompt-manager/` | `@sreetej510/pi-prompt-manager` | commands + arg ghosts, `Prompt(submit=False)` composer | `docs/py/07 §4.15` |
 | `discovery-lmstudio/` | `pi-lmstudio` | `DiscoverySpec`, authoritative-absence merge, zero churn | `docs/py/13 §2` |
@@ -90,7 +90,7 @@ distance.
 | `study-commits/` | `@anthnykr/pi-study-commits` | overlay multi-select, single bounded injection, spill fallback | `docs/py/07`, `docs/py/12` |
 | `auto-thinking/` | `@narumitw/pi-auto-thinking` | thinking patch (ruling landed), classifier ladder + heuristic fallback | `docs/py/05 §3.3`, `docs/py/12` |
 | `llama-switch/` | `pi-llama-switch` | named-process argv switch, generation fencing, availability flips | `docs/py/11`, `docs/py/13` |
-| `tool-search/` | `pi-tool-search` | `dyn` subsumes discovery; allowlisted availability promotion | `docs/py/01` |
+| `tool-search/` | `pi-tool-search` | `xd` supplies device discovery; allowlisted availability promotion | `docs/py/01` |
 | `github-tools/` | `@amitkot/pi-safe-github` | one zero-slot device, typed sub-paths, creds + approval-gated writes | `docs/py/01`, `docs/py/11` |
 | `shell-hooks/` | `@hsingjui/pi-hooks` | config-driven event→shell hooks, OBSERVE default, opt-in gating | `docs/py/05` |
 | `script-tools/` | `@isr4el-silv4/pi-script-tools` | dynamic mount from workspace scan, header-parsed args, rescan refresh | `docs/py/01`, `docs/py/11` |
@@ -284,7 +284,7 @@ the first inverse divergences (frozen ahead of docs). The
 | No extension-visible merged-catalog read (`models()`/`ModelCard`/WatchModels documented, no frozen Python reader; `ProviderHandle.models()` is declaration-scoped) | `auto-thinking/` | `provider.py:980-1060` |
 | Telemetry: `ModelRequest` lacks `latency_ms`/`ttft_ms`/`degraded`/content fields; `coalesce_key` validated then discarded (registry has no field); `PromptFingerprint.slots` lack byte sizes/bands | `pulse/`, `dev-inspector/` | `telemetry.py:108-183`, `_registry.py:184-195` |
 | Provider: `SpecError` missing; duplicate `ModelSpec.id` not rejected in `__post_init__`; bare class-(a) `provider(spec)` call doesn't register; `PromptCacheCaps`/`CacheRetention` naming divergence; `SpeechCaps`/`AudioFormat`/`TranscriptionCaps` absent (`ModelSpec` fields `object`); `ProviderHandle.request` image-only despite SPEAK/TRANSCRIBE shared-machinery docs; `completion` has no image-part input contract | `provider-pack/`, `speech-providers/`, `vision-describe/` | `provider.py`, `agents.py:155-167` |
-| Devices: `Device.subtool` returns `ToolPath` vs documented child-device decorator (blocks publishing `dyn invoke/github/pr/list` addresses); `devices.list` async vs docs sync; `HARD_SLOT_BUDGET` absent | `github-tools/`, `tool-search/` | `devices.py:290-296,368-415` |
+| Devices: `Device.subtool` returns `ToolPath` vs documented child-device decorator (blocks publishing `github/pr/list` addresses for `xd github/pr/list …`); `devices.list` async vs docs sync; `HARD_SLOT_BUDGET` absent | `github-tools/`, `tool-search/` | `devices.py:290-296,368-415` |
 | UI: `MessageView` missing (renderer takes `object`); message-renderer purity contradiction for pending→cached rewrites (no sanctioned presentation-cache/invalidation); no renderer decoration/augmentation mode though 01 sanctions it; `<diff>` `context` prop unread in TUI props | `legible/`, `grep-heatmap/`, `git-changes/` | `ui/__init__.py:666-720`, `crates/tui/src/props.rs` |
 | env: `Process.restart()` absent (stop+ensure works); `Process` ops dispatch by name without generation fencing despite the contract; `Run.stdin` vs frozen `write`/`eof` | `llama-switch/`, `shell-hooks/` | `env.py:742-748,1033-1077` |
 **Resolved 2026-08-20:** All Round 5 clusters closed. Docs moved to frozen
@@ -452,10 +452,9 @@ drop), recorded in `patch-conflict/README.md`.
 | 9 | **`WorkerHandle.call` drops its generation** and wraps stale-generation as `WorkerUnavailable` instead of `StaleGeneration` | `fencing-probe/` | `placement.py:134-150,213-218` |
 | 10 | **Manifest drift never checked at FREEZE** — `_manifest_tools`/`_hooks`/`_services` are written and never read; `DeclarationDrift` is dead code | declaration audit | `_registry.py:372-375,780-841` |
 | 11 | **Executable declaration rows cannot be ingested** — `configure_manifest(declarations=)` decodes every row as `ContentDeclaration` (4 content kinds), so command/renderer/completion rows in real manifests never reach the registry | declaration audit | `_registry.py:337-375` |
-| 12 | **Reserved parameter names survive** — `do_` and trailing-underscore params pass schema derivation instead of raising activation-time `SchemaError` | `malformed-probe/` | `_registry.py:1071-1119` |
-| 13 | **`omp.ui.__all__` leaks imports** — `Any`, `Callable`, `ContextVar`, `MappingProxyType`, `dataclass`, `field`, `annotations` are public exports | symbol audit | `ui/__init__.py` |
-| 14 | **No activation-trigger class is ever set** — no Definition record or snapshot carries `trigger`; static/lazy/eager-prompt/eager-ui are all absent in practice. Three kinds are also recorded but absent from `DeclarationSnapshot` | declaration audit | `_registry.py:83-255` |
-| 15 | **`TmlError.at` is a code-point offset, not the documented byte offset** | `malformed-probe/` | `ui/__init__.py:102-130` |
+| 12 | **`omp.ui.__all__` leaks imports** — `Any`, `Callable`, `ContextVar`, `MappingProxyType`, `dataclass`, `field`, `annotations` are public exports | symbol audit | `ui/__init__.py` |
+| 13 | **No activation-trigger class is ever set** — no Definition record or snapshot carries `trigger`; static/lazy/eager-prompt/eager-ui are all absent in practice. Three kinds are also recorded but absent from `DeclarationSnapshot` | declaration audit | `_registry.py:83-255` |
+| 14 | **`TmlError.at` is a code-point offset, not the documented byte offset** | `malformed-probe/` | `ui/__init__.py:102-130` |
 
 ### Surface drift, measured exhaustively
 

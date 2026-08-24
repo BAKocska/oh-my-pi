@@ -4,7 +4,7 @@ There is no pi origin. This is a mechanical two-claimant conformance probe for c
 
 | Collision class | Documented resolution | Re-observed current result |
 |---|---|---|
-| Two device claimants, ordered precedence | The core registry chooses the highest-precedence live claimant, retains qualified shadows, and hides losers from `dyn`; frozen Python enforces intra-extension claims only | Conforms to the 2026-08-20 ruling: one frozen registry retains both local declarations, while separately configured registries deliberately have no merge/resolution operation |
+| Two device claimants, ordered precedence | The core registry chooses the highest-precedence live claimant, retains qualified shadows, and hides losers from the device catalog behind `xd`; frozen Python enforces intra-extension claims only | Conforms to the 2026-08-20 ruling: one frozen registry retains both local declarations, while separately configured registries deliberately have no merge/resolution operation |
 | Two device claimants, equal precedence | Frozen Python raises `PrecedenceConflict` naming both claimant keys and the source package | Conforms: the message identifies both local claimant keys as owned by `publisher-a/extension-a` and says honestly that claimants from another extension are outside this process |
 | Core name above `Precedence.CORE` | `DeviceNameError` at load | Conforms: `DeviceNameError` is raised before decoration |
 | Two renderers for one `(name, family, rev)` | `DuplicateRenderer` at import, naming the incumbent holder and second claimant | Conforms: `DuplicateRenderer` subclasses `DuplicateRegistration` and names `_render_one` and `_render_two` |

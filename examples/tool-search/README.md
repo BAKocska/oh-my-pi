@@ -6,13 +6,13 @@
 
 | Origin mechanism | Harness replacement |
 |---|---|
-| Manifest-aware `tool_search` | The fixed `dyn` surface already provides `search`, `docs/<path>`, and `invoke/<path>`. |
-| Hidden tools loaded into model slots on demand | Soft devices stay host-registered in the `dyn` catalog and consume zero model-facing schema slots. |
+| Manifest-aware `tool_search` | The `xd` shell builtin already provides catalog listing and search (`xd`, `xd --q <text>`), docs (`xd <path> --help`), and invocation (`xd <path> [args…]`). |
+| Hidden tools loaded into model slots on demand | Soft devices stay host-registered in the device catalog behind `xd` and consume zero model-facing schema slots. |
 | `setActiveTools`-style enable/disable | `omp.devices.set_availability(AvailabilityDelta(...))` emits availability notices without changing the request tool array. |
 
 ## The omp shape
 
-The searchable, low-context premise is built into the harness: `dyn` owns catalog search, detailed docs, and invocation, while catalog reads remain content rather than request schema ([Devices — Purpose and the three ops](../../docs/py/01-devices.md#purpose)). There is therefore no second search tool in this port.
+The searchable, low-context premise is built into the harness: the `xd` shell builtin owns catalog search, detailed docs, and invocation, while catalog reads remain content rather than request schema ([Devices — Purpose and transport](../../docs/py/01-devices.md#purpose)). There is therefore no second search tool in this port.
 
 `tool_enable` and `tool_disable` are soft devices that accept one path from the comma-separated `[settings.allowlist]`. They inspect the session catalog and lower accepted changes to a single `omp.AvailabilityDelta`; the host delivers that transition as an availability notice at `TurnBoundary`. The advertised tool array remains byte-identical across these changes ([Devices — Availability is a notification, not a re-registration](../../docs/py/01-devices.md#availability-is-a-notification-not-a-re-registration)).
 
@@ -25,7 +25,7 @@ Configure a bounded set explicitly, for example:
 allowlist = "repo_search,issue_lookup"
 ```
 
-Then invoke `tool_enable` or `tool_disable` through `dyn`; neither device registers, unregisters, or rewrites any target tool schema.
+Then invoke `tool_enable` or `tool_disable` with `xd tool_enable <path>` or `xd tool_disable <path>` in the shell; neither device registers, unregisters, or rewrites any target tool schema.
 
 ## Gaps
 

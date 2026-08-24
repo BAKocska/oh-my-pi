@@ -10,7 +10,7 @@ The landed `Ok` is immutable. A `tool_result` hook may not write `prompt`, `text
 
 The replacement separates the three jobs:
 
-- `code_map` is a soft device the model calls explicitly through `dyn`. It returns typed `CodeMapResult` and `HeatedFile` values. The SQLite database under `await omp.state_dir()` is only a rebuildable index, matching `docs/py/09-journal.md` §`omp.state_dir` (lines 1230–1233); source remains authoritative.
+- `code_map` is a soft device the model calls explicitly by running `xd code_map …` in the shell. It returns typed `CodeMapResult` and `HeatedFile` values. The SQLite database under `await omp.state_dir()` is only a rebuildable index, matching `docs/py/09-journal.md` §`omp.state_dir` (lines 1230–1233); source remains authoritative.
 - The `tool_result` OBSERVE hook refreshes the indexed document only after a native `edit` has settled as `Ok`. It also fold-syncs a small immutable heat annotation for a settled native grep call. It returns `None`, never injects a message, and is off the decision path as required by `docs/py/05-hooks.md` lines 704–708.
 - `render_grep_augmentation` is the pure presentation suffix: it uses only `view.call_id`, the verdict arm, and the cached annotation, and emits TML without inspecting verdict payload parts. It is intentionally not registered as the one exact grep renderer because that would replace/race with the native renderer rather than augment it.
 

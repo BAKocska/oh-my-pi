@@ -293,8 +293,8 @@ async def activate(event: omp.ExtensionActivateEvent, ctx: omp.Context) -> None:
         Spawn(
             SubagentSpec(
                 task=(
-                    "Push the settings snapshot now by invoking "
-                    "dyn with do_='invoke/settings_sync_push'."
+                    "Push the settings snapshot now by running "
+                    "`xd settings_sync_push` in the shell."
                 ),
                 name="SettingsSyncPush",
                 allowed_devices=frozenset({"settings_sync_push"}),

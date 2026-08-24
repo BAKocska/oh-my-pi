@@ -181,18 +181,18 @@ def _catalog_paths() -> frozenset[str]:
     return frozenset(str(row.path) for row in omp.devices.list(mounted_only=True))
 
 
-async def _invoke_dyn(
+async def _invoke_device(
     device: str, args: Mapping[str, object], ctx: omp.Context
 ) -> object:
     del device, args, ctx
-    raise omp.NotWiredError("omp.dyn.invoke")
+    raise omp.NotWiredError("omp.devices.invoke")
 
 
 async def _execute(
     args: ComposeArgs,
     ctx: omp.Context,
     *,
-    invoke: _Invoke = _invoke_dyn,
+    invoke: _Invoke = _invoke_device,
     catalog: frozenset[str] | None = None,
 ) -> ComposeResult:
     allowed = _allowed_devices(ctx.settings)

@@ -6,7 +6,7 @@
 
 ## The omp shape
 
-The provider wire is class (a): one `ProviderSpec` declares an `OPENAI_MEDIA` route and separate model catalog entries for `Operation.SPEAK` and `Operation.TRANSCRIBE`, sharing brokered credentials as specified by `docs/py/13-inference.md:96-109` and the media codec at `:492-513`. The two soft devices remain behind `dyn`: `speak` maps text to an `omp.BlobPart` whose `omp.Spill` carries an `audio/*` media type, while `transcribe` accepts only an `omp.EnvPath` or `omp.BlobRef` and returns typed timestamped segments. Audio is never rendered as base64 prose; this follows the blob-backed media rule in `docs/py/02-verdicts.md:632-653`.
+The provider wire is class (a): one `ProviderSpec` declares an `OPENAI_MEDIA` route and separate model catalog entries for `Operation.SPEAK` and `Operation.TRANSCRIBE`, sharing brokered credentials as specified by `docs/py/13-inference.md:96-109` and the media codec at `:492-513`. The two soft devices remain behind the `xd` shell builtin: `speak` maps text to an `omp.BlobPart` whose `omp.Spill` carries an `audio/*` media type, while `transcribe` accepts only an `omp.EnvPath` or `omp.BlobRef` and returns typed timestamped segments. Audio is never rendered as base64 prose; this follows the blob-backed media rule in `docs/py/02-verdicts.md:632-653`.
 
 The response parsers are deliberately small class (b) Python. This applies the resolved SEARCH-seam precedent at `docs/py/13-inference.md:2540-2547`: refusing a declarative response-shape DSL keeps endpoint, operation, authentication, and codec selection declarative while response interpretation stays ordinary reviewable code.
 

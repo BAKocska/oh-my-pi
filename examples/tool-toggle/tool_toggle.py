@@ -93,7 +93,7 @@ def _context_cost(row: CatalogRow) -> str:
     """Price schema slots while making schema-free devices visibly free."""
 
     if not row.slotted:
-        return "0 B · 0 tokens · dyn device"
+        return "0 B · 0 tokens · xd device"
     return f"{row.schema_bytes} B · {row.schema_tokens} tokens · schema slot"
 
 

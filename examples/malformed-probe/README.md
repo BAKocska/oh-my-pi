@@ -33,8 +33,6 @@ This adversarial conformance probe feeds malformed values to pure extension-owne
 | Shortcut empty key | `ctrl+` | Refused with `omp.ui.ShortcutError`; message names the malformed chord |
 | Shortcut duplicate modifier | `ctrl+ctrl+x` | Refused with `omp.ui.ShortcutError`; message names the malformed chord |
 | Shortcut unknown modifier | `hyper+x` | Refused with `omp.ui.ShortcutError`; message names the malformed chord |
-| Reserved parameter | `do_` | Refused with `omp.devices.SchemaError` naming `do_` and the reserved-name rule |
-| Reserved parameter | `future_` | Refused with `omp.devices.SchemaError` naming `future_` and the trailing-underscore rule |
 
 ## Closure records
 
@@ -42,16 +40,14 @@ This adversarial conformance probe feeds malformed values to pure extension-owne
 
 2. **Argument-finalizer surface — closed.** The defect was the absence of the exported typed family, which made every extension-visible finalization outcome untestable. `crates/py/python/omp/params.py:34-108` implements `ArgIssueKind`, `ArgIssue`, and `ArgFault`; `crates/py/python/omp/params.py:263-291` implements repair records; `crates/py/python/omp/params.py:410-623` implements `IncomingParams`; and `crates/py/python/omp/__init__.py:716-750,1662` exports the family. Re-observation shows ambiguous and type-mismatch envelopes become path-addressed `ArgFault`s, while coercion produces the typed value and a retained `Repair`.
 
-3. **Reserved device parameter names — closed.** The defect was that schema extraction accepted `do_` and trailing-underscore names. `crates/py/python/omp/_registry.py:1626-1634` now rejects either form with `SchemaError` before registration. Both specimens are refused and their messages name the offending parameter and rule.
+3. **Strict journal surface — closed.** The defect was that `UnknownEntryKind`, `EntryUndecodable`, and `journal.decode` were missing. They now exist at `crates/py/python/omp/journal.py:79-132,183-207` and are publicly exported. Canonical `{"count":"wrong"}` re-decodes unchanged. The earlier probe expectation that `decode` validates an application payload schema was wrong: the recorded Revision 2 contract at `docs/py/09-journal.md:445-461` defines strictness as exact canonical-byte decoding into plain Python values.
 
-4. **Strict journal surface — closed.** The defect was that `UnknownEntryKind`, `EntryUndecodable`, and `journal.decode` were missing. They now exist at `crates/py/python/omp/journal.py:79-132,183-207` and are publicly exported. Canonical `{"count":"wrong"}` re-decodes unchanged. The earlier probe expectation that `decode` validates an application payload schema was wrong: the recorded Revision 2 contract at `docs/py/09-journal.md:445-461` defines strictness as exact canonical-byte decoding into plain Python values.
+4. **Duration classification — probe expectation corrected, no product defect.** The old finding conflated direct value construction with manifest admission. `docs/py/00-overview.md:716-727` assigns `ManifestError` to an unparseable config value at ADMIT; direct `Duration(...)` remains a value constructor, whose malformed string branch maps to `ValueError` at `crates/py/src/bindings.rs:159-166`. No exception suppression or probe weakening is involved.
 
-5. **Duration classification — probe expectation corrected, no product defect.** The old finding conflated direct value construction with manifest admission. `docs/py/00-overview.md:716-727` assigns `ManifestError` to an unparseable config value at ADMIT; direct `Duration(...)` remains a value constructor, whose malformed string branch maps to `ValueError` at `crates/py/src/bindings.rs:159-166`. No exception suppression or probe weakening is involved.
-
-6. **Top-level extra-key classification — probe expectation corrected.** The old row called a top-level `extra` member a closed-schema violation. The recorded strict-finalization rule at `docs/py/03-params.md:444-445` explicitly tolerates and preserves unknown top-level members; `additional_properties=True` governs declared dict-shaped fields (`docs/py/03-params.md:474-480`). The row now asserts preservation instead of a refusal.
+5. **Top-level extra-key classification — probe expectation corrected.** The old row called a top-level `extra` member a closed-schema violation. The recorded strict-finalization rule at `docs/py/03-params.md:444-445` explicitly tolerates and preserves unknown top-level members; `additional_properties=True` governs declared dict-shaped fields (`docs/py/03-params.md:474-480`). The row now asserts preservation instead of a refusal.
 
 ## Smoke
 
-The smoke asserts every locally reachable refusal, the exact TML ceilings and UTF-8 byte offset, typed finalizer-envelope handling and repair retention, canonical journal decode, reserved-name activation failures, selectors, shortcuts, and control stripping. The URL vocabulary, native `Duration`, journal append, and production finalizer parser remain host/native-owned under the mandated no-I/O example harness and are labeled host-only rather than mocked as local execution.
+The smoke asserts every locally reachable refusal, the exact TML ceilings and UTF-8 byte offset, typed finalizer-envelope handling and repair retention, canonical journal decode, selectors, shortcuts, and control stripping. The URL vocabulary, native `Duration`, journal append, and production finalizer parser remain host/native-owned under the mandated no-I/O example harness and are labeled host-only rather than mocked as local execution.
 
 **Still-open findings: none.**

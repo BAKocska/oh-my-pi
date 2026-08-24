@@ -19,7 +19,7 @@ I  = F(J')
 
 `J'` is durable journal truth; `I` is `vectors.db`, a replaceable index under `state_dir()`. If the worker crashes during `F`, the call's effects are unknown at the placement boundary, but `J'` is unchanged. The supervisor respawns generation `g + 1`, and activation or the next put/query replays the complete journal and assigns `I := F(J')` transactionally. The session never shares the worker's crash fate, and deleting `vectors.db` loses no memory.
 
-The hash embedder is deterministic and downloads no model. It exists only to make put, query, crash recovery, and rebuild executable as an example; it is not presented as a semantic embedding model. The tools remain discoverable only through `dyn`.
+The hash embedder is deterministic and downloads no model. It exists only to make put, query, crash recovery, and rebuild executable as an example; it is not presented as a semantic embedding model. The tools remain discoverable only through the `xd` shell builtin.
 
 ## Gaps
 

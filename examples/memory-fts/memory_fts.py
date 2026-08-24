@@ -248,9 +248,9 @@ def profile_and_standing(ctx: PromptContext) -> str:
 
     del ctx
     blocks = [
-        "Durable memory is available through dyn: fetch `docs/memory_search`, then call "
-        "`invoke/memory_search`. Consult it before asking the user to repeat a decision; "
-        "current instructions always win."
+        "Durable memory is available through the `xd` builtin: run "
+        "`xd memory_search --help`, then `xd memory_search …`. Consult it before asking "
+        "the user to repeat a decision; current instructions always win."
     ]
     if _profile_snapshot:
         blocks.append("User profile:\n" + "\n".join(f"- {item}" for item in _profile_snapshot))

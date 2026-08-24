@@ -4,7 +4,7 @@
 
 ## The omp shape
 
-This port declares `edit@hlx.1` as a soft, environment-placed dialect beside core `edit@hl.1`; it never calls `setActiveTools`, disables the core tool, or captures `edit` by registration order. That machinery is deleted because `family`/`rev` identify both dialects durably and `caps.dialect` selects the projection appropriate to the live model, while soft intent keeps the extension behind the core `dyn` dispatcher rather than taking another schema slot (`docs/py/01-devices.md` §“pi-hashline-edit-pro → a second dialect, not a deleted tool”; `docs/py/02-verdicts.md` §3).
+This port declares `edit@hlx.1` as a soft, environment-placed dialect beside core `edit@hl.1`; it never calls `setActiveTools`, disables the core tool, or captures `edit` by registration order. That machinery is deleted because `family`/`rev` identify both dialects durably and `caps.dialect` selects the projection appropriate to the live model, while soft intent keeps the extension behind the `xd` builtin inside the core `shell` tool rather than taking another schema slot (`docs/py/01-devices.md` §“pi-hashline-edit-pro → a second dialect, not a deleted tool”; `docs/py/02-verdicts.md` §3).
 
 The `hl.1` lift deterministically rewrites the old `{“input”: ...}` argument bytes as canonical `{“patch”: ...}` bytes and retains the dialect-neutral verdict bytes exactly. Execution opens one `omp.env.docs` lease and commits through `Doc.hashline`, so the mutation uses the document authority's pinned revision and compare-and-swap path instead of private hash state or direct filesystem writes (`docs/py/11-env.md` §Document leases).
 
