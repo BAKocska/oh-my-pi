@@ -224,6 +224,47 @@ fn convert_legacy(document: &mut toml::Table, record: &mut MigrationRecord) -> O
 	move_key(document, "queueMode", "steering_mode", record);
 	move_key(document, "defaultModel", "default_model", record);
 	move_key(document, "worktreeDir", "worktree.base", record);
+	if let Some(legacy) = take_path(document, "features.unexpectedStopDetection") {
+		let mode = match legacy {
+			toml::Value::Boolean(true) => Some("smart"),
+			toml::Value::Boolean(false) => Some("none"),
+			toml::Value::String(mode)
+				if matches!(mode.as_str(), "none" | "mechanical" | "smart") =>
+			{
+				set_dotted(
+					document,
+					"interaction.unexpectedStopDetection",
+					toml::Value::String(mode),
+				);
+				converted(
+					record,
+					"features.unexpectedStopDetection",
+					"interaction.unexpectedStopDetection",
+				);
+				None
+			},
+			_ => {
+				dropped(
+					record,
+					"features.unexpectedStopDetection",
+					"unexpected-stop mode was invalid",
+				);
+				None
+			},
+		};
+		if let Some(mode) = mode {
+			set_dotted(
+				document,
+				"interaction.unexpectedStopDetection",
+				toml::Value::String(mode.to_owned()),
+			);
+			converted(
+				record,
+				"features.unexpectedStopDetection",
+				"interaction.unexpectedStopDetection",
+			);
+		}
+	}
 	for (old, new) in [
 		("async.maxJobs", "async.max_jobs"),
 		("async.pollWaitDuration", "async.poll_wait_duration"),
