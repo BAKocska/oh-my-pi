@@ -238,10 +238,12 @@ export class MnemopiSessionState {
 	readonly aliasOf?: MnemopiSessionState;
 	private readonly scoped: MnemopiScopedResources;
 	lastRetainedTurn: number;
+	lastConsolidatedTurn: number;
 	hasRecalledForFirstTurn: boolean;
 	lastRecallSnippet?: string;
 	unsubscribe?: () => void;
 	#retentionCursorLoaded = false;
+	#consolidating = false;
 
 	constructor(options: MnemopiSessionStateOptions) {
 		this.sessionId = options.sessionId;
@@ -249,6 +251,7 @@ export class MnemopiSessionState {
 		this.session = options.session;
 		this.aliasOf = options.aliasOf;
 		this.lastRetainedTurn = options.lastRetainedTurn ?? 0;
+		this.lastConsolidatedTurn = 0;
 		this.hasRecalledForFirstTurn = options.hasRecalledForFirstTurn ?? false;
 		this.scoped = options.aliasOf?.scoped ?? createScopedResources(options.config);
 		this.memory = this.scoped.retain.memory;
@@ -259,11 +262,13 @@ export class MnemopiSessionState {
 		if (this.sessionId === sessionId) return;
 		this.sessionId = sessionId;
 		this.lastRetainedTurn = 0;
+		this.lastConsolidatedTurn = 0;
 		this.#retentionCursorLoaded = false;
 	}
 
 	resetConversationTracking(): void {
 		this.lastRetainedTurn = 0;
+		this.lastConsolidatedTurn = 0;
 		this.#retentionCursorLoaded = false;
 		this.hasRecalledForFirstTurn = false;
 		this.lastRecallSnippet = undefined;
@@ -507,6 +512,53 @@ export class MnemopiSessionState {
 		this.lastRetainedTurn = userTurns;
 	}
 
+	/**
+	 * Periodic in-session counterpart to {@link maybeRetainOnAgentEnd}: once
+	 * every `consolidateEveryNTurns` user turns, run the same
+	 * {@link consolidate} pass `/memory enqueue` uses (backend.ts `enqueue`),
+	 * scoped to just the current session's own working memory (`full: false`,
+	 * i.e. `memory.sleep()` not `sleepAllSessions()`) so it never touches a
+	 * concurrent session's bank. Reuses the retain turn-accounting shape via
+	 * {@link lastConsolidatedTurn} rather than inventing a parallel cursor.
+	 *
+	 * `consolidateEveryNTurns <= 0` (including an unset/non-numeric config,
+	 * which the `> 0` form treats as disabled) is a no-op, and so is any
+	 * aliased subagent state (`aliasOf`), matching how
+	 * {@link maybeRetainOnAgentEnd} defers subagent turn-counting to the
+	 * parent. `extract: false` mirrors {@link dispose}'s shutdown pass: the
+	 * retain step inside `consolidate()` only has anything to do here when
+	 * `autoRetain` is off or lagging, and a best-effort background pass
+	 * should not add a fresh LLM extraction round-trip. Actual eligibility
+	 * for promotion out of working memory is unchanged — only rows older
+	 * than half the working-memory TTL are ever picked up (see
+	 * `eligibleWorkingRows` in `beam/consolidate.ts`) — so most firings are
+	 * cheap no-ops; `#consolidating` keeps overlapping firings from racing,
+	 * and running BEFORE `maybeRetainOnAgentEnd` (see `attachSessionListeners`,
+	 * D7) keeps this pass's own `forceRetainCurrentSession()` call — which is
+	 * itself a `remember()` and would otherwise trigger `trimWorkingMemory()`
+	 * ahead of the sleep this same pass just ran — from racing a promotion it
+	 * hasn't made yet; `maybeRetainOnAgentEnd`'s subsequent run just no-ops
+	 * against the now-advanced `lastRetainedTurn` cursor.
+	 */
+	async maybeConsolidateOnAgentEnd(): Promise<void> {
+		if (!(this.config.consolidateEveryNTurns > 0) || this.aliasOf || this.#consolidating) return;
+		const flat = extractMessages(this.session.sessionManager);
+		const userTurns = flat.filter(message => message.role === "user").length;
+		if (userTurns - this.lastConsolidatedTurn < this.config.consolidateEveryNTurns) return;
+		this.lastConsolidatedTurn = userTurns;
+		this.#consolidating = true;
+		try {
+			await this.consolidate({ full: false, extract: false, sleep: true });
+		} catch (error) {
+			logger.warn("Mnemopi: periodic consolidation failed.", {
+				bank: this.config.bank,
+				error: toError(error).message,
+			});
+		} finally {
+			this.#consolidating = false;
+		}
+	}
+
 	async forceRetainCurrentSession(options: { extract?: boolean } = {}): Promise<void> {
 		if (this.aliasOf) return;
 		const flat = extractMessages(this.session.sessionManager);
@@ -582,9 +634,26 @@ export class MnemopiSessionState {
 					);
 				});
 			} else if (event.type === "agent_end") {
-				void this.maybeRetainOnAgentEnd(event.messages).catch(error => {
-					this.#logLifecycleFailure("agent_end retention", [this.scoped.retain.bank], error);
-				});
+				// D7: consolidation (sleep) runs before retention so a fresh
+				// forceRetainCurrentSession() trim can never run ahead of this
+				// turn's promotion pass. maybeConsolidateOnAgentEnd() already
+				// catches its own errors internally (see its try/catch), so it
+				// never rejects and this leg's `.catch()` below is defense in
+				// depth only — the chain always reaches maybeRetainOnAgentEnd()
+				// next regardless of consolidation's outcome. That leg is itself
+				// gated on `autoRetain` and no-ops when it is off, so it is NOT
+				// what guarantees this turn's transcript survives a
+				// consolidation failure; that guarantee lives inside
+				// consolidate() itself (see its docblock), which force-retains
+				// even after a sleep failure regardless of `autoRetain`.
+				void this.maybeConsolidateOnAgentEnd()
+					.catch(error => {
+						this.#logLifecycleFailure("agent_end consolidation", [this.config.bank], error);
+					})
+					.then(() => this.maybeRetainOnAgentEnd(event.messages))
+					.catch(error => {
+						this.#logLifecycleFailure("agent_end retention", [this.scoped.retain.bank], error);
+					});
 			}
 		});
 	}
@@ -629,6 +698,17 @@ export class MnemopiSessionState {
 	 * `/memory enqueue` path requests full cross-session consolidation; disposal
 	 * composes the lighter retain-and-flush path with closing the DB handles.
 	 *
+	 * Sleep runs BEFORE {@link forceRetainCurrentSession} (D7): the retain
+	 * step is itself a `remember()`, which triggers `trimWorkingMemory` on
+	 * the same bank. Retaining first would let that trim run before this same
+	 * call's `sleep()` ever got a chance to promote older rows to episodic —
+	 * exactly the ordering that let un-consolidated working memory get
+	 * deleted instead of promoted. Running sleep first is safe for the
+	 * transcript this call is about to retain: consolidation only ever
+	 * considers working rows older than half the working-memory TTL (12h by
+	 * default — see `eligibleWorkingRows` in `beam/consolidate.ts`), so it
+	 * never reaches back far enough to need the turn that just ended.
+	 *
 	 * Aliased subagent states share `scoped` (and therefore the actual SQLite
 	 * banks) with their parent. `consolidate()` deliberately does NOT
 	 * short-circuit on `aliasOf`: `forceRetainCurrentSession` already guards
@@ -637,6 +717,17 @@ export class MnemopiSessionState {
 	 * otherwise enqueue would report success while leaving the subagent's
 	 * retained memories unconsolidated until a later full consolidation request
 	 * (PR #2327 review).
+	 *
+	 * A throw from the flush/sleep loop below must not cost this turn's
+	 * transcript (issue B3): the loop is wrapped in its own try/catch so a
+	 * failure is captured, logged with the same `logger.warn` +
+	 * `toError(error).message` shape used elsewhere in this class, and only
+	 * rethrown after {@link forceRetainCurrentSession} has been attempted.
+	 * Every current caller of `consolidate()` (this class's own
+	 * `maybeConsolidateOnAgentEnd` and `dispose`, plus the `/memory enqueue`
+	 * backend path) already wraps its call in a catch, so rethrowing — rather
+	 * than swallowing — keeps the failure visible to those callers instead of
+	 * silently reporting success.
 	 *
 	 * @param options.full - When true, run `sleepAllSessions` on every owned bank
 	 *  (the full cross-session consolidation used by `/memory enqueue`). When
@@ -650,16 +741,26 @@ export class MnemopiSessionState {
 	 *  so `dispose` does not block on a fresh LLM round-trip.
 	 */
 	async consolidate(options: { full?: boolean; extract?: boolean; sleep?: boolean } = {}): Promise<void> {
-		await this.forceRetainCurrentSession({ extract: options.extract });
-		for (const memory of this.scoped.owned) {
-			await memory.flushExtractions();
-			if (options.sleep === false) continue;
-			if (options.full) {
-				memory.sleepAllSessions(false);
-			} else {
-				memory.sleep(false);
+		let sleepFailure: Error | undefined;
+		try {
+			for (const memory of this.scoped.owned) {
+				await memory.flushExtractions();
+				if (options.sleep === false) continue;
+				if (options.full) {
+					memory.sleepAllSessions(false);
+				} else {
+					memory.sleep(false);
+				}
 			}
+		} catch (error) {
+			sleepFailure = toError(error);
+			logger.warn("Mnemopi: consolidation flush/sleep failed; retaining current session before propagating.", {
+				bank: this.config.bank,
+				error: sleepFailure.message,
+			});
 		}
+		await this.forceRetainCurrentSession({ extract: options.extract });
+		if (sleepFailure) throw sleepFailure;
 	}
 
 	/**

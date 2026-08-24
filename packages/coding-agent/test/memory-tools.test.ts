@@ -136,6 +136,7 @@ function makeMnemopiConfig(
 		enhancedRecall: false,
 		proactiveLinking: false,
 		retainEveryNTurns: 3,
+		consolidateEveryNTurns: 0,
 		recallLimit: 10,
 		recallContextTurns: 1,
 		recallMaxQueryChars: 800,
@@ -892,6 +893,72 @@ describe("Mnemopi backend lifecycle", () => {
 		expect(sleepSpy).not.toHaveBeenCalled();
 
 		registeredMnemopiState = undefined;
+	});
+
+	it("force-retains the current session when periodic consolidation's sleep step throws (B3)", async () => {
+		const entries = [{ type: "message", message: { role: "user", content: "hello there" } }];
+		const state = registerMnemopiState(makeMnemopiConfig({ autoRetain: false, consolidateEveryNTurns: 1 }), {
+			entries: () => entries,
+		});
+		const retainMemory = state.getScopedRetainTarget().memory;
+		const sleepError = new Error("sleep boom");
+		vi.spyOn(retainMemory, "sleep").mockImplementation(() => {
+			throw sleepError;
+		});
+		const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
+
+		// autoRetain is off, so only the force-retain inside consolidate()
+		// can write the transcript; maybeConsolidateOnAgentEnd() must not
+		// let the sleep throw propagate before that retain runs.
+		await expect(state.maybeConsolidateOnAgentEnd()).resolves.toBeUndefined();
+
+		const rows = state.memory.beam.db
+			.prepare<{ content: string }, [string]>(`
+				SELECT content
+				FROM working_memory
+				WHERE source = 'coding-agent-transcript'
+				  AND json_extract(metadata_json, '$.session_id') = ?
+			`)
+			.all(TEST_SESSION_ID);
+		expect(rows).toHaveLength(1);
+		expect(rows[0].content).toContain("hello there");
+
+		// The sleep failure must stay visible in the logs rather than being
+		// silently swallowed by the force-retain fix.
+		expect(warn).toHaveBeenCalledWith(
+			"Mnemopi: consolidation flush/sleep failed; retaining current session before propagating.",
+			expect.objectContaining({ error: "sleep boom" }),
+		);
+		expect(warn).toHaveBeenCalledWith(
+			"Mnemopi: periodic consolidation failed.",
+			expect.objectContaining({ error: "sleep boom" }),
+		);
+	});
+
+	it("force-retains the current session via periodic consolidation on the happy path", async () => {
+		const entries = [{ type: "message", message: { role: "user", content: "hello there" } }];
+		const state = registerMnemopiState(makeMnemopiConfig({ autoRetain: false, consolidateEveryNTurns: 1 }), {
+			entries: () => entries,
+		});
+		const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
+
+		await expect(state.maybeConsolidateOnAgentEnd()).resolves.toBeUndefined();
+
+		const rows = state.memory.beam.db
+			.prepare<{ content: string }, [string]>(`
+				SELECT content
+				FROM working_memory
+				WHERE source = 'coding-agent-transcript'
+				  AND json_extract(metadata_json, '$.session_id') = ?
+			`)
+			.all(TEST_SESSION_ID);
+		expect(rows).toHaveLength(1);
+		expect(rows[0].content).toContain("hello there");
+		expect(warn).not.toHaveBeenCalledWith(
+			"Mnemopi: consolidation flush/sleep failed; retaining current session before propagating.",
+			expect.anything(),
+		);
+		expect(warn).not.toHaveBeenCalledWith("Mnemopi: periodic consolidation failed.", expect.anything());
 	});
 
 	it("skips consolidation when disposing an aliased subagent state (#2320)", async () => {

@@ -3217,6 +3217,7 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 	"mnemopi.retainEveryNTurns": { type: "number", default: 4 },
+	"mnemopi.consolidateEveryNTurns": { type: "number", default: 20 },
 	"mnemopi.recallLimit": { type: "number", default: 8 },
 	"mnemopi.recallContextTurns": { type: "number", default: 3 },
 	"mnemopi.recallMaxQueryChars": { type: "number", default: 4000 },
