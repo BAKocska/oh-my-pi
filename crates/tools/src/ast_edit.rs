@@ -22,8 +22,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::staging::{
-	PREVIEW_PENDING_NOTICE, PreviewActionError, PreviewDecision, PreviewError, PreviewRegistry,
-	PreviewRejection, StagedAction,
+	PROPOSAL_PENDING_NOTICE, ProposalActionError, ProposalDecision, ProposalError,
+	ProposalRejection, StagedProposalAction, StagedProposalRegistry,
 };
 
 const MAX_FILES: usize = 200;
@@ -74,18 +74,18 @@ pub struct Advisory {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-/// Structural-rewrite result before or after preview finalization.
+/// Structural-rewrite result before or after proposal resolution.
 pub struct Payload {
 	/// Proposed files while staged, or files written after `resolve` applies the
 	/// proposal.
-	pub files:           Vec<ChangedFile>,
+	pub files:            Vec<ChangedFile>,
 	/// Per-file skips encountered while constructing the staged proposal.
-	pub advisories:      Vec<Advisory>,
+	pub advisories:       Vec<Advisory>,
 	/// Recovery-snapshot directory created on apply; `None` while the proposal
 	/// is staged.
-	pub recovery_root:   Option<Str>,
+	pub recovery_root:    Option<Str>,
 	/// Uncommitted proposal identity requiring resolve or reject.
-	pub pending_preview: Option<Str>,
+	pub pending_proposal: Option<Str>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -106,17 +106,17 @@ impl error::Error for Fault {}
 
 /// Workspace-scoped structural-rewrite tool exposed as `ast_edit`.
 pub struct AstEdit {
-	root:     PathBuf,
-	spec:     ToolSpec,
-	previews: PreviewRegistry,
+	root:      PathBuf,
+	spec:      ToolSpec,
+	proposals: StagedProposalRegistry,
 }
 
-/// Builds an `ast_edit` tool that stages proposals in `previews` for later
+/// Builds an `ast_edit` tool that stages proposals in `proposals` for later
 /// resolve or reject.
-pub fn tool(root: PathBuf, previews: PreviewRegistry) -> AstEdit {
+pub fn tool(root: PathBuf, proposals: StagedProposalRegistry) -> AstEdit {
 	AstEdit {
 		root,
-		previews,
+		proposals,
 		spec: ToolSpec {
 			name:            sf!("ast_edit"),
 			rev:             Rev { family: Default::default(), n: 1 },
@@ -196,10 +196,10 @@ impl Tool for AstEdit {
 				let (updated, replacements) = match omp_ast::ops::rewrite_source(source, language, &rules) { Ok(v) => v, Err(e) => { yield done(Err(Fault { message: Str::new(e.to_string()) })); return; } };
 				if replacements != 0 { prepared.push(Prepared { absolute, relative: file.relative_path, before: *Hash32::sum(&original).as_bytes(), after: *Hash32::sum(updated.as_bytes()).as_bytes(), original, updated, replacements }); }
 			}
-			if prepared.is_empty() { yield done(Ok(Payload { files: Vec::new(), advisories, recovery_root: None, pending_preview: None })); return; }
+			if prepared.is_empty() { yield done(Ok(Payload { files: Vec::new(), advisories, recovery_root: None, pending_proposal: None })); return; }
 			let files = prepared.iter().map(|p| ChangedFile { path: p.relative.clone(), replacements: p.replacements, before_hash: short_hash(&p.before), after_hash: short_hash(&p.after) }).collect::<Vec<_>>();
 			let summary = sf!("Pending proposal: ast_edit would change {} file(s).", files.len());
-			let pending = match self.previews.stage(
+			let pending = match self.proposals.stage(
 				sf!("ast_edit"),
 				summary,
 				AstEditAction { root, prepared },
@@ -214,7 +214,7 @@ impl Tool for AstEdit {
 				files,
 				advisories,
 				recovery_root: None,
-				pending_preview: Some(pending.id),
+				pending_proposal: Some(pending.id),
 			}));
 		}
 	}
@@ -237,8 +237,8 @@ impl Tool for AstEdit {
 						use std::fmt::Write as _;
 						let _ = writeln!(out, "[advisory {}] {}", advisory.path, advisory.message);
 					}
-					if p.pending_preview.is_some() {
-						out.push_str(PREVIEW_PENDING_NOTICE);
+					if p.pending_proposal.is_some() {
+						out.push_str(PROPOSAL_PENDING_NOTICE);
 					}
 					Str::new(out)
 				},
@@ -262,27 +262,27 @@ struct AstEditAction {
 	prepared: Vec<Prepared>,
 }
 
-impl StagedAction for AstEditAction {
-	fn finalize(&mut self, decision: &PreviewDecision) -> Result<serde_json::Value, PreviewError> {
+impl StagedProposalAction for AstEditAction {
+	fn finalize(&mut self, decision: &ProposalDecision) -> Result<serde_json::Value, ProposalError> {
 		if matches!(
 			decision,
-			PreviewDecision::Reject(
-				PreviewRejection::Requested { .. } | PreviewRejection::CampaignExhausted
+			ProposalDecision::Reject(
+				ProposalRejection::Requested { .. } | ProposalRejection::RegimeLimitReached
 			)
 		) {
 			return Ok(serde_json::json!({ "rejected": true }));
 		}
-		self.apply().map_err(PreviewError::from)
+		self.apply().map_err(ProposalError::from)
 	}
 }
 
 impl AstEditAction {
-	fn apply(&mut self) -> Result<serde_json::Value, PreviewActionError> {
+	fn apply(&mut self) -> Result<serde_json::Value, ProposalActionError> {
 		for item in &self.prepared {
 			let current = fs::read(&item.absolute)
-				.map_err(|source| PreviewActionError::Io { path: item.absolute.clone(), source })?;
+				.map_err(|source| ProposalActionError::Io { path: item.absolute.clone(), source })?;
 			if Hash32::sum(&current).as_bytes() != &item.before {
-				return Err(PreviewActionError::RevisionChanged { path: item.absolute.clone() });
+				return Err(ProposalActionError::RevisionChanged { path: item.absolute.clone() });
 			}
 		}
 		let generation = SystemTime::now()
@@ -293,7 +293,7 @@ impl AstEditAction {
 			.join(".omp/recovery/ast-edit")
 			.join(generation.to_string());
 		snapshot_all(&recovery, &self.prepared)
-			.map_err(|source| PreviewActionError::Io { path: recovery.clone(), source })?;
+			.map_err(|source| ProposalActionError::Io { path: recovery.clone(), source })?;
 		let mut committed = 0;
 		for item in &self.prepared {
 			let temporary = item
@@ -305,7 +305,7 @@ impl AstEditAction {
 				for restore in self.prepared[..committed].iter().rev() {
 					let _ = fs::write(&restore.absolute, &restore.original);
 				}
-				return Err(PreviewActionError::Io { path: item.absolute.clone(), source });
+				return Err(ProposalActionError::Io { path: item.absolute.clone(), source });
 			}
 			committed += 1;
 		}
@@ -323,7 +323,7 @@ impl AstEditAction {
 			files,
 			advisories: Vec::new(),
 			recovery_root: Some(Str::from(recovery.to_string_lossy().into_owned())),
-			pending_preview: None,
+			pending_proposal: None,
 		})?)
 	}
 }
@@ -385,7 +385,7 @@ mod tests {
 	}
 
 	#[test]
-	fn staged_action_mutates_only_after_resolve_and_reject_is_effect_free() {
+	fn staged_action_mutates_only_after_resolve_and_regime_limit_is_effect_free() {
 		let temp = tempfile::tempdir().expect("temporary workspace");
 		let path = temp.path().join("sample.rs");
 		let original = b"fn old() {}\n";
@@ -393,15 +393,13 @@ mod tests {
 
 		let mut rejected = action(temp.path(), &path, original, "fn new() {}\n");
 		rejected
-			.finalize(&PreviewDecision::Reject(PreviewRejection::Requested {
-				reason: Str::new_static("The rewrite is not desired."),
-			}))
+			.finalize(&ProposalDecision::Reject(ProposalRejection::RegimeLimitReached))
 			.expect("proposal rejected");
 		assert_eq!(fs::read(&path).expect("source readable"), original);
 
 		let mut resolved = action(temp.path(), &path, original, "fn new() {}\n");
 		let payload = resolved
-			.finalize(&PreviewDecision::Resolve {
+			.finalize(&ProposalDecision::Resolve {
 				reason: Str::new_static("Apply the reviewed rewrite."),
 			})
 			.expect("proposal resolved");

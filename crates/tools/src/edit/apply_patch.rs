@@ -22,9 +22,10 @@ use serde::{Deserialize, Serialize};
 use super::{
 	AppliedOp, CommittedSection, EditAction, EditCommitError, EditDocuments, EditPrepared,
 	EditProposal, EditUpdate, Fault, FormatPolicy, Payload, PrepareRequest, ResolvedEdit, SectionOp,
-	SectionPayload, StalePolicy, commit_event, done_fault, param_event, rejection_text,
+	SectionPayload, StalePolicy, commit_event, done_fault,
+	observer::{AppliedEditSnapshot, EditObserver, PendingBlackbox},
+	param_event, rejection_text,
 };
-use super::observer::{AppliedEditSnapshot, EditObserver, PendingBlackbox};
 use crate::{
 	path::{HostPaths, normalize_target},
 	render::TextProjection,

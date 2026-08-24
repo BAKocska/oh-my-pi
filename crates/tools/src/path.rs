@@ -54,11 +54,17 @@ pub fn aggregate_file_write_approval<'a>(
 			return FileWriteApproval::Write;
 		}
 	}
-	if any { FileWriteApproval::Read } else { FileWriteApproval::Write }
+	if any {
+		FileWriteApproval::Read
+	} else {
+		FileWriteApproval::Write
+	}
 }
 
 fn is_internal_resource(target: &str) -> bool {
-	let Some((scheme, _)) = target.trim().split_once("://") else { return false };
+	let Some((scheme, _)) = target.trim().split_once("://") else {
+		return false;
+	};
 	matches!(
 		scheme.to_ascii_lowercase().as_str(),
 		"agent"
@@ -68,8 +74,7 @@ fn is_internal_resource(target: &str) -> bool {
 			| "local"
 			| "mcp"
 			| "memory"
-			| "pr"
-			| "rule"
+			| "pr" | "rule"
 			| "security"
 			| "skill"
 			| "vault"
@@ -425,17 +430,11 @@ mod tests {
 	#[test]
 	fn aggregates_every_write_target_and_preserves_writable_internal_tier() {
 		assert_eq!(
-			aggregate_file_write_approval(
-				["local://notes", "src/config.rs"],
-				|_| false
-			),
+			aggregate_file_write_approval(["local://notes", "src/config.rs"], |_| false),
 			FileWriteApproval::Write
 		);
 		assert_eq!(
-			aggregate_file_write_approval(
-				["local://notes", "artifact://result"],
-				|_| false
-			),
+			aggregate_file_write_approval(["local://notes", "artifact://result"], |_| false),
 			FileWriteApproval::Read
 		);
 		assert_eq!(

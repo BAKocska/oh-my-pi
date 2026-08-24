@@ -14,6 +14,7 @@ pub use apply_patch::{
 use async_stream::stream;
 use bytes::Bytes;
 use futures::{FutureExt, Stream, pin_mut, select_biased};
+use observer::{AppliedEditSnapshot, EditObserver, PendingBlackbox};
 use omp_core::{IntoStr, Str, sf};
 use omp_hashline::{
 	ApplyMode, ApplyOptions, Clipboard, FileOp, MismatchDetails, MismatchError, Patch,
@@ -35,7 +36,6 @@ use crate::{
 	path::{HostPaths, normalize_target},
 	render::TextProjection,
 };
-use observer::{AppliedEditSnapshot, EditObserver, PendingBlackbox};
 
 /// One registered edit argument dialect.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

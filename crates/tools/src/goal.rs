@@ -1,4 +1,4 @@
-//! Hidden goal lifecycle tool over an application-owned durable authority.
+//! Hidden goal lifecycle tool over application-owned regime control.
 
 use async_stream::stream;
 use futures::Stream;
@@ -115,11 +115,11 @@ pub struct Payload {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum Update {}
 
-/// Typed goal authority refusal.
+/// Typed refusal from the goal regime owner.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, thiserror::Error)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Fault {
-	/// No live durable goal authority is bound.
+	/// No live durable goal regime control is installed.
 	#[error("goal mode is not active")]
 	Unavailable,
 	/// An operation required an existing goal.
@@ -134,20 +134,23 @@ pub enum Fault {
 	/// The active mode prevents a goal transition.
 	#[error("the active execution mode prevents this goal transition")]
 	ModeConflict,
-	/// Campaign arbitration denied the goal regime's mode-slot claim.
-	#[error("the goal campaign mode-slot claim is held by another engagement")]
-	ClaimDenied {
-		/// Stable engagement currently holding the mode slot.
-		holder: Str,
-		/// Epoch millisecond at which the holder acquired the slot.
-		since:  u64,
+	/// A resource required by the goal regime is owned by another activation.
+	#[error("the goal regime resource {resource} is owned by activation {owner}")]
+	ResourceConflict {
+		/// Canonical resource name, such as `mode`.
+		resource: Str,
+		/// Activation currently owning the resource.
+		owner:    Str,
+		/// Epoch millisecond at which the owner acquired the resource.
+		since:    u64,
 	},
 	/// The requested transition is invalid for the current goal state.
 	#[error("the requested goal transition is invalid for its durable state")]
 	InvalidTransition,
 }
 
-/// App-owned durable goal authority consumed through a frozen registry binding.
+/// App-owned durable goal regime control consumed through a frozen registry
+/// entry.
 pub trait GoalControl: Clone + Send + Sync + 'static {
 	/// Applies one validated operation atomically and returns its latest
 	/// projection.
@@ -155,7 +158,7 @@ pub trait GoalControl: Clone + Send + Sync + 'static {
 	-> impl Future<Output = Result<Option<Goal>, Fault>> + Send + '_;
 }
 
-/// Hidden goal tool bound to one durable authority handle.
+/// Hidden goal tool backed by one durable regime-control handle.
 pub struct GoalTool<C> {
 	control: C,
 	spec:    ToolSpec,
@@ -327,39 +330,7 @@ fn protocol_issue(message: Str) -> ArgIssue {
 
 #[cfg(test)]
 mod tests {
-	use std::{future::ready, sync::Arc};
-
-	use parking_lot::Mutex;
-
 	use super::*;
-
-	#[derive(Clone, Default)]
-	struct Control(Arc<Mutex<Option<Goal>>>);
-
-	impl GoalControl for Control {
-		fn apply(
-			&self,
-			params: Params,
-		) -> impl Future<Output = Result<Option<Goal>, Fault>> + Send + '_ {
-			let result = match params.op {
-				Operation::Create => {
-					let goal = Goal {
-						id:             sf!("goal-1"),
-						objective:      params.objective.expect("validated objective"),
-						status:         Status::Active,
-						token_budget:   params.token_budget,
-						tokens_used:    0,
-						time_used_secs: 0,
-					};
-					*self.0.lock() = Some(goal.clone());
-					Ok(Some(goal))
-				},
-				Operation::Get => Ok(self.0.lock().clone()),
-				_ => Err(Fault::InvalidTransition),
-			};
-			ready(result)
-		}
-	}
 
 	#[test]
 	fn schema_rejects_unknown_and_zero_budget_is_typed() {
@@ -379,6 +350,23 @@ mod tests {
 			.expect("shape parses")
 			.token_budget,
 			Some(0)
+		);
+	}
+	#[test]
+	fn resource_conflict_retains_mode_owner_data() {
+		let fault = Fault::ResourceConflict {
+			resource: sf!("mode"),
+			owner:    sf!("activation-7"),
+			since:    42,
+		};
+		assert_eq!(
+			serde_json::to_value(fault).expect("fault serializes"),
+			serde_json::json!({
+				"kind": "resource_conflict",
+				"resource": "mode",
+				"owner": "activation-7",
+				"since": 42
+			})
 		);
 	}
 }

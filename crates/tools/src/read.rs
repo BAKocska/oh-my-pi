@@ -387,13 +387,13 @@ impl Default for ReadPolicy {
 
 /// `read@1` executor over unboxed app resource adapters.
 pub struct ReadTool<S, B, R = resolver::NoResolver> {
-	sources:   S,
-	blobs:     B,
-	resolvers: Arc<ResolverTable<R>>,
-	conflicts: Arc<conflicts::ConflictRegistry>,
-	policy:    ReadPolicy,
+	sources:      S,
+	blobs:        B,
+	resolvers:    Arc<ResolverTable<R>>,
+	conflicts:    Arc<conflicts::ConflictRegistry>,
+	policy:       ReadPolicy,
 	repeat_reads: Mutex<RepeatReadTracker>,
-	spec:      ToolSpec,
+	spec:         ToolSpec,
 }
 #[derive(Clone, Copy)]
 struct RepeatedRead {
@@ -422,7 +422,9 @@ impl RepeatReadTracker {
 		if self.reads.len() >= REPEAT_READ_TRACKER_CAP {
 			self.reads.clear();
 		}
-		self.reads.insert(Str::new(path), RepeatedRead { hash, count: 1 });
+		self
+			.reads
+			.insert(Str::new(path), RepeatedRead { hash, count: 1 });
 		None
 	}
 }
@@ -695,8 +697,8 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 			return;
 		};
 		*text = sf!(
-			"{}\n\n[You have received this identical output {count} times. Re-reading '{}' will \
-			 not change it — use a narrower selector (path:A-B), or proceed with the edit.]",
+			"{}\n\n[You have received this identical output {count} times. Re-reading '{}' will not \
+			 change it — use a narrower selector (path:A-B), or proceed with the edit.]",
 			text,
 			path
 		);

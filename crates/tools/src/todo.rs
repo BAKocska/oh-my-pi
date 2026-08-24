@@ -177,10 +177,10 @@ pub fn tool() -> Todo {
 			rev:             Rev { family: Str::new(""), n: 1 },
 			description:     sf!(
 				"Tracks a phased task list. `items` supplies tasks for single-phase `init` or \
-				 `append`. After each successful state-changing op, if nothing is `in_progress`, \
-				 the earliest `pending` task in phase order auto-promotes; if several are \
-				 `in_progress`, only the earliest stays. Blocked tasks never auto-promote: \
-				 `unblock` first. Read-only `view` and failed operations never normalize state.",
+				 `append`. After each successful state-changing op, if nothing is `in_progress`, the \
+				 earliest `pending` task in phase order auto-promotes; if several are `in_progress`, \
+				 only the earliest stays. Blocked tasks never auto-promote: `unblock` first. \
+				 Read-only `view` and failed operations never normalize state.",
 			),
 			schema:          omp_tool::schema::<Params>(),
 			constraint:      Constraint::Schema {
@@ -253,14 +253,12 @@ fn apply_mut(phases: &mut Vec<Phase>, params: Params) -> Result<(), Fault> {
 					return Err(invalid("`items` must not be empty for init"));
 				}
 				vec![Phase {
-					phase: params.phase.map_or_else(|| sf!("Todos"), |phase| title_case(&phase)),
+					phase: params
+						.phase
+						.map_or_else(|| sf!("Todos"), |phase| title_case(&phase)),
 					items: items
 						.into_iter()
-						.map(|text| Item {
-							text,
-							status: Status::Pending,
-							reason: None,
-						})
+						.map(|text| Item { text, status: Status::Pending, reason: None })
 						.collect(),
 				}]
 			};
@@ -780,11 +778,7 @@ mod tests {
 			items: vec![
 				Item { text: sf!("first"), status: Status::InProgress, reason: None },
 				Item { text: sf!("second"), status: Status::InProgress, reason: None },
-				Item {
-					text: sf!("blocked"),
-					status: Status::Blocked,
-					reason: Some(sf!("waiting")),
-				},
+				Item { text: sf!("blocked"), status: Status::Blocked, reason: Some(sf!("waiting")) },
 			],
 		}];
 		let original = phases.clone();
@@ -844,13 +838,20 @@ mod tests {
 		let schema = String::from_utf8(todo.spec().schema.to_vec()).expect("UTF-8 schema");
 		assert!(schema.contains("tasks for single-phase init or append"));
 		assert!(
-			todo.spec()
+			todo
+				.spec()
 				.description
 				.contains("After each successful state-changing op")
 		);
-		assert!(todo.spec().description.contains("Blocked tasks never auto-promote"));
 		assert!(
-			todo.spec()
+			todo
+				.spec()
+				.description
+				.contains("Blocked tasks never auto-promote")
+		);
+		assert!(
+			todo
+				.spec()
 				.description
 				.contains("Read-only `view` and failed operations never normalize state")
 		);

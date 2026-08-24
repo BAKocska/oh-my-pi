@@ -409,8 +409,8 @@ impl ShellPromptSnapshot {
 	fn description(&self) -> Str {
 		let mut description = String::from(
 			"Execute a shell script in a persistent session, or start a named asynchronous job. \
-			 Eligible long-running calls may auto-background at the configured foreground \
-			 threshold and deliver later. `timeout_ms: 0` disables the command deadline; otherwise \
+			 Eligible long-running calls may auto-background at the configured foreground threshold \
+			 and deliver later. `timeout_ms: 0` disables the command deadline; otherwise \
 			 `timeout_ms` sets it without extending foreground waiting.",
 		);
 		let _ = write!(

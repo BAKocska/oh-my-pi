@@ -94,7 +94,8 @@ pub enum EditRepairError {
 	},
 }
 
-/// Structured repair prompt; the inference owner renders it for its selected model.
+/// Structured repair prompt; the inference owner renders it for its selected
+/// model.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EditRepairPrompt {
 	/// Canonical source language.
@@ -110,16 +111,16 @@ impl EditRepairPrompt {
 	/// Renders the strict code-only completion request for the repair model.
 	pub fn render(&self) -> Str {
 		let mut prompt = format!(
-			"An automated edit made this {} region invalid. BEFORE parsed; AFTER does not.\n\n\
-			 BEFORE:\n```\n{}\n```\n\nAFTER:\n```\n{}\n```\n\n\
-			 Output only corrected AFTER code. Preserve the intended change; fix only syntax. \
-			 Do not revert to BEFORE and do not use a code fence.",
+			"An automated edit made this {} region invalid. BEFORE parsed; AFTER does \
+			 not.\n\nBEFORE:\n```\n{}\n```\n\nAFTER:\n```\n{}\n```\n\nOutput only corrected AFTER \
+			 code. Preserve the intended change; fix only syntax. Do not revert to BEFORE and do not \
+			 use a code fence.",
 			self.language, self.before, self.after
 		);
 		if let Some(previous) = &self.previous_attempt {
 			prompt.push_str(&format!(
-				"\n\nThe previous candidate still failed validation:\n```\n{previous}\n```\n\
-				 Produce a different corrected region."
+				"\n\nThe previous candidate still failed validation:\n```\n{previous}\n```\nProduce a \
+				 different corrected region."
 			));
 		}
 		Str::new(prompt)
@@ -150,11 +151,15 @@ impl EditRepairClient {
 
 	async fn complete(&self, prompt: EditRepairPrompt) -> Result<Str, EditRepairError> {
 		let (reply, response) = flume::bounded(1);
-		self.tx
+		self
+			.tx
 			.send_async(EditRepairRequest { prompt, reply })
 			.await
 			.map_err(|_| EditRepairError::Unavailable)?;
-		response.recv_async().await.map_err(|_| EditRepairError::Unavailable)?
+		response
+			.recv_async()
+			.await
+			.map_err(|_| EditRepairError::Unavailable)?
 	}
 }
 
@@ -167,7 +172,8 @@ pub struct EditObserver {
 }
 
 impl EditObserver {
-	/// Constructs an observer. `None` blackbox path and repair client disable all work.
+	/// Constructs an observer. `None` blackbox path and repair client disable
+	/// all work.
 	pub fn new(blackbox: EditBlackboxConfig, auto_repair: Option<EditRepairClient>) -> Self {
 		Self {
 			blackbox: Arc::new(blackbox),
@@ -176,7 +182,8 @@ impl EditObserver {
 		}
 	}
 
-	/// Inspects a proposed transition, repairing only a newly introduced parse error.
+	/// Inspects a proposed transition, repairing only a newly introduced parse
+	/// error.
 	pub async fn inspect(
 		&self,
 		snapshot: AppliedEditSnapshot,
@@ -195,7 +202,8 @@ impl EditObserver {
 			return EditInspection {
 				content: repaired.content,
 				notice: Some(sf!(
-					"{} stopped parsing after this edit; automatic syntax repair succeeded in {} attempt(s). Review the repaired region.",
+					"{} stopped parsing after this edit; automatic syntax repair succeeded in {} \
+					 attempt(s). Review the repaired region.",
 					snapshot.path,
 					repaired.attempts
 				)),
@@ -212,10 +220,15 @@ impl EditObserver {
 		}
 	}
 
-	/// Appends a pending record after the enclosing document transaction commits.
+	/// Appends a pending record after the enclosing document transaction
+	/// commits.
 	pub async fn record_committed(&self, pending: PendingBlackbox) {
-		let Some(path) = self.blackbox.path.as_ref() else { return };
-		let Ok(mut bytes) = serde_json::to_vec(&pending.record) else { return };
+		let Some(path) = self.blackbox.path.as_ref() else {
+			return;
+		};
+		let Ok(mut bytes) = serde_json::to_vec(&pending.record) else {
+			return;
+		};
 		bytes.push(b'\n');
 		let path = path.clone();
 		let lock = Arc::clone(&self.append_lock);
@@ -223,11 +236,7 @@ impl EditObserver {
 	}
 }
 
-fn append(
-	path: &PathBuf,
-	bytes: &[u8],
-	lock: &parking_lot::Mutex<()>,
-) -> std::io::Result<()> {
+fn append(path: &PathBuf, bytes: &[u8], lock: &parking_lot::Mutex<()>) -> std::io::Result<()> {
 	use std::io::Write as _;
 	let _guard = lock.lock();
 	if let Some(parent) = path.parent() {
@@ -259,12 +268,17 @@ pub struct PendingBlackbox {
 
 /// True only for supported valid-to-invalid syntax transitions.
 pub fn introduced_parse_failure(snapshot: &AppliedEditSnapshot) -> bool {
-	let Ok(before) = std::str::from_utf8(&snapshot.before) else { return false };
-	let Ok(after) = std::str::from_utf8(&snapshot.after) else { return false };
+	let Ok(before) = std::str::from_utf8(&snapshot.before) else {
+		return false;
+	};
+	let Ok(after) = std::str::from_utf8(&snapshot.after) else {
+		return false;
+	};
 	!source_parses(after, &snapshot.path) && source_parses(before, &snapshot.path)
 }
 
-/// Whether tree-sitter accepts a supported source, treating an empty file as valid.
+/// Whether tree-sitter accepts a supported source, treating an empty file as
+/// valid.
 pub fn source_parses(source: &str, path: &str) -> bool {
 	if source.is_empty() {
 		return true;
@@ -280,12 +294,12 @@ fn bounded_record(
 	config: &EditBlackboxConfig,
 ) -> EditBlackboxRecord {
 	EditBlackboxRecord {
-		path: snapshot.path.clone(),
+		path:   snapshot.path.clone(),
 		before: capture(&snapshot.before, config.max_source_bytes),
-		after: capture(&snapshot.after, config.max_source_bytes),
-		model: config.model.clone(),
-		mode: Str::new(mode),
-		args: bounded_args(args, config.max_args_bytes),
+		after:  capture(&snapshot.after, config.max_source_bytes),
+		model:  config.model.clone(),
+		mode:   Str::new(mode),
+		args:   bounded_args(args, config.max_args_bytes),
 	}
 }
 
@@ -306,7 +320,9 @@ fn floor_char_boundary(bytes: &[u8], mut end: usize) -> usize {
 }
 
 fn bounded_args(args: &serde_json::Value, maximum: usize) -> serde_json::Value {
-	let Ok(encoded) = serde_json::to_vec(args) else { return serde_json::Value::Null };
+	let Ok(encoded) = serde_json::to_vec(args) else {
+		return serde_json::Value::Null;
+	};
 	if encoded.len() <= maximum {
 		return args.clone();
 	}
@@ -352,21 +368,21 @@ fn hunks<'a>(before: &[&'a str], after: &[&'a str]) -> Vec<Hunk> {
 			DiffOp::Equal { .. } => None,
 			DiffOp::Delete { old_index, old_len, new_index } => Some(Hunk {
 				a_start: old_index,
-				a_end: old_index + old_len,
+				a_end:   old_index + old_len,
 				b_start: new_index,
-				b_end: new_index,
+				b_end:   new_index,
 			}),
 			DiffOp::Insert { old_index, new_index, new_len } => Some(Hunk {
 				a_start: old_index,
-				a_end: old_index,
+				a_end:   old_index,
 				b_start: new_index,
-				b_end: new_index + new_len,
+				b_end:   new_index + new_len,
 			}),
 			DiffOp::Replace { old_index, old_len, new_index, new_len } => Some(Hunk {
 				a_start: old_index,
-				a_end: old_index + old_len,
+				a_end:   old_index + old_len,
 				b_start: new_index,
-				b_end: new_index + new_len,
+				b_end:   new_index + new_len,
 			}),
 		})
 		.collect()
@@ -387,7 +403,12 @@ fn revert_hunks(before: &[&str], after: &[&str], hunks: &[Hunk], selected: &[usi
 	output.join("\n")
 }
 
-fn culprit_hunks(path: &str, before: &[&str], after: &[&str], hunks: &[Hunk]) -> Option<Vec<usize>> {
+fn culprit_hunks(
+	path: &str,
+	before: &[&str],
+	after: &[&str],
+	hunks: &[Hunk],
+) -> Option<Vec<usize>> {
 	for index in 0..hunks.len() {
 		if source_parses(&revert_hunks(before, after, hunks, &[index]), path) {
 			return Some(vec![index]);
@@ -420,7 +441,10 @@ fn repair_region(snapshot: &AppliedEditSnapshot) -> Option<RepairRegion> {
 	if b_end.saturating_sub(b_start) > MAX_REGION_LINES {
 		return None;
 	}
-	let mut ordered = culprits.iter().map(|index| hunks[*index]).collect::<Vec<_>>();
+	let mut ordered = culprits
+		.iter()
+		.map(|index| hunks[*index])
+		.collect::<Vec<_>>();
 	ordered.sort_by_key(|hunk| hunk.b_start);
 	let mut reference = Vec::new();
 	let mut at = b_start;
@@ -436,7 +460,9 @@ fn repair_region(snapshot: &AppliedEditSnapshot) -> Option<RepairRegion> {
 	let language = summarize_source(before_text, SummarySettings {
 		path: Some(&snapshot.path),
 		..SummarySettings::default()
-	}).ok()?.language?;
+	})
+	.ok()?
+	.language?;
 	Some(RepairRegion {
 		b_start,
 		b_end,
@@ -456,12 +482,15 @@ async fn repair_parse_regression(
 	let normalized_reference = normalize_revert_check(&region.reference);
 	let mut previous_attempt = None;
 	for attempt in 1..=MAX_ATTEMPTS {
-		let candidate = tokio::time::timeout(REPAIR_TIMEOUT, client.complete(EditRepairPrompt {
-			language: region.language.clone(),
-			before: region.reference.clone(),
-			after: region.broken.clone(),
-			previous_attempt: previous_attempt.clone(),
-		}))
+		let candidate = tokio::time::timeout(
+			REPAIR_TIMEOUT,
+			client.complete(EditRepairPrompt {
+				language:         region.language.clone(),
+				before:           region.reference.clone(),
+				after:            region.broken.clone(),
+				previous_attempt: previous_attempt.clone(),
+			}),
+		)
 		.await
 		.ok()?
 		.ok()?;
@@ -486,8 +515,12 @@ async fn repair_parse_regression(
 
 fn strip_fence(candidate: &str) -> &str {
 	let trimmed = candidate.trim();
-	let Some(rest) = trimmed.strip_prefix("```") else { return trimmed };
-	let Some(body) = rest.split_once('\n').map(|(_, body)| body) else { return trimmed };
+	let Some(rest) = trimmed.strip_prefix("```") else {
+		return trimmed;
+	};
+	let Some(body) = rest.split_once('\n').map(|(_, body)| body) else {
+		return trimmed;
+	};
 	body.strip_suffix("```").map_or(trimmed, str::trim_end)
 }
 
@@ -509,9 +542,9 @@ mod tests {
 
 	fn snapshot(after: &str) -> AppliedEditSnapshot {
 		AppliedEditSnapshot {
-			path: sf!(PATH),
+			path:   sf!(PATH),
 			before: Bytes::copy_from_slice(VALID.as_bytes()),
-			after: Bytes::copy_from_slice(after.as_bytes()),
+			after:  Bytes::copy_from_slice(after.as_bytes()),
 		}
 	}
 
@@ -520,9 +553,9 @@ mod tests {
 		assert!(introduced_parse_failure(&snapshot(INVALID)));
 		assert!(!introduced_parse_failure(&snapshot(VALID)));
 		assert!(!introduced_parse_failure(&AppliedEditSnapshot {
-			path: sf!(PATH),
+			path:   sf!(PATH),
 			before: Bytes::copy_from_slice(INVALID.as_bytes()),
-			after: Bytes::from_static(b"export const next = (;\n"),
+			after:  Bytes::from_static(b"export const next = (;\n"),
 		}));
 		assert!(!introduced_parse_failure(&snapshot("")));
 	}
@@ -538,19 +571,30 @@ mod tests {
 		);
 		let temp = tempdir().expect("tempdir");
 		let log = temp.path().join("blackbox.jsonl");
-		let observer = EditObserver::new(EditBlackboxConfig {
-			path: Some(log.clone()),
-			model: sf!("openai/test"),
-			max_source_bytes: 24,
-			max_args_bytes: 16,
-		}, None);
+		let observer = EditObserver::new(
+			EditBlackboxConfig {
+				path:             Some(log.clone()),
+				model:            sf!("openai/test"),
+				max_source_bytes: 24,
+				max_args_bytes:   16,
+			},
+			None,
+		);
 		for mode in ["hashline", "replace", "patch", "apply_patch", "sloppy"] {
-			let inspected = observer.inspect(snapshot(INVALID), mode, &serde_json::json!({
-				"path": PATH,
-				"old_string": "return 1",
-			})).await;
+			let inspected = observer
+				.inspect(
+					snapshot(INVALID),
+					mode,
+					&serde_json::json!({
+						"path": PATH,
+						"old_string": "return 1",
+					}),
+				)
+				.await;
 			assert!(inspected.notice.is_some());
-			observer.record_committed(inspected.pending.expect("record")).await;
+			observer
+				.record_committed(inspected.pending.expect("record"))
+				.await;
 		}
 		let log = tokio::fs::read_to_string(log).await.expect("log");
 		let records = log
@@ -558,7 +602,10 @@ mod tests {
 			.map(|line| serde_json::from_str::<EditBlackboxRecord>(line).expect("record json"))
 			.collect::<Vec<_>>();
 		assert_eq!(
-			records.iter().map(|record| record.mode.as_str()).collect::<Vec<_>>(),
+			records
+				.iter()
+				.map(|record| record.mode.as_str())
+				.collect::<Vec<_>>(),
 			["hashline", "replace", "patch", "apply_patch", "sloppy"]
 		);
 		let record = &records[1];
@@ -574,10 +621,16 @@ mod tests {
 		let worker = tokio::spawn(async move {
 			let first = requests.recv_async().await.expect("request");
 			assert!(first.prompt.after.contains("return (;"));
-			first.reply.send_async(Ok(sf!("export function value(): number {\n\treturn (1);\n}"))).await.expect("reply");
+			first
+				.reply
+				.send_async(Ok(Str::new_static("export function value(): number {\n\treturn (1);\n}")))
+				.await
+				.expect("reply");
 		});
 		let observer = EditObserver::new(EditBlackboxConfig::default(), Some(client));
-		let inspected = observer.inspect(snapshot(INVALID), "replace", &serde_json::Value::Null).await;
+		let inspected = observer
+			.inspect(snapshot(INVALID), "replace", &serde_json::Value::Null)
+			.await;
 		assert!(source_parses(std::str::from_utf8(&inspected.content).expect("utf8"), PATH));
 		worker.await.expect("worker");
 
@@ -585,12 +638,21 @@ mod tests {
 		let worker = tokio::spawn(async move {
 			for _ in 0..2 {
 				let request = requests.recv_async().await.expect("request");
-				request.reply.send_async(Ok(sf!("export function value(): number {\n\treturn 1;\n}"))).await.expect("reply");
+				request
+					.reply
+					.send_async(Ok(Str::new_static("export function value(): number {\n\treturn 1;\n}")))
+					.await
+					.expect("reply");
 			}
 		});
 		let observer = EditObserver::new(EditBlackboxConfig::default(), Some(client));
-		let inspected = observer.inspect(snapshot(INVALID), "replace", &serde_json::Value::Null).await;
+		let inspected = observer
+			.inspect(snapshot(INVALID), "replace", &serde_json::Value::Null)
+			.await;
 		assert_eq!(inspected.content, Bytes::copy_from_slice(INVALID.as_bytes()));
-		tokio::time::timeout(Duration::from_secs(1), worker).await.expect("worker timeout").expect("worker");
+		tokio::time::timeout(Duration::from_secs(1), worker)
+			.await
+			.expect("worker timeout")
+			.expect("worker");
 	}
 }

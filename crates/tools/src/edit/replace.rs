@@ -23,9 +23,9 @@ use super::{
 	AppliedOp, CommittedSection, EditAction, EditCommitError, EditDocuments, EditPrepared,
 	EditProposal, EditUpdate, Fault, FormatPolicy, NoopResult, Payload, PrepareRequest,
 	RejectionReason, ResolvedEdit, SectionOp, SectionPayload, StalePolicy, commit_event, done_fault,
+	observer::{AppliedEditSnapshot, EditObserver, PendingBlackbox},
 	param_event, recovery_edits,
 };
-use super::observer::{AppliedEditSnapshot, EditObserver, PendingBlackbox};
 use crate::render::TextProjection;
 
 const DESCRIPTION: &str = "Replace exact or uniquely recoverable text in a file. The matcher \

@@ -273,7 +273,8 @@ fn constructed_tool_spec_preserves_the_shell_schema_contract() {
 		 values do not extend the foreground auto-background threshold."
 	);
 	assert!(
-		tool.spec()
+		tool
+			.spec()
 			.description
 			.contains("`timeout_ms` sets it without extending foreground waiting")
 	);

@@ -71,7 +71,7 @@ pub struct CatalogQuery {
 	pub text:       Option<Str>,
 	/// Tags every result must have.
 	pub tags:       SmallVec<Str, 4>,
-	/// Case-insensitive claimant/provenance filter.
+	/// Case-insensitive owner/provenance filter.
 	pub provenance: Option<Str>,
 	/// Number of matched rows to skip.
 	pub offset:     usize,
@@ -95,12 +95,12 @@ pub enum Operation {
 /// A deterministic `tool_only` flattening collision.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FlattenCollision {
-	/// First claimant to occupy the flattened slot.
-	pub first:  Str,
-	/// Conflicting claimant.
-	pub second: Str,
+	/// Existing owner of the flattened slot.
+	pub existing_owner:    Str,
+	/// Owner whose path conflicts with the existing slot.
+	pub conflicting_owner: Str,
 	/// Model-facing flattened slot spelling.
-	pub slot:   Str,
+	pub slot:              Str,
 }
 
 /// Flattens device paths for `tool_only`, rejecting collisions fail-closed.
@@ -108,10 +108,10 @@ pub fn flatten_slots(
 	paths: impl IntoIterator<Item = (Str, Str)>,
 ) -> Result<BTreeMap<Str, Str>, FlattenCollision> {
 	let mut slots = BTreeMap::new();
-	for (path, claimant) in paths {
+	for (path, owner) in paths {
 		let slot = Str::new(path.as_str().replace('/', "_"));
-		if let Some(first) = slots.insert(slot.clone(), claimant.clone()) {
-			return Err(FlattenCollision { first, second: claimant, slot });
+		if let Some(existing_owner) = slots.insert(slot.clone(), owner.clone()) {
+			return Err(FlattenCollision { existing_owner, conflicting_owner: owner, slot });
 		}
 	}
 	Ok(slots)
@@ -134,14 +134,14 @@ pub fn reserved_parameter(schema: &SchemaValue) -> Option<Str> {
 /// Late-bound immutable registry access for the self-referential `dyn` slot.
 ///
 /// The registry must first register `dyn`, then be frozen in an [`Arc`] and
-/// bound exactly once. The catalog retains only a weak reference, so registry
-/// assembly does not create an ownership cycle.
+/// installed exactly once. The catalog retains only a weak reference, so
+/// registry assembly does not create an ownership cycle.
 #[derive(Clone, Default)]
 pub struct DeviceCatalog(Arc<OnceLock<Weak<Registry>>>);
 
 impl DeviceCatalog {
-	/// Binds the completed immutable registry once.
-	pub fn bind(&self, registry: Arc<Registry>) -> Result<(), Weak<Registry>> {
+	/// Installs the completed immutable registry once.
+	pub fn install_registry(&self, registry: Arc<Registry>) -> Result<(), Weak<Registry>> {
 		self.0.set(Arc::downgrade(&registry))
 	}
 
@@ -158,8 +158,8 @@ pub struct DeviceInvokeRequest {
 	pub name:          Str,
 	/// Resolved revision.
 	pub rev:           Str,
-	/// Owning extension claimant when worker-routed.
-	pub claimant:      Option<Str>,
+	/// Owning extension when worker-routed.
+	pub owner:         Option<Str>,
 	/// Placed worker site when worker-routed.
 	pub site:          Option<omp_tool::WorkerSiteKind>,
 	/// Placed worker name when worker-routed.
@@ -209,7 +209,8 @@ impl OperationError {
 	}
 }
 
-/// Parses the path-bearing `do_` grammar without normalizing claimant paths.
+/// Parses the path-bearing `do_` grammar without normalizing
+/// publisher-qualified paths.
 ///
 /// An empty path and a trailing slash are distinct malformed envelopes; they
 /// never fall through to registry lookup and therefore cannot be mistaken for
@@ -301,7 +302,7 @@ pub fn render_catalog<'a>(devices: impl Iterator<Item = MountedDevice<'a>>) -> S
 /// Text search prefers exact leaves, then path prefixes, path containment,
 /// summaries, provenance, and finally tags. Without text, registry order is
 /// preserved. `tags` are conjunctive and `provenance` matches the authenticated
-/// claimant string.
+/// owner identity.
 pub fn render_catalog_query<'a>(
 	devices: impl Iterator<Item = MountedDevice<'a>>,
 	query: &CatalogQuery,
@@ -683,7 +684,8 @@ struct DynTool<I> {
 
 /// Constructs the stable `dyn` dynamic-device transport.
 ///
-/// `catalog` is bound after registry assembly with [`DeviceCatalog::bind`].
+/// `catalog` is installed after registry assembly with
+/// [`DeviceCatalog::install_registry`].
 pub fn dyn_tool<I: DeviceInvoker + 'static>(
 	invoker: I,
 	catalog: DeviceCatalog,
@@ -890,7 +892,7 @@ impl<I: DeviceInvoker + 'static> Tool for DynTool<I> {
 							path: path.clone(),
 							name: target.name.clone(),
 							rev: Str::new(target.rev.to_string()),
-							claimant: Some(target.claimant.clone()),
+							owner: Some(target.claimant.clone()),
 							site: Some(*site),
 							worker: Some(name.clone()),
 							invocation_id: self.next_invocation_id(),
@@ -981,7 +983,7 @@ fn catalog_query(flat: &Object) -> CatalogQuery {
 		.map(str::trim)
 		.filter(|value| !value.is_empty())
 		.map(Str::new);
-	let provenance = ["provenance", "claimant", "source"]
+	let provenance = ["provenance", "owner", "source"]
 		.into_iter()
 		.find_map(|key| flat.get(key).and_then(Value::as_str))
 		.map(str::trim)
@@ -1129,7 +1131,9 @@ mod tests {
 			)
 			.expect("fixture registers");
 		let registry = Arc::new(registry);
-		catalog.bind(Arc::clone(&registry)).expect("catalog binds");
+		catalog
+			.install_registry(Arc::clone(&registry))
+			.expect("catalog installs");
 		(catalog, registry)
 	}
 
@@ -1425,8 +1429,8 @@ mod tests {
 		])
 		.unwrap_err();
 		assert_eq!(collision.slot, "jira_create");
-		assert_eq!(collision.first, "acme/jira");
-		assert_eq!(collision.second, "other/tools");
+		assert_eq!(collision.existing_owner, "acme/jira");
+		assert_eq!(collision.conflicting_owner, "other/tools");
 		assert!(!dyn_enabled(ToolsPolicy::ToolOnly));
 	}
 
