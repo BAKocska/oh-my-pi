@@ -430,6 +430,19 @@
 - Cancelled prompts during pre-stream turn setup restore the text and image attachments to the editor.
 - `top` builtin accepts single-dash macOS flags such as `-pid` and `-stats`.
 - GNU/BSD compat sweep across built-in shell utilities (`timeout`, `diff`, `find`, `date`, `tail`, `head`, `rg`, `stat`, `truncate`, `cksum`, `sleep`, `which`, `nohup`, `kill`).
+### Added
+
+- Added `mnemopi.consolidateEveryNTurns` (default `20`): Mnemopi consolidation previously only ran from an explicit `/memory enqueue`, so an automated session never promoted aged working memory or wrote a `consolidation_log` row. The periodic pass runs from `agent_end`; `0` disables it.
+- Added `MNEMOPI_CROSS_PROJECT_RECALL=1`, an opt-in that extends recall to non-empty sibling project banks. Project banks are keyed to one absolute path, so a second checkout or git worktree of the same repository could not reach memories retained from the other — and under `per-project-tagged` nothing ever writes to the shared bank whose recall visibility that mode advertises. Off by default; recall-only; `per-project-tagged` only.
+
+### Changed
+
+- `Mnemopi.recallEnhanced()` now routes through `orchestrateRecall()` instead of calling the linear beam retriever directly, so `mnemopi.polyphonicRecall` and `mnemopi.enhancedRecall` actually affect the injected `<memories>` block. Both settings were previously accepted and ignored on this path: the orchestrator, its four voices and their `combined_score`/`voice_scores` had no production caller. With the gates off, behaviour is unchanged.
+- The Mnemopi backend uses the core module's structured extraction prompt instead of substituting an unstructured one, so LLM extraction returns the knowledge-graph triples the schema is built for.
+
+### Fixed
+
+- Fixed the agent-end memory pass losing a turn's transcript when consolidation threw: consolidation now runs before the retention that triggers trim, and retention is still attempted when consolidation fails.
 
 ## [17.3.8] - 2026-08-19
 

@@ -8,6 +8,25 @@
 
 - Fixed false-positive location extraction in episodic gists by properly enforcing capitalization constraints for proper nouns.
 - Improved episodic gist participant extraction with Unicode support to properly capture names in non-Latin scripts (e.g., Cyrillic, Greek).
+### Added
+
+- Added a `QueryCache` instance to the recall orchestrator, so `enhancedRecall` finally caches anything. The cache key includes every option the row-visibility predicate reads (topK, facts, session/channel, mode, per-voice gates, author/date/source/topic/veracity/memoryType and `ignoreSessionScope`), so a visibility-widened recall cannot poison a narrower session-scoped bucket. In-memory per bank; SQLite persistence stays off, because separate-process runs reproduced stale reads, TTL resets on restart and cross-bank contamination.
+- Added `fts_memoria_facts`, an FTS index over flat extracted statements, and taught both the linear and polyphonic fact paths to search it alongside the legacy `fts_facts`. Legacy placeholder rows stay queryable.
+
+### Changed
+
+- Polyphonic recall's diversity rerank now measures similarity over memory *content* (the shared `mmrRerank`/`jaccardSimilarity` helpers, lambda 0.7) instead of over which voices found a row. Two rows found by the same single voice scored 1.0 similar and all but the first were dropped, so the result ceiling was the number of distinct voice-combination classes present — often 1-3 rows. On a 250-topic bank with five near-duplicates each, `topK=20` now returns 20 rows across 20 topics instead of 5.
+- The graph voice seeds from a memoised per-bank dictionary of subjects that actually exist in the bank, instead of a proper-case regex that could only recover 3 of 25 stored subjects (`Bash tool`, `CLI`, `Kitty APC graphics upload` were all unreachable). Writer placeholders and a measured list of sentence-initial common words are rejected, and the dictionary is invalidated from every store/forget/consolidation path plus a rowid stamp for cross-process appends.
+- The polyphonic fact voice matches flat statements by object text, scoped to the caller's session and to text columns, and blends the FTS rank into the score. It previously scored every flat fact at exactly its constant importance, so a perfect match ranked identically to an incidental one-word mention (164 facts, one distinct score).
+- Polyphonic results clip row content to the same preview length as the linear path, setting `truncated`/`full_length`. Eight selected rows measured 85,643 characters, of which the host's raw tail-cut delivered roughly one memory intact; the same selection is now 2,362 characters.
+
+### Fixed
+
+- Fixed `sleep()` stamping a whole batch `consolidated_at` before promoting any of it, outside a transaction: a mid-batch throw left rows marked consolidated but never promoted, invisible to both the promotion path and the retention guard. Claim and promote now run per chunk in one transaction, and a failed chunk rolls back to `consolidated_at IS NULL`.
+- Fixed `trimWorkingMemory` deleting unconsolidated rows older than `workingMemoryTtlHours` (default 24h) while consolidation only becomes eligible at ttl/2 (12h): a session that crossed 24h without a consolidation pass destroyed the memory instead of promoting it (a 40-row bank fell to 22 with no consolidation log row). Unconsolidated rows are now categorically exempt from the TTL and overflow trims.
+- Fixed the `consolidated_at` migration back-filling every pre-existing row with `now()` when the column was first added, which made an upgraded bank's entire history ineligible for consolidation — and, under the corrected trim predicate, deletable.
+- Fixed the graph voice emitting `fact_<memoryId>_<index>` and `gist_<id>` identifiers that could not hydrate; 7 of 22 graph candidates were discarded on a real bank, now 0 of 17.
+- Fixed flat extracted statements being written as a fabricated `subject='fact'`, `predicate='entity'` triple that no subject-based reader can reach (154 of 185 rows on a real bank). They are stored in `memoria_facts` and indexed for text search instead; no `facts` triple is invented.
 
 ## [17.3.8] - 2026-08-19
 
