@@ -3061,8 +3061,7 @@ mod tests {
 				settings_json: settings_json.clone(),
 				..Default::default()
 			};
-			let decoded =
-				proto::LspServerBinding::decode(binding.encode_to_vec().as_slice()).unwrap();
+			let decoded = proto::LspServerBinding::decode(binding.encode_to_vec().as_slice()).unwrap();
 			assert_eq!(decoded.settings_json, settings_json);
 		}
 	}

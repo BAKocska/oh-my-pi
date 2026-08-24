@@ -287,6 +287,7 @@ impl LspBindingSpec {
 	pub fn root_markers(&self) -> &[Str] {
 		&self.root_markers
 	}
+
 	/// Returns the exact active `workspace/didChangeConfiguration` parameters.
 	pub const fn settings_json(&self) -> &Bytes {
 		&self.settings_json
@@ -850,7 +851,8 @@ impl LspRegistry {
 	}
 
 	/// Re-emits the active binding configuration before optionally replacing
-	/// the native binding lane. Callers evict config and pool caches before calling.
+	/// the native binding lane. Callers evict config and pool caches before
+	/// calling.
 	pub async fn reload_binding(
 		&self,
 		binding_id: LspBindingId,
@@ -3429,14 +3431,13 @@ mod tests {
 		let root = tempfile::tempdir().unwrap();
 		let registry =
 			LspRegistry::new(DocumentStore::new(ServerConfig::new(root.path()).unwrap()).unwrap());
-		let configured = Bytes::from_static(
-			br#"{"settings":{"rust-analyzer":{"cargo":{"features":["all"]}}}}"#,
-		);
+		let configured =
+			Bytes::from_static(br#"{"settings":{"rust-analyzer":{"cargo":{"features":["all"]}}}}"#);
 		let empty = Bytes::from_static(br#"{"settings":{}}"#);
 
 		for (name, settings_json) in [("configured", configured), ("empty", empty)] {
 			let transport = Arc::new(ToggleNotifyTransport {
-				fail: AtomicBool::new(false),
+				fail:   AtomicBool::new(false),
 				params: Mutex::new(Vec::new()),
 			});
 			let server = LspServer::new(

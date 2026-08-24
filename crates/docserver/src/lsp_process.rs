@@ -471,11 +471,7 @@ impl LspProcess {
 			}
 			if config.settings.is_some() {
 				if let Err(error) = transport
-					.notify(
-						"workspace/didChangeConfiguration",
-						settings_json,
-						cancel.child_token(),
-					)
+					.notify("workspace/didChangeConfiguration", settings_json, cancel.child_token())
 					.await
 					.map_err(LspProcessError::from)
 				{
