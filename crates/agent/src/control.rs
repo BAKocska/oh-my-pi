@@ -26,12 +26,7 @@ use serde_json::value::RawValue;
 use thiserror::Error;
 
 use crate::{
-	AgentHostControl, ArbiterError,
-	campaign::{
-		CampaignEntry, CampaignMachine, CampaignSpec, CampaignStepResult, DisengageError,
-		EngageError, EngageOptions, EngageReceipt,
-	},
-	core_regime,
+	AgentHostControl, ArbiterError, core_regime,
 	journal::{
 		Journal, JournalCustomEntry, JournalError, JournalQuery, JournalReply, JournalRequest,
 		SessionStateValue, SessionStateWatchEvent,
@@ -39,6 +34,10 @@ use crate::{
 	journal_kinds::EntryKindDecl,
 	r#loop,
 	r#loop::{ActiveCheckpoint, CheckpointState},
+	regime::{
+		ActivationId, Regime, RegimeRecord, RegimeSpec, RegimeStepResult, StartError, StartOptions,
+		StartReceipt, StopError,
+	},
 	tool_choice::Invoker,
 };
 
@@ -84,20 +83,20 @@ pub enum ControlError {
 	/// A rewind for the active checkpoint is already queued.
 	#[error("rewind already scheduled for the active checkpoint")]
 	RewindAlreadyScheduled,
-	/// The campaign stack rejected an engagement.
+	/// The regime set rejected a start.
 	#[error(transparent)]
-	CampaignEngage(#[from] EngageError),
-	/// The campaign stack rejected a disengagement.
+	RegimeStart(#[from] StartError),
+	/// The regime set rejected a stop.
 	#[error(transparent)]
-	CampaignDisengage(#[from] DisengageError),
-	/// Campaign journaling or arbitration failed on the mutable agent owner.
+	RegimeStop(#[from] StopError),
+	/// Regime journaling or arbitration failed on the mutable agent owner.
 	#[error(transparent)]
-	CampaignArbiter(#[from] ArbiterError),
-	/// A built-in campaign selector was not declared by Core.
-	#[error("unknown core campaign")]
-	UnknownCoreCampaign {
+	RegimeArbiter(#[from] ArbiterError),
+	/// A built-in regime selector was not declared by Core.
+	#[error("unknown core regime `{id}`")]
+	UnknownCoreRegime {
 		/// Unknown stable declaration identity.
-		spec_id: Str,
+		id: Str,
 	},
 }
 
@@ -145,31 +144,32 @@ pub enum ControlMailboxEvent {
 	JournalHandled,
 	/// A loop-scoped rewind is ready for boundary execution.
 	Rewind(ScheduledRewind),
-	/// A campaign command requires mutable access to the agent arbiter.
-	Campaign(CampaignControl),
+	/// A regime command requires mutable access to the agent arbiter.
+	Regime(RegimeControl),
 }
-/// One authenticated campaign operation surfaced to the mutable agent owner.
-pub enum CampaignControl {
-	/// Engage a declared machine.
-	Engage {
+/// One authenticated regime lifecycle operation surfaced to the mutable agent
+/// owner.
+pub enum RegimeControl {
+	/// Start one declared regime activation.
+	Start {
 		/// Immutable declaration.
-		spec:    Arc<CampaignSpec>,
-		/// Extension or core machine.
-		machine: Box<dyn CampaignMachine>,
-		/// Engagement options.
-		options: EngageOptions,
+		spec:    Arc<RegimeSpec>,
+		/// Extension or core handler.
+		handler: Box<dyn Regime>,
+		/// Start options.
+		options: StartOptions,
 		/// Correlated result.
-		reply:   flume::Sender<Result<EngageReceipt, ControlError>>,
+		reply:   flume::Sender<Result<StartReceipt, ControlError>>,
 	},
-	/// Project every active engagement.
+	/// Project every active or queued activation.
 	Active {
 		/// Correlated result.
-		reply: flume::Sender<Result<Vec<CampaignEntry>, ControlError>>,
+		reply: flume::Sender<Result<Vec<RegimeRecord>, ControlError>>,
 	},
-	/// Remove one owned engagement.
-	Disengage {
-		/// Engagement identity.
-		engagement: Str,
+	/// Stop one active or queued activation.
+	Stop {
+		/// Activation identity.
+		activation: ActivationId,
 		/// Current epoch milliseconds.
 		now_ms:     u64,
 		/// Correlated result.
@@ -193,53 +193,53 @@ pub enum CampaignControl {
 		/// Correlated acknowledgement.
 		reply: flume::Sender<Result<(), ControlError>>,
 	},
-	/// Explicitly step one campaign ladder.
-	Step {
-		/// Engagement identity.
-		engagement: Str,
+	/// Advance one activation's committed-step count.
+	Advance {
+		/// Activation identity.
+		activation: ActivationId,
 		/// Forensic transition reason.
 		reason:     Str,
 		/// Correlated result.
-		reply:      flume::Sender<Result<CampaignStepResult, ControlError>>,
+		reply:      flume::Sender<Result<RegimeStepResult, ControlError>>,
 	},
-	/// Cut one campaign without dwell.
-	Cut {
-		/// Engagement identity.
-		engagement: Str,
+	/// Cancel one activation immediately.
+	Cancel {
+		/// Activation identity.
+		activation: ActivationId,
 		/// Correlated result.
 		reply:      flume::Sender<Result<bool, ControlError>>,
 	},
-	/// Update one campaign's typed state payload.
+	/// Update one regime activation's typed state payload.
 	UpdateState {
-		/// Engagement identity.
-		engagement: Str,
-		/// Machine-family payload.
+		/// Activation identity.
+		activation: ActivationId,
+		/// Versioned handler-state payload.
 		payload:    Bytes,
 		/// Correlated durable entry.
-		reply:      flume::Sender<Result<CampaignEntry, ControlError>>,
+		reply:      flume::Sender<Result<RegimeRecord, ControlError>>,
 	},
 }
 
-impl CampaignControl {
+impl RegimeControl {
 	/// Rejects a loop-scoped command received by a journal-only harness.
 	pub fn reject_unavailable(self) {
 		match self {
-			Self::Engage { reply, .. } => {
+			Self::Start { reply, .. } => {
 				let _ = reply.send(Err(ControlError::Closed));
 			},
 			Self::Active { reply } => {
 				let _ = reply.send(Err(ControlError::Closed));
 			},
-			Self::Disengage { reply, .. } => {
+			Self::Stop { reply, .. } => {
 				let _ = reply.send(Err(ControlError::Closed));
 			},
 			Self::RegisterPendingInvoker { reply, .. } | Self::RemovePendingInvoker { reply, .. } => {
 				let _ = reply.send(Err(ControlError::Closed));
 			},
-			Self::Step { reply, .. } => {
+			Self::Advance { reply, .. } => {
 				let _ = reply.send(Err(ControlError::Closed));
 			},
-			Self::Cut { reply, .. } => {
+			Self::Cancel { reply, .. } => {
 				let _ = reply.send(Err(ControlError::Closed));
 			},
 			Self::UpdateState { reply, .. } => {
@@ -596,17 +596,21 @@ impl ControlSender {
 			.map_err(ControlError::from)
 	}
 
-	/// Engages one campaign on the sole mutable agent owner.
-	pub async fn engage_campaign(
+	/// Starts one regime on the sole mutable agent owner.
+	///
+	/// # Errors
+	/// Returns a closed-owner, declaration, resource-acquisition, or durable
+	/// arbitration failure.
+	pub async fn start_regime(
 		&self,
-		spec: Arc<CampaignSpec>,
-		machine: Box<dyn CampaignMachine>,
-		options: EngageOptions,
-	) -> Result<EngageReceipt, ControlError> {
+		spec: Arc<RegimeSpec>,
+		handler: Box<dyn Regime>,
+		options: StartOptions,
+	) -> Result<StartReceipt, ControlError> {
 		let (reply, response) = flume::bounded(1);
 		self
 			.commands
-			.send(ControlCommand::Campaign(CampaignControl::Engage { spec, machine, options, reply }))
+			.send(ControlCommand::Regime(RegimeControl::Start { spec, handler, options, reply }))
 			.map_err(|_| ControlError::Closed)?;
 		response
 			.recv_async()
@@ -614,16 +618,20 @@ impl ControlSender {
 			.map_err(|_| ControlError::Closed)?
 	}
 
-	/// Engages a built-in regime by stable declaration identity.
-	pub async fn engage_regime(
+	/// Starts a built-in regime by stable declaration identity.
+	///
+	/// # Errors
+	/// Returns [`ControlError::UnknownCoreRegime`] for an unknown identity, or
+	/// any error returned by [`Self::start_regime`].
+	pub async fn start_core_regime(
 		&self,
-		spec_id: &str,
+		id: &str,
 		queue: bool,
-	) -> Result<EngageReceipt, ControlError> {
-		let (spec, machine) = core_regime(spec_id)
-			.ok_or_else(|| ControlError::UnknownCoreCampaign { spec_id: Str::new(spec_id) })?;
+	) -> Result<StartReceipt, ControlError> {
+		let (spec, handler) =
+			core_regime(id).ok_or_else(|| ControlError::UnknownCoreRegime { id: Str::new(id) })?;
 		self
-			.engage_campaign(spec, machine, EngageOptions { now_ms: r#loop::now_ms(), queue })
+			.start_regime(spec, handler, StartOptions { now_ms: r#loop::now_ms(), queue })
 			.await
 	}
 
@@ -637,7 +645,7 @@ impl ControlSender {
 		let (reply, response) = flume::bounded(1);
 		self
 			.commands
-			.send(ControlCommand::Campaign(CampaignControl::RegisterPendingInvoker {
+			.send(ControlCommand::Regime(RegimeControl::RegisterPendingInvoker {
 				id,
 				source_tool,
 				invoker,
@@ -655,7 +663,7 @@ impl ControlSender {
 		let (reply, response) = flume::bounded(1);
 		self
 			.commands
-			.send(ControlCommand::Campaign(CampaignControl::RemovePendingInvoker { id, reply }))
+			.send(ControlCommand::Regime(RegimeControl::RemovePendingInvoker { id, reply }))
 			.map_err(|_| ControlError::Closed)?;
 		response
 			.recv_async()
@@ -663,16 +671,20 @@ impl ControlSender {
 			.map_err(|_| ControlError::Closed)?
 	}
 
-	/// Explicitly steps one campaign ladder on the sole mutable owner.
-	pub async fn step_campaign(
+	/// Advances one activation's committed-step accounting on the sole mutable
+	/// owner.
+	///
+	/// # Errors
+	/// Returns a closed-owner or durable arbitration failure.
+	pub async fn advance_regime(
 		&self,
-		engagement: Str,
+		activation: ActivationId,
 		reason: Str,
-	) -> Result<CampaignStepResult, ControlError> {
+	) -> Result<RegimeStepResult, ControlError> {
 		let (reply, response) = flume::bounded(1);
 		self
 			.commands
-			.send(ControlCommand::Campaign(CampaignControl::Step { engagement, reason, reply }))
+			.send(ControlCommand::Regime(RegimeControl::Advance { activation, reason, reply }))
 			.map_err(|_| ControlError::Closed)?;
 		response
 			.recv_async()
@@ -680,12 +692,15 @@ impl ControlSender {
 			.map_err(|_| ControlError::Closed)?
 	}
 
-	/// Cuts one campaign without dwell on the sole mutable owner.
-	pub async fn cut_campaign(&self, engagement: Str) -> Result<bool, ControlError> {
+	/// Cancels one activation immediately on the sole mutable owner.
+	///
+	/// # Errors
+	/// Returns a closed-owner or durable arbitration failure.
+	pub async fn cancel_regime(&self, activation: ActivationId) -> Result<bool, ControlError> {
 		let (reply, response) = flume::bounded(1);
 		self
 			.commands
-			.send(ControlCommand::Campaign(CampaignControl::Cut { engagement, reply }))
+			.send(ControlCommand::Regime(RegimeControl::Cancel { activation, reply }))
 			.map_err(|_| ControlError::Closed)?;
 		response
 			.recv_async()
@@ -693,20 +708,20 @@ impl ControlSender {
 			.map_err(|_| ControlError::Closed)?
 	}
 
-	/// Updates one campaign's typed state and returns the journaled entry.
-	pub async fn update_campaign_state(
+	/// Updates one regime activation's typed state and returns the journaled
+	/// record.
+	///
+	/// # Errors
+	/// Returns a closed-owner, state-restoration, or durable journaling failure.
+	pub async fn update_regime_state(
 		&self,
-		engagement: Str,
+		activation: ActivationId,
 		payload: Bytes,
-	) -> Result<CampaignEntry, ControlError> {
+	) -> Result<RegimeRecord, ControlError> {
 		let (reply, response) = flume::bounded(1);
 		self
 			.commands
-			.send(ControlCommand::Campaign(CampaignControl::UpdateState {
-				engagement,
-				payload,
-				reply,
-			}))
+			.send(ControlCommand::Regime(RegimeControl::UpdateState { activation, payload, reply }))
 			.map_err(|_| ControlError::Closed)?;
 		response
 			.recv_async()
@@ -714,12 +729,15 @@ impl ControlSender {
 			.map_err(|_| ControlError::Closed)?
 	}
 
-	/// Returns every active or queued campaign engagement.
-	pub async fn active_campaigns(&self) -> Result<Vec<CampaignEntry>, ControlError> {
+	/// Returns every active or queued regime activation.
+	///
+	/// # Errors
+	/// Returns [`ControlError::Closed`] if the mutable agent owner stopped.
+	pub async fn active_regimes(&self) -> Result<Vec<RegimeRecord>, ControlError> {
 		let (reply, response) = flume::bounded(1);
 		self
 			.commands
-			.send(ControlCommand::Campaign(CampaignControl::Active { reply }))
+			.send(ControlCommand::Regime(RegimeControl::Active { reply }))
 			.map_err(|_| ControlError::Closed)?;
 		response
 			.recv_async()
@@ -727,13 +745,16 @@ impl ControlSender {
 			.map_err(|_| ControlError::Closed)?
 	}
 
-	/// Disengages one campaign on the sole mutable agent owner.
-	pub async fn disengage_campaign(&self, engagement: Str) -> Result<bool, ControlError> {
+	/// Stops one regime activation on the sole mutable agent owner.
+	///
+	/// # Errors
+	/// Returns a closed-owner, minimum-duration, or durable arbitration failure.
+	pub async fn stop_regime(&self, activation: ActivationId) -> Result<bool, ControlError> {
 		let now_ms = r#loop::now_ms();
 		let (reply, response) = flume::bounded(1);
 		self
 			.commands
-			.send(ControlCommand::Campaign(CampaignControl::Disengage { engagement, now_ms, reply }))
+			.send(ControlCommand::Regime(RegimeControl::Stop { activation, now_ms, reply }))
 			.map_err(|_| ControlError::Closed)?;
 		response
 			.recv_async()
@@ -786,7 +807,7 @@ impl ControlMailbox {
 		journal: &mut Journal,
 		limit: usize,
 		surfaced: &mut VecDeque<ScheduledRewind>,
-		campaigns: &mut Vec<CampaignControl>,
+		regimes: &mut Vec<RegimeControl>,
 	) -> usize {
 		let mut handled = 0;
 		while handled < limit {
@@ -795,7 +816,7 @@ impl ControlMailbox {
 			};
 			match handle_command(journal, command, &self.checkpoint_state) {
 				ControlMailboxEvent::Rewind(rewind) => surfaced.push_back(rewind),
-				ControlMailboxEvent::Campaign(campaign) => campaigns.push(campaign),
+				ControlMailboxEvent::Regime(regime) => regimes.push(regime),
 				ControlMailboxEvent::Closed | ControlMailboxEvent::JournalHandled => {},
 			}
 			handled += 1;
@@ -805,7 +826,7 @@ impl ControlMailbox {
 }
 
 pub(crate) enum ControlCommand {
-	Campaign(CampaignControl),
+	Regime(RegimeControl),
 	Reset {
 		ts:    u64,
 		reply: flume::Sender<JournalReplyResult<u64>>,
@@ -893,7 +914,7 @@ fn handle_command(
 	checkpoint_state: &Mutex<CheckpointState>,
 ) -> ControlMailboxEvent {
 	match command {
-		ControlCommand::Campaign(command) => return ControlMailboxEvent::Campaign(command),
+		ControlCommand::Regime(command) => return ControlMailboxEvent::Regime(command),
 		ControlCommand::Reset { ts, reply } => {
 			let _ = reply.send(journal.reset(ts));
 		},

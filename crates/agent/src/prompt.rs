@@ -68,7 +68,8 @@ pub struct ContextFile {
 	pub origin:  Str,
 	/// Exact file bytes captured for this snapshot.
 	pub content: Bytes,
-	/// Ancestor distance from the workspace directory; zero is most authoritative.
+	/// Ancestor distance from the workspace directory; zero is most
+	/// authoritative.
 	///
 	/// `None` denotes an unscoped source and is less authoritative than every
 	/// project-scoped source.
@@ -79,12 +80,7 @@ impl ContextFile {
 	/// Creates an immutable context-file input.
 	#[inline]
 	pub fn new(path: impl Into<PathBuf>, content: impl Into<Bytes>) -> Self {
-		Self {
-			path: path.into(),
-			origin: Str::default(),
-			content: content.into(),
-			depth: None,
-		}
+		Self { path: path.into(), origin: Str::default(), content: content.into(), depth: None }
 	}
 
 	/// Attaches the canonical source origin retained by discovery.
@@ -139,7 +135,9 @@ fn context_blocks_contain(source: &[String], candidate: &[String]) -> bool {
 	!source.is_empty()
 		&& !candidate.is_empty()
 		&& candidate.len() <= source.len()
-		&& source.windows(candidate.len()).any(|window| window == candidate)
+		&& source
+			.windows(candidate.len())
+			.any(|window| window == candidate)
 }
 
 /// Returns retained context-file indices in least-to-most-authoritative order.
@@ -152,13 +150,11 @@ fn context_blocks_contain(source: &[String], candidate: &[String]) -> bool {
 /// source bytes rather than normalized content.
 pub fn dedupe_context_file_indices(context_files: &[ContextFile]) -> Vec<usize> {
 	let mut order = (0..context_files.len()).collect::<Vec<_>>();
-	order.sort_by(|left, right| {
-		match (context_files[*left].depth, context_files[*right].depth) {
-			(None, None) => Ordering::Equal,
-			(None, Some(_)) => Ordering::Less,
-			(Some(_), None) => Ordering::Greater,
-			(Some(left), Some(right)) => right.cmp(&left),
-		}
+	order.sort_by(|left, right| match (context_files[*left].depth, context_files[*right].depth) {
+		(None, None) => Ordering::Equal,
+		(None, Some(_)) => Ordering::Less,
+		(Some(_), None) => Ordering::Greater,
+		(Some(left), Some(right)) => right.cmp(&left),
 	});
 	let blocks = order
 		.iter()
@@ -175,8 +171,7 @@ pub fn dedupe_context_file_indices(context_files: &[ContextFile]) -> Vec<usize> 
 				.iter()
 				.enumerate()
 				.any(|(candidate, candidate_blocks)| {
-					candidate > position
-						&& context_blocks_contain(candidate_blocks, &blocks[position])
+					candidate > position && context_blocks_contain(candidate_blocks, &blocks[position])
 				});
 			(!contained).then_some(*index)
 		})
@@ -1142,20 +1137,20 @@ impl SlotSource for CachedContribution {
 		Ok(())
 	}
 }
-/// Immutable built-in [`SlotSource`] selected by the campaign prompt-slot
-/// binding.
+/// Immutable built-in [`SlotSource`] selected by a regime-scoped prompt
+/// setting.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PromptSlotSource {
 	slot: Str,
 }
 
 impl PromptSlotSource {
-	/// Creates a prompt source from a canonical prompt-slot binding value.
+	/// Creates a prompt source from a canonical scoped prompt-setting value.
 	pub fn new(slot: impl Into<Str>) -> Self {
 		Self { slot: slot.into() }
 	}
 
-	/// Returns the canonical binding value.
+	/// Returns the canonical scoped setting value.
 	pub fn slot(&self) -> &str {
 		self.slot.as_str()
 	}
@@ -1847,10 +1842,10 @@ pub enum PromptError {
 	/// Embedded or user-authored template compilation/rendering failed.
 	#[error(transparent)]
 	Template(#[from] omp_scribe::Error),
-	/// A campaign binding named no built-in prompt slot.
+	/// A scoped setting named no built-in prompt slot.
 	#[error("unknown prompt slot {slot}")]
 	UnknownPromptSlot {
-		/// Unknown binding value.
+		/// Unknown scoped setting value.
 		slot: Str,
 	},
 	/// The source emitted different items for identical immutable input.
@@ -2003,11 +1998,7 @@ mod tests {
 	fn context_dedup_uses_normalized_contiguous_paragraph_containment() {
 		let files = [
 			context("/far/AGENTS.md", "  Shared A.  \n\n Shared B. ", Some(5)),
-			context(
-				"/project/AGENTS.md",
-				"Shared A.\n\nShared B.\n\nProject-only.",
-				Some(0),
-			),
+			context("/project/AGENTS.md", "Shared A.\n\nShared B.\n\nProject-only.", Some(0)),
 		];
 		assert_eq!(retained_paths(&files), ["/project/AGENTS.md"]);
 	}
@@ -2025,16 +2016,9 @@ mod tests {
 	fn context_dedup_keeps_non_contiguous_and_changed_paragraphs() {
 		let interleaved = [
 			context("/far/AGENTS.md", "First.\n\nSecond.\n\nThird.", Some(5)),
-			context(
-				"/project/AGENTS.md",
-				"First.\n\nInterleaved.\n\nSecond.\n\nThird.",
-				Some(0),
-			),
+			context("/project/AGENTS.md", "First.\n\nInterleaved.\n\nSecond.\n\nThird.", Some(0)),
 		];
-		assert_eq!(
-			retained_paths(&interleaved),
-			["/far/AGENTS.md", "/project/AGENTS.md"]
-		);
+		assert_eq!(retained_paths(&interleaved), ["/far/AGENTS.md", "/project/AGENTS.md"]);
 
 		let changed = [
 			context("/far/AGENTS.md", "Always use tabs.", Some(5)),
@@ -2060,10 +2044,7 @@ mod tests {
 				context("/far/AGENTS.md", "Never delete user data.", Some(5)),
 				context("/project/AGENTS.md", &example, Some(0)),
 			];
-			assert_eq!(
-				retained_paths(&files),
-				["/far/AGENTS.md", "/project/AGENTS.md"]
-			);
+			assert_eq!(retained_paths(&files), ["/far/AGENTS.md", "/project/AGENTS.md"]);
 		}
 	}
 
@@ -2071,11 +2052,7 @@ mod tests {
 	fn fence_boundaries_do_not_make_surrounding_paragraphs_contiguous() {
 		let files = [
 			context("/far/AGENTS.md", "Before.\n\nAfter.", Some(5)),
-			context(
-				"/project/AGENTS.md",
-				"Before.\n\n```\nexample\n```\n\nAfter.",
-				Some(0),
-			),
+			context("/project/AGENTS.md", "Before.\n\n```\nexample\n```\n\nAfter.", Some(0)),
 		];
 		assert_eq!(retained_paths(&files), ["/far/AGENTS.md", "/project/AGENTS.md"]);
 	}
@@ -2118,10 +2095,7 @@ mod tests {
 			context("/project/AGENTS.md", "Shared.", Some(0)),
 			context("/user/AGENTS.md", "Shared.\n\nUser-only.", None),
 		];
-		assert_eq!(
-			retained_paths(&user_superset),
-			["/user/AGENTS.md", "/project/AGENTS.md"]
-		);
+		assert_eq!(retained_paths(&user_superset), ["/user/AGENTS.md", "/project/AGENTS.md"]);
 	}
 
 	#[test]

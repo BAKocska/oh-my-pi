@@ -146,7 +146,8 @@ fn truncate_parts_for_persistence(parts: &mut [thread_pb::Part]) {
 	}
 }
 fn is_terminal_error_item(item: &thread_pb::Item) -> bool {
-	item.props
+	item
+		.props
 		.as_ref()
 		.and_then(|props| props.fields.get(journal_kinds::TERMINAL_ERROR_PROP))
 		.and_then(|value| value.kind.as_ref())

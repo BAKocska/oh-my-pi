@@ -66,13 +66,7 @@ struct CallState {
 
 #[derive(Debug)]
 enum WorkerMessage {
-	Check {
-		epoch:   u64,
-		call_id: Str,
-		display: Str,
-		path:    PathBuf,
-		removed: Vec<Str>,
-	},
+	Check { epoch: u64, call_id: Str, display: Str, path: PathBuf, removed: Vec<Str> },
 	Invalidate(PathBuf),
 	Reset,
 	Barrier(Sender<()>),
@@ -85,13 +79,13 @@ enum WorkerMessage {
 /// invalidates queued/in-flight verdicts immediately through an atomic epoch.
 #[derive(Debug)]
 pub struct StreamingEditGuard {
-	cwd:      Arc<PathBuf>,
-	enabled:  bool,
-	epoch:    Arc<AtomicU64>,
+	cwd:         Arc<PathBuf>,
+	enabled:     bool,
+	epoch:       Arc<AtomicU64>,
 	invalidated: Arc<Mutex<HashSet<(u64, Str)>>>,
-	calls:    Mutex<HashMap<Str, CallState>>,
-	work_tx:  Sender<WorkerMessage>,
-	abort_rx: Receiver<StreamingEditAbort>,
+	calls:       Mutex<HashMap<Str, CallState>>,
+	work_tx:     Sender<WorkerMessage>,
+	abort_rx:    Receiver<StreamingEditAbort>,
 }
 
 impl StreamingEditGuard {
@@ -101,12 +95,7 @@ impl StreamingEditGuard {
 		let (abort_tx, abort_rx) = flume::unbounded();
 		let epoch = Arc::new(AtomicU64::new(0));
 		let invalidated = Arc::new(Mutex::new(HashSet::new()));
-		tokio::spawn(worker(
-			work_rx,
-			abort_tx,
-			Arc::clone(&epoch),
-			Arc::clone(&invalidated),
-		));
+		tokio::spawn(worker(work_rx, abort_tx, Arc::clone(&epoch), Arc::clone(&invalidated)));
 		Self {
 			cwd: Arc::new(cwd),
 			enabled,
@@ -123,9 +112,14 @@ impl StreamingEditGuard {
 		if !self.enabled {
 			return;
 		}
-		let Some(dialect) = StreamingEditDialect::from_revision(revision) else { return };
+		let Some(dialect) = StreamingEditDialect::from_revision(revision) else {
+			return;
+		};
 		let call_id = call_id.into();
-		self.invalidated.lock().remove(&(self.epoch.load(Ordering::Acquire), call_id.clone()));
+		self
+			.invalidated
+			.lock()
+			.remove(&(self.epoch.load(Ordering::Acquire), call_id.clone()));
 		self.calls.lock().insert(call_id, CallState {
 			dialect,
 			buffer: String::new(),
@@ -140,10 +134,14 @@ impl StreamingEditGuard {
 		}
 		let epoch = self.epoch.load(Ordering::Acquire);
 		let mut calls = self.calls.lock();
-		let Some(call) = calls.get_mut(call_id) else { return };
+		let Some(call) = calls.get_mut(call_id) else {
+			return;
+		};
 		call.buffer.push_str(fragment);
 		for target in extract_targets(call.dialect, &call.buffer) {
-			let Some(path) = resolve_path(&self.cwd, &target.path) else { continue };
+			let Some(path) = resolve_path(&self.cwd, &target.path) else {
+				continue;
+			};
 			let known = call.queued.entry(path.clone()).or_default();
 			let removed = target
 				.removed
@@ -165,7 +163,9 @@ impl StreamingEditGuard {
 
 	/// Invalidates one cached target after an edit commits.
 	pub fn invalidate(&self, path: &str) {
-		let Some(path) = resolve_path(&self.cwd, path) else { return };
+		let Some(path) = resolve_path(&self.cwd, path) else {
+			return;
+		};
 		let _ = self.work_tx.send(WorkerMessage::Invalidate(path));
 	}
 
@@ -183,7 +183,9 @@ impl StreamingEditGuard {
 	pub fn invalidate_call(&self, call_id: &str) {
 		let epoch = self.epoch.load(Ordering::Acquire);
 		self.invalidated.lock().insert((epoch, Str::new(call_id)));
-		let Some(call) = self.calls.lock().remove(call_id) else { return };
+		let Some(call) = self.calls.lock().remove(call_id) else {
+			return;
+		};
 		for path in call.queued.into_keys() {
 			let _ = self.work_tx.send(WorkerMessage::Invalidate(path));
 		}
@@ -216,7 +218,12 @@ impl StreamingEditGuard {
 	/// Waits until every check queued before this call has settled.
 	pub async fn settle(&self) {
 		let (reply, done) = flume::bounded(1);
-		if self.work_tx.send_async(WorkerMessage::Barrier(reply)).await.is_ok() {
+		if self
+			.work_tx
+			.send_async(WorkerMessage::Barrier(reply))
+			.await
+			.is_ok()
+		{
 			let _ = done.recv_async().await;
 		}
 	}
@@ -230,7 +237,9 @@ struct GuardTarget {
 
 fn extract_targets(dialect: StreamingEditDialect, buffer: &str) -> Vec<GuardTarget> {
 	let document = if dialect == StreamingEditDialect::Replace {
-		let Ok(document) = omp_slopjson::parse(buffer) else { return Vec::new() };
+		let Ok(document) = omp_slopjson::parse(buffer) else {
+			return Vec::new();
+		};
 		document
 	} else {
 		omp_slopjson::parse_streaming(buffer)
@@ -245,8 +254,12 @@ fn extract_targets(dialect: StreamingEditDialect, buffer: &str) -> Vec<GuardTarg
 				let path = edit.get("path")?.as_str()?;
 				let old = edit.get("old")?.as_str()?;
 				Some(GuardTarget {
-					path: Str::new(path),
-					removed: old.lines().filter(|line| !line.is_empty()).map(Str::new).collect(),
+					path:    Str::new(path),
+					removed: old
+						.lines()
+						.filter(|line| !line.is_empty())
+						.map(Str::new)
+						.collect(),
 				})
 			})
 			.collect(),
@@ -267,9 +280,7 @@ fn extract_targets(dialect: StreamingEditDialect, buffer: &str) -> Vec<GuardTarg
 fn extract_patch_targets(input: &str) -> Vec<GuardTarget> {
 	let mut targets = Vec::<GuardTarget>::new();
 	let mut current = None;
-	let complete = input
-		.rfind('\n')
-		.map_or("", |end| &input[..=end]);
+	let complete = input.rfind('\n').map_or("", |end| &input[..=end]);
 	for line in complete.lines() {
 		if let Some(path) = line
 			.strip_prefix("*** Update File:")
@@ -313,7 +324,9 @@ fn extract_sloppy_targets(input: &str) -> Vec<GuardTarget> {
 		let mut rest = line;
 		while let Some(open) = rest.find('⟪') {
 			let selected = &rest[open + '⟪'.len_utf8()..];
-			let Some(close) = selected.find('⟫') else { break };
+			let Some(close) = selected.find('⟫') else {
+				break;
+			};
 			let body = &selected[..close];
 			if let Some((old, _)) = body.split_once('│')
 				&& !old.is_empty()
@@ -331,7 +344,11 @@ fn resolve_path(cwd: &Path, authored: &str) -> Option<PathBuf> {
 		return None;
 	}
 	let path = Path::new(authored);
-	Some(if path.is_absolute() { path.to_path_buf() } else { cwd.join(path) })
+	Some(if path.is_absolute() {
+		path.to_path_buf()
+	} else {
+		cwd.join(path)
+	})
 }
 
 async fn worker(
@@ -372,7 +389,8 @@ async fn worker(
 						.ok()
 						.map(|text| Str::new(normalize_lf(&text)));
 					if epoch.load(Ordering::Acquire) != queued_epoch
-						|| call_invalidated(&invalidated, queued_epoch, &call_id) {
+						|| call_invalidated(&invalidated, queued_epoch, &call_id)
+					{
 						continue;
 					}
 					cache.insert(path.clone(), loaded.clone());
@@ -383,7 +401,8 @@ async fn worker(
 				let mut slice = Instant::now();
 				for line in removed {
 					if epoch.load(Ordering::Acquire) != queued_epoch
-						|| call_invalidated(&invalidated, queued_epoch, &call_id) {
+						|| call_invalidated(&invalidated, queued_epoch, &call_id)
+					{
 						break;
 					}
 					let normalized = Str::new(normalize_lf(&line));
@@ -392,19 +411,22 @@ async fn worker(
 					}
 					if !content.contains(normalized.as_str()) {
 						aborted_epoch = Some(queued_epoch);
-						let _ = abort_tx.send_async(StreamingEditAbort {
-							call_id: call_id.clone(),
-							path: display.clone(),
-							missing: normalized,
-							epoch: queued_epoch,
-						}).await;
+						let _ = abort_tx
+							.send_async(StreamingEditAbort {
+								call_id: call_id.clone(),
+								path:    display.clone(),
+								missing: normalized,
+								epoch:   queued_epoch,
+							})
+							.await;
 						break;
 					}
 					known.insert(normalized);
 					if slice.elapsed() >= Duration::from_millis(2) {
 						tokio::task::yield_now().await;
 						if epoch.load(Ordering::Acquire) != queued_epoch
-						|| call_invalidated(&invalidated, queued_epoch, &call_id) {
+							|| call_invalidated(&invalidated, queued_epoch, &call_id)
+						{
 							break;
 						}
 						slice = Instant::now();
@@ -415,11 +437,7 @@ async fn worker(
 	}
 }
 
-fn call_invalidated(
-	invalidated: &Mutex<HashSet<(u64, Str)>>,
-	epoch: u64,
-	call_id: &Str,
-) -> bool {
+fn call_invalidated(invalidated: &Mutex<HashSet<(u64, Str)>>, epoch: u64, call_id: &Str) -> bool {
 	invalidated.lock().contains(&(epoch, call_id.clone()))
 }
 
@@ -450,7 +468,9 @@ mod tests {
 	#[tokio::test]
 	async fn distinguishes_empty_file_from_failed_load() {
 		let temp = tempdir().expect("tempdir");
-		tokio::fs::write(temp.path().join("empty.txt"), "").await.expect("empty");
+		tokio::fs::write(temp.path().join("empty.txt"), "")
+			.await
+			.expect("empty");
 		let guard = StreamingEditGuard::new(temp.path().to_path_buf(), true);
 		guard.start("empty", &revision("apply_patch"));
 		guard.push_fragment("empty", &patch_args("empty.txt", "absent"));
@@ -465,7 +485,9 @@ mod tests {
 	async fn verifies_incremental_removed_lines_and_invalidates_cache() {
 		let temp = tempdir().expect("tempdir");
 		let path = temp.path().join("target.txt");
-		tokio::fs::write(&path, "alpha\nbeta\n").await.expect("source");
+		tokio::fs::write(&path, "alpha\nbeta\n")
+			.await
+			.expect("source");
 		let guard = StreamingEditGuard::new(temp.path().to_path_buf(), true);
 		guard.start("first", &revision("apply_patch"));
 		guard.push_fragment("first", &patch_args("target.txt", "alpha"));
@@ -486,7 +508,9 @@ mod tests {
 	#[tokio::test]
 	async fn completed_call_invalidation_drops_a_stale_async_result() {
 		let temp = tempdir().expect("tempdir");
-		tokio::fs::write(temp.path().join("target.txt"), "present\n").await.expect("source");
+		tokio::fs::write(temp.path().join("target.txt"), "present\n")
+			.await
+			.expect("source");
 		let guard = StreamingEditGuard::new(temp.path().to_path_buf(), true);
 		guard.start("done", &revision("apply_patch"));
 		guard.push_fragment("done", &patch_args("target.txt", "missing"));
@@ -498,7 +522,9 @@ mod tests {
 	#[tokio::test]
 	async fn reset_epoch_drops_queued_and_in_flight_verdicts_synchronously() {
 		let temp = tempdir().expect("tempdir");
-		tokio::fs::write(temp.path().join("target.txt"), "present\n").await.expect("source");
+		tokio::fs::write(temp.path().join("target.txt"), "present\n")
+			.await
+			.expect("source");
 		let guard = StreamingEditGuard::new(temp.path().to_path_buf(), true);
 		guard.start("stale", &revision("apply_patch"));
 		guard.push_fragment("stale", &patch_args("target.txt", "missing"));

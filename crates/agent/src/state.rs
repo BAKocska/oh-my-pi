@@ -14,8 +14,7 @@ use thiserror::Error;
 use tokio::sync::watch::{self, Receiver};
 
 use crate::{
-	InterruptedReasoningDialect, TurnOptions,
-	CompactionMethodOrder,
+	CompactionMethodOrder, InterruptedReasoningDialect, TurnOptions,
 	prompt::{CanonicalPromptSource, PromptError, PromptSource, RenderedPrompt, render_prompt},
 };
 
@@ -135,7 +134,7 @@ pub struct AgentSnapshot {
 	/// recovery compaction.
 	pub compaction:        CompactionMethodOrder,
 	/// Unexpected assistant-stop recovery policy.
-	pub unexpected_stop:  UnexpectedStopMode,
+	pub unexpected_stop:   UnexpectedStopMode,
 }
 
 impl AgentSnapshot {

@@ -44,9 +44,9 @@ pub const PLAN_YOLO_PROP: &str = "omp/plan-yolo";
 /// Namespaced explanation for an automatic prewalk transition.
 pub const PREWALK_REASON_PROP: &str = "omp/prewalk-reason";
 
-/// Builds immutable invocation metadata from the campaign prompt-slot binding.
+/// Builds immutable invocation metadata from the regime-scoped mode setting.
 ///
-/// `plan-yolo` and `prewalk` are one-shot bindings removed by the agent before
+/// `plan-yolo` and `prewalk` are one-shot settings removed by the agent before
 /// this function is called for their first mutating effect.
 pub fn invocation_mode_props(mode: Option<&str>, effects: &Effects) -> value_pb::ValueMap {
 	let mode = mode.unwrap_or("standard");

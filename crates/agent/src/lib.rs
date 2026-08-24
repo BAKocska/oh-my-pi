@@ -8,7 +8,7 @@
 //! this boundary. [`Agent`] is the durable policy loop tying these foundations
 //! into complete N-turn conversations.
 
-#[allow(unused_imports)]
+#[allow(unused_imports, reason = "macro_use imports are consumed by generated and test modules")]
 #[macro_use]
 extern crate omp_core;
 
@@ -20,7 +20,6 @@ mod autolearn;
 mod batch;
 pub mod branch_summary;
 mod broker;
-pub mod campaign;
 mod compact;
 pub mod context;
 mod continuation;
@@ -45,6 +44,7 @@ pub mod prompt_assets;
 pub mod prompt_engine;
 pub mod prompt_keys;
 mod read_only_policy;
+pub mod regime;
 mod revival;
 mod schedule;
 pub mod scheduler;
@@ -61,7 +61,7 @@ pub use approvals::{
 	ApprovalBook, ApprovalDecision, ApprovalGuard, ApprovalInbox, ApprovalRequest, ApprovalRoute,
 	ApprovalSource, ApprovalSpec, ApprovalTicket, TicketState,
 };
-pub use arbiter::{Arbiter, ArbiterError, Fold, FoldFact, Lane, PendingInvokerCx, PointCx};
+pub use arbiter::{Arbiter, ArbiterError, PendingInvokerCx, PointCx, RegimeFact};
 pub use attachments::{
 	Attachment, AttachmentError, AttachmentIndex, DEFAULT_PROVIDER_IMAGE_BUDGET,
 	MAX_TRANSIENT_IMAGE_BYTES, NormalizeAttachmentError, NormalizedAttachmentImage,
@@ -82,16 +82,6 @@ pub use broker::{
 	CollabAgentRecord, CollabRegistrySnapshot, DeliveryMode, DeliveryReceipt, DiscoveryDiagnostic,
 	DiscoveryDiagnosticKind, ParkLease, PeerMessage, Receipt, RegistryError, RegistryStatus,
 	RevivalRequest, RoutedEvent, now_ms as broker_now_ms, peer_item,
-};
-pub use campaign::{
-	BindSlot, CampaignEntry, CampaignEntryStatus, CampaignFold, CampaignMachine, CampaignScope,
-	CampaignSpec, CampaignSpecId, CampaignStack, CampaignStateError, CampaignStepResult,
-	CampaignWhen, ClaimOutcome, DeclareError, DisengageError, EngageError, EngageOptions,
-	EngageReceipt, EngagementId, ExhaustPolicy, GoalCampaign, GoalCampaignState, HoldError, HoldSet,
-	HoldTicket, Ladder, LadderStep, LegacySessionStopCampaign, QuiescenceBarrier, Reaction,
-	RegimeMachine, RevivalReport, SLOT_TABLE, ScopedBinding, SlotClaim, SlotRegistry,
-	SubagentYieldCampaign, Verdict, WinnerKind, autoresearch_regime_spec, core_regime,
-	goal_regime_spec, plan_regime_spec, vibe_regime_spec,
 };
 pub use compact::{
 	COMPACTION_RECOVERY_BAND, CancelCompaction, CompactionBoundary, CompactionCancellation,
@@ -196,6 +186,15 @@ pub use prompt::{
 	WorkspaceRootsInput, WorkspaceTreeInput, dedupe_context_file_indices, render_prompt,
 };
 pub use read_only_policy::is_read_only_agent;
+pub use regime::{
+	AcquireOutcome, ActivationId, BuiltinRegime, DeclareError, GoalRegime, GoalRegimeState, Next,
+	QuiescenceBarrier, RESOURCE_TABLE, Regime, RegimeContext, RegimeError, RegimeFailure, RegimeId,
+	RegimeLifetime, RegimeRecord, RegimeSet, RegimeSpec, RegimeStateError, RegimeStatus,
+	RegimeStepResult, RegimeWhen, Resource, ResourceDecl, ResourceRegistry, RevivalReport,
+	ScopedSetting, SettingSlot, StartError, StartOptions, StartReceipt, StopError,
+	SubagentYieldRegime, WaitError, WaitSet, WaitTicket, autoresearch_regime_spec, core_regime,
+	goal_regime_spec, plan_regime_spec, vibe_regime_spec,
+};
 pub use revival::{RevivalError, RevivedSession, revive, revive_existing};
 pub use schedule::{
 	Firing, FiringOutcome, MissedRunPolicy, Schedule, ScheduleBudget, ScheduleDelivery,

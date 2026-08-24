@@ -1,6 +1,6 @@
 //! Named decision-point seams for the closed agent loop.
 
-use std::{array, mem, sync};
+use std::{mem, sync};
 
 use flume::Receiver;
 use omp_core::{Point, PointSet, Str};
@@ -8,15 +8,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
 	Journal, JournalError,
-	campaign::{
-		CampaignEntry, CampaignEntryStatus, CampaignFold, CampaignMachine, CampaignSpec,
-		CampaignStack, CampaignStateError, CampaignStepResult, DisengageError, EngageError,
-		EngageOptions, EngageReceipt, Reaction, RevivalReport, absorb_lane,
+	regime::{
+		Regime, RegimeDraft, RegimeRecord, RegimeResolution, RegimeSet, RegimeSpec, RegimeStateError,
+		RegimeStatus, RegimeStepResult, RevivalReport, StartError, StartOptions, StartReceipt,
+		StopError, absorb_draft, evaluate_regime,
 	},
 	tool_choice::ToolChoiceQueue,
 };
 
-/// Borrowed pending-preview metadata exposed to campaign lanes.
+/// Borrowed pending-preview metadata exposed to regime handlers.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PendingInvokerCx<'a> {
 	/// Unique staged-preview identity.
@@ -29,114 +29,88 @@ pub struct PendingInvokerCx<'a> {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PointCx<'a> {
 	/// Current durable turn identity, when a turn exists.
-	pub turn_id:         Option<&'a str>,
+	pub turn_id:           Option<&'a str>,
 	/// Current invocation identity at ADMISSION/BATCH.
-	pub invocation_id:   Option<&'a str>,
+	pub invocation_id:     Option<&'a str>,
 	/// Current streamed UTF-8 fragment at STREAM.
-	pub stream_delta:    Option<&'a str>,
+	pub stream_delta:      Option<&'a str>,
 	/// Current epoch milliseconds.
-	pub now_ms:          u64,
+	pub now_ms:            u64,
 	/// Whether the preceding operation delivered an observable effect.
-	pub delivered:       bool,
+	pub delivered:         bool,
+	/// Whether an exploration checkpoint is currently active.
+	pub checkpoint_active: bool,
 	/// Most recently registered staged-preview invoker.
-	pub pending_invoker: Option<PendingInvokerCx<'a>>,
+	pub pending_invoker:   Option<PendingInvokerCx<'a>>,
 }
 
-/// Journal and telemetry representation of one fold.
+/// Durable forensic representation of one resolved regime event.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct FoldFact {
-	/// Decision point folded.
-	pub point:           Point,
-	/// Durable turn identity, when the fold belongs to a turn.
-	pub turn_id:         Option<Str>,
-	/// Participating engagement identities in deterministic order.
-	pub lanes:           Vec<Str>,
-	/// Winning transition class.
-	pub winner:          Str,
-	/// Exclusive winning engagement, if any.
-	pub winner_lane:     Option<Str>,
-	/// Number of accumulated context patches.
-	pub patch_count:     u32,
-	/// Number of accumulated injections.
-	pub injection_count: u32,
-	/// Number of unioned denial reasons.
-	pub denial_count:    u32,
-	/// Number of unresolved holds.
-	pub hold_count:      u32,
+pub struct RegimeFact {
+	/// Fixed event resolved.
+	pub point:                  Point,
+	/// Durable turn identity, when the event belongs to a turn.
+	pub turn_id:                Option<Str>,
+	/// Participating activation identities in deterministic order.
+	pub participants:           Vec<Str>,
+	/// Resolved control class.
+	pub control:                Str,
+	/// Activation supplying the exclusive control, if any.
+	pub controlling_activation: Option<Str>,
+	/// Number of committed context rewrites.
+	pub rewrite_count:          u32,
+	/// Number of committed context appends.
+	pub append_count:           u32,
+	/// Number of combined rejection reasons.
+	pub rejection_count:        u32,
+	/// Number of unresolved waits.
+	pub wait_count:             u32,
 }
 
-impl FoldFact {
-	fn from_campaign(point: Point, cx: &PointCx<'_>, fold: &CampaignFold) -> Self {
+impl RegimeFact {
+	fn from_resolution(point: Point, cx: &PointCx<'_>, resolution: &RegimeResolution) -> Self {
 		Self {
 			point,
 			turn_id: cx.turn_id.map(Str::new),
-			lanes: fold.lanes.clone(),
-			winner: Str::new(<&'static str>::from(fold.winner)),
-			winner_lane: fold.winner_lane.clone(),
-			patch_count: u32::try_from(fold.patches.len()).unwrap_or(u32::MAX),
-			injection_count: u32::try_from(fold.injects.len()).unwrap_or(u32::MAX),
-			denial_count: u32::try_from(fold.denials.len()).unwrap_or(u32::MAX),
-			hold_count: u32::try_from(fold.holds.len()).unwrap_or(u32::MAX),
+			participants: resolution.participants.clone(),
+			control: Str::new(<&'static str>::from(resolution.control)),
+			controlling_activation: resolution.controlling_activation.clone(),
+			rewrite_count: u32::try_from(resolution.patches.len()).unwrap_or(u32::MAX),
+			append_count: u32::try_from(resolution.injects.len()).unwrap_or(u32::MAX),
+			rejection_count: u32::try_from(resolution.denials.len()).unwrap_or(u32::MAX),
+			wait_count: u32::try_from(resolution.waits.len()).unwrap_or(u32::MAX),
 		}
 	}
 }
 
-/// Result of one named arbiter fold.
 #[derive(Clone, Debug)]
-pub struct Fold {
-	/// Campaign arbiter output consumed by the loop call site.
-	pub campaign: CampaignFold,
-	/// Durable forensic fact emitted for the fold.
-	pub fact:     FoldFact,
+pub(crate) struct ResolvedEvent {
+	pub(crate) regime: RegimeResolution,
+	pub(crate) fact:   RegimeFact,
 }
 
-struct RegisteredLane {
-	id:         Str,
-	precedence: i16,
-	lane:       sync::Arc<dyn Lane>,
-}
-
-/// One behavior-preserving core lane at fixed decision points.
-pub trait Lane: Send + Sync + 'static {
-	/// Stable forensic lane identity.
-	fn id(&self) -> &str;
-
-	/// Points at which this lane is eligible.
-	fn points(&self) -> PointSet;
-
-	/// Higher values fold first.
-	fn precedence(&self) -> i16 {
-		0
-	}
-
-	/// Produces one atomic reaction from point-local facts.
-	fn react(&self, point: Point, cx: &PointCx<'_>) -> Reaction;
-}
-
-/// Arbiter owner for all point subscriptions and fold observations.
+/// Arbiter owner for all point subscriptions and resolution facts.
 pub struct Arbiter {
-	campaigns:          CampaignStack,
-	ttsr_campaign:      stream::TtsrCampaign,
+	regimes:            RegimeSet,
+	ttsr_regime:        stream::TtsrRegime,
 	empty_output_retry: settle::EmptyOutputRetry,
 	checkpoint_notice:  context::CheckpointNotice,
-	retry_chain:        Option<settle::RetryChainCampaign>,
-	lanes:              [Vec<RegisteredLane>; 9],
-	pending_facts:      Vec<FoldFact>,
+	retry_chain:        Option<settle::RetryChainRegime>,
+	pending_facts:      Vec<RegimeFact>,
 	subscribed:         PointSet,
-	fact_tx:            flume::Sender<FoldFact>,
-	fact_rx:            Receiver<FoldFact>,
+	fact_tx:            flume::Sender<RegimeFact>,
+	fact_rx:            Receiver<RegimeFact>,
 }
 
 impl Default for Arbiter {
 	fn default() -> Self {
 		let (fact_tx, fact_rx) = flume::unbounded();
 		Self {
-			campaigns: CampaignStack::new(),
-			ttsr_campaign: stream::TtsrCampaign::default(),
+			regimes: RegimeSet::new(),
+			ttsr_regime: stream::TtsrRegime::default(),
 			empty_output_retry: settle::EmptyOutputRetry::default(),
 			checkpoint_notice: context::CheckpointNotice::default(),
 			retry_chain: None,
-			lanes: array::from_fn(|_| Vec::new()),
 			pending_facts: Vec::new(),
 			subscribed: PointSet::EMPTY,
 			fact_tx,
@@ -151,26 +125,26 @@ impl Arbiter {
 		Self::default()
 	}
 
-	/// Returns the durable campaign owner registered at this arbiter.
-	pub const fn campaigns(&self) -> &CampaignStack {
-		&self.campaigns
+	/// Returns the durable regime owner.
+	pub const fn regimes(&self) -> &RegimeSet {
+		&self.regimes
 	}
 
-	/// Returns mutable access to the durable campaign owner.
-	pub const fn campaigns_mut(&mut self) -> &mut CampaignStack {
-		&mut self.campaigns
+	/// Returns mutable access to the durable regime owner.
+	pub const fn regimes_mut(&mut self) -> &mut RegimeSet {
+		&mut self.regimes
 	}
 
-	pub(crate) const fn ttsr_campaign_mut(&mut self) -> &mut stream::TtsrCampaign {
-		&mut self.ttsr_campaign
+	pub(crate) const fn ttsr_regime_mut(&mut self) -> &mut stream::TtsrRegime {
+		&mut self.ttsr_regime
 	}
 
 	pub(crate) const fn checkpoint_notice_mut(&mut self) -> &mut context::CheckpointNotice {
 		&mut self.checkpoint_notice
 	}
 
-	pub(crate) fn restore_empty_output_retry(&mut self, spent: u8) {
-		self.empty_output_retry = settle::EmptyOutputRetry::recovered(spent);
+	pub(crate) fn restore_empty_output_retry(&mut self, committed_steps: u8) {
+		self.empty_output_retry = settle::EmptyOutputRetry::recovered(committed_steps);
 	}
 
 	pub(crate) const fn reset_empty_output_retry(&mut self) {
@@ -181,8 +155,15 @@ impl Arbiter {
 		self.empty_output_retry.spent()
 	}
 
-	pub(crate) fn react_empty_output_retry(&mut self, cx: &PointCx<'_>) -> Reaction {
-		self.empty_output_retry.react(Point::Settle, cx)
+	pub(crate) fn apply_empty_output_retry(&mut self, cx: &PointCx<'_>) -> RegimeDraft {
+		evaluate_regime(
+			Point::Settle,
+			cx,
+			"empty-output-retry",
+			u32::from(self.empty_output_retry.spent()),
+			|ctx, next| self.empty_output_retry.apply(ctx, next),
+		)
+		.expect("core empty-output regime is infallible")
 	}
 
 	pub(crate) fn set_retry_chain(&mut self, routes: Vec<Str>) {
@@ -191,126 +172,125 @@ impl Arbiter {
 		{
 			chain.retry_now();
 		} else {
-			self.retry_chain = Some(settle::RetryChainCampaign::new(routes));
+			self.retry_chain = Some(settle::RetryChainRegime::new(routes));
 		}
 	}
 
-	/// Engages and journals one lane as a single lifecycle operation.
-	pub fn engage(
+	/// Starts and journals one activation atomically.
+	pub fn start(
 		&mut self,
-		spec: sync::Arc<CampaignSpec>,
-		machine: Box<dyn CampaignMachine>,
+		spec: sync::Arc<RegimeSpec>,
+		handler: Box<dyn Regime>,
 		journal: &mut Journal,
-		options: EngageOptions,
-	) -> Result<EngageReceipt, ArbiterError> {
-		let receipt = self.campaigns.engage(spec, machine, options)?;
-		let entry = self
-			.campaigns
-			.entries()
+		options: StartOptions,
+	) -> Result<StartReceipt, ArbiterError> {
+		let receipt = self.regimes.start(spec, handler, options)?;
+		let record = self
+			.regimes
+			.records()
 			.into_iter()
-			.find(|entry| entry.engagement == receipt.engagement)
-			.expect("new engagement has one durable record");
-		if let Err(error) = journal.append_campaign_entry(options.now_ms, &entry) {
-			self.campaigns.cut(receipt.engagement.as_str());
+			.find(|record| record.activation == receipt.activation)
+			.expect("new activation has one durable record");
+		if let Err(error) = journal.append_regime_record(options.now_ms, &record) {
+			self.regimes.cancel(receipt.activation.as_str());
 			return Err(ArbiterError::Journal(error));
 		}
 		Ok(receipt)
 	}
 
-	/// Disengages one lane after dwell and journals its terminal lifecycle.
-	pub fn disengage(
+	/// Stops one activation after minimum duration and journals the transition.
+	pub fn stop(
 		&mut self,
-		engagement: &str,
+		activation: &str,
 		now_ms: u64,
 		journal: &mut Journal,
 	) -> Result<bool, ArbiterError> {
 		let Some(mut terminal) = self
-			.campaigns
-			.entries()
+			.regimes
+			.records()
 			.into_iter()
-			.find(|entry| entry.engagement == engagement)
+			.find(|record| record.activation == activation)
 		else {
 			return Ok(false);
 		};
-		if !self.campaigns.check_disengage(engagement, now_ms)? {
+		if !self.regimes.check_stop(activation, now_ms)? {
 			return Ok(false);
 		}
-		terminal.status = CampaignEntryStatus::Disengaged;
-		journal.append_campaign_entry(now_ms, &terminal)?;
-		let removed = self.campaigns.cut(engagement);
+		terminal.status = RegimeStatus::Stopped;
+		journal.append_regime_record(now_ms, &terminal)?;
+		let removed = self.regimes.cancel(activation);
 		if removed {
 			self.checkpoint(journal, now_ms)?;
 		}
 		Ok(removed)
 	}
 
-	/// Updates one machine state and journals the resulting campaign entry.
+	/// Cancels one activation immediately and journals the transition.
+	pub fn cancel(
+		&mut self,
+		activation: &str,
+		now_ms: u64,
+		journal: &mut Journal,
+	) -> Result<bool, JournalError> {
+		let Some(mut terminal) = self
+			.regimes
+			.records()
+			.into_iter()
+			.find(|record| record.activation == activation)
+		else {
+			return Ok(false);
+		};
+		terminal.status = RegimeStatus::Stopped;
+		journal.append_regime_record(now_ms, &terminal)?;
+		let removed = self.regimes.cancel(activation);
+		self.checkpoint(journal, now_ms)?;
+		Ok(removed)
+	}
+
+	/// Updates one handler state and journals the resulting record.
 	pub fn update_state(
 		&mut self,
-		engagement: &str,
+		activation: &str,
 		payload: &[u8],
 		now_ms: u64,
 		journal: &mut Journal,
-	) -> Result<CampaignEntry, ArbiterError> {
-		let entry = self.campaigns.update_state(engagement, payload)?;
-		journal.append_campaign_entry(now_ms, &entry)?;
-		Ok(entry)
+	) -> Result<RegimeRecord, ArbiterError> {
+		let record = self.regimes.update_state(activation, payload)?;
+		journal.append_regime_record(now_ms, &record)?;
+		Ok(record)
 	}
 
-	/// Explicitly steps one campaign and journals its rung or exhaustion.
-	pub fn step(
+	/// Advances one activation's committed-step accounting and journals it.
+	pub fn advance(
 		&mut self,
-		engagement: &str,
+		activation: &str,
 		now_ms: u64,
 		journal: &mut Journal,
-	) -> Result<CampaignStepResult, JournalError> {
-		let mut terminal = self
-			.campaigns
-			.entries()
-			.into_iter()
-			.find(|entry| entry.engagement == engagement);
-		let result = self.campaigns.step_result(engagement, now_ms);
-		if matches!(result, CampaignStepResult::Terminal { .. })
-			&& let Some(entry) = terminal.as_mut()
-		{
-			entry.status = CampaignEntryStatus::Exhausted;
-			journal.append_campaign_entry(now_ms, entry)?;
+	) -> Result<RegimeStepResult, JournalError> {
+		let result = self.regimes.advance(activation, now_ms);
+		if !matches!(result, RegimeStepResult::Missing) {
+			if let Some(record) = self
+				.regimes
+				.records()
+				.into_iter()
+				.find(|record| record.activation == activation)
+			{
+				journal.append_regime_record(now_ms, &record)?;
+			}
 		}
 		self.checkpoint(journal, now_ms)?;
 		Ok(result)
 	}
 
-	/// Cuts one campaign without dwell and journals its terminal lifecycle.
-	pub fn cut(
-		&mut self,
-		engagement: &str,
-		now_ms: u64,
-		journal: &mut Journal,
-	) -> Result<bool, JournalError> {
-		let Some(mut terminal) = self
-			.campaigns
-			.entries()
-			.into_iter()
-			.find(|entry| entry.engagement == engagement)
-		else {
-			return Ok(false);
-		};
-		terminal.status = CampaignEntryStatus::Disengaged;
-		journal.append_campaign_entry(now_ms, &terminal)?;
-		let removed = self.campaigns.cut(engagement);
-		self.checkpoint(journal, now_ms)?;
-		Ok(removed)
-	}
-
-	/// Journals the current cursor and state of every active lane.
+	/// Journals current state for every active or queued activation.
 	pub fn checkpoint(&self, journal: &mut Journal, now_ms: u64) -> Result<(), JournalError> {
-		for entry in self.campaigns.entries() {
-			journal.append_campaign_entry(now_ms, &entry)?;
+		for record in self.regimes.records() {
+			journal.append_regime_record(now_ms, &record)?;
 		}
 		Ok(())
 	}
 
-	/// Revives journaled lanes and journals unloadable-state exhaustion.
+	/// Revives durable activations and journals typed revival failures.
 	pub fn recover<F>(
 		&mut self,
 		journal: &mut Journal,
@@ -318,69 +298,47 @@ impl Arbiter {
 		now_ms: u64,
 	) -> Result<RevivalReport, JournalError>
 	where
-		F: FnMut(&str) -> Option<(sync::Arc<CampaignSpec>, Box<dyn CampaignMachine>)>,
+		F: FnMut(&str) -> Option<(sync::Arc<RegimeSpec>, Box<dyn Regime>)>,
 	{
-		let entries = journal.recover_campaign_entries()?;
-		let report = self.campaigns.revive(entries, |id| resolve(id));
-		for entry in &report.exhausted {
-			journal.append_campaign_entry(now_ms, entry)?;
+		let records = journal.recover_regime_records()?;
+		let report = self.regimes.revive(records, |id| resolve(id));
+		for record in &report.failed {
+			journal.append_regime_record(now_ms, record)?;
 		}
 		Ok(report)
 	}
 
-	/// Registers point bits. Unregistered points still emit a degenerate fold
-	/// fact.
+	/// Registers fixed event bits for fast loop placement checks.
 	pub fn register_points(&mut self, points: PointSet) {
 		self.subscribed = self.subscribed.union(points);
 	}
 
-	/// Registers one lane into every subscribed per-point list.
-	pub fn register(&mut self, lane: sync::Arc<dyn Lane>) {
-		let points = lane.points();
-		let id = Str::new(lane.id());
-		let precedence = lane.precedence();
-		for point in Point::ALL {
-			if !points.contains(point) {
-				continue;
-			}
-			let list = &mut self.lanes[usize::from(point.ordinal())];
-			list.push(RegisteredLane { id: id.clone(), precedence, lane: sync::Arc::clone(&lane) });
-			list.sort_by(|left, right| {
-				right
-					.precedence
-					.cmp(&left.precedence)
-					.then_with(|| left.id.cmp(&right.id))
-			});
-		}
-		self.register_points(points);
-	}
-
-	/// Returns the union of registered point subscriptions.
+	/// Returns the union of registered event subscriptions.
 	pub const fn subscriptions(&self) -> PointSet {
 		self.subscribed
 	}
 
-	/// Purely folds one point and emits the same fact to the telemetry stream.
-	pub fn fold(
+	/// Resolves one fixed event and emits its durable forensic fact.
+	pub(crate) fn resolve(
 		&mut self,
 		point: Point,
 		cx: &PointCx<'_>,
 		tool_choices: Option<&mut ToolChoiceQueue>,
-	) -> Fold {
-		let campaign = self.campaigns.fold(point, cx, tool_choices);
-		let mut campaign = campaign;
-		for lane in &self.lanes[usize::from(point.ordinal())] {
-			absorb_lane(&mut campaign, lane.id.clone(), lane.lane.react(point, cx));
-		}
-		if point == Point::Stream && self.ttsr_campaign.has_pending() {
-			absorb_lane(&mut campaign, Str::new_static("ttsr"), self.ttsr_campaign.react(point, cx));
+	) -> ResolvedEvent {
+		let mut regime = self.regimes.resolve(point, cx, tool_choices);
+		if point == Point::Stream && self.ttsr_regime.has_pending() {
+			if let Ok(draft) =
+				evaluate_regime(point, cx, "ttsr", 0, |ctx, next| self.ttsr_regime.apply(ctx, next))
+			{
+				absorb_draft(&mut regime, Str::new_static("ttsr"), draft);
+			}
 		}
 		if point == Point::Context && self.checkpoint_notice.is_active() {
-			absorb_lane(
-				&mut campaign,
-				Str::new_static("checkpoint"),
-				self.checkpoint_notice.react(point, cx),
-			);
+			if let Ok(draft) = evaluate_regime(point, cx, "checkpoint", 0, |ctx, next| {
+				self.checkpoint_notice.apply(ctx, next)
+			}) {
+				absorb_draft(&mut regime, Str::new_static("checkpoint"), draft);
+			}
 		}
 		if matches!(point, Point::PreModel | Point::Stream)
 			&& self
@@ -389,57 +347,61 @@ impl Arbiter {
 				.is_some_and(|chain| chain.is_active())
 			&& let Some(chain) = self.retry_chain.as_mut()
 		{
-			absorb_lane(&mut campaign, Str::new_static("retry-chain"), chain.react(point, cx));
+			if let Ok(draft) =
+				evaluate_regime(point, cx, "retry-chain", 0, |ctx, next| chain.apply(ctx, next))
+			{
+				absorb_draft(&mut regime, Str::new_static("retry-chain"), draft);
+			}
 		}
-		let fact = FoldFact::from_campaign(point, cx, &campaign);
+		let fact = RegimeFact::from_resolution(point, cx, &regime);
 		let _ = self.fact_tx.send(fact.clone());
-		Fold { campaign, fact }
+		ResolvedEvent { regime, fact }
 	}
 
-	/// Folds and atomically appends the forensic fact to the session journal.
-	pub fn fold_and_record(
+	/// Resolves and atomically appends the forensic fact to the journal.
+	pub(crate) fn resolve_and_record(
 		&mut self,
 		point: Point,
 		cx: &PointCx<'_>,
 		tool_choices: Option<&mut ToolChoiceQueue>,
 		journal: &mut Journal,
-	) -> Result<Fold, JournalError> {
-		let fold = self.fold(point, cx, tool_choices);
+	) -> Result<ResolvedEvent, JournalError> {
+		let resolved = self.resolve(point, cx, tool_choices);
 		if journal.pending_turn().is_some() {
-			self.pending_facts.push(fold.fact.clone());
+			self.pending_facts.push(resolved.fact.clone());
 		} else {
 			self.flush(journal, cx.now_ms)?;
-			journal.append_arbiter_fold(cx.now_ms, &fold.fact)?;
+			journal.append_regime_fact(cx.now_ms, &resolved.fact)?;
 			self.checkpoint(journal, cx.now_ms)?;
 		}
-		Ok(fold)
+		Ok(resolved)
 	}
 
 	/// Flushes facts buffered while a durable turn was pending.
 	pub fn flush(&mut self, journal: &mut Journal, now_ms: u64) -> Result<(), JournalError> {
 		for fact in mem::take(&mut self.pending_facts) {
-			journal.append_arbiter_fold(now_ms, &fact)?;
+			journal.append_regime_fact(now_ms, &fact)?;
 		}
 		self.checkpoint(journal, now_ms)
 	}
 
-	/// Drains one telemetry fold fact without blocking.
-	pub fn try_fact(&self) -> Option<FoldFact> {
+	/// Drains one telemetry fact without blocking.
+	pub fn try_fact(&self) -> Option<RegimeFact> {
 		self.fact_rx.try_recv().ok()
 	}
 }
-/// Failure while engaging a journaled arbiter lane.
+/// Failure while starting, stopping, updating, or journaling a regime.
 #[derive(Debug, thiserror::Error)]
 pub enum ArbiterError {
-	/// The campaign declaration or claim set rejected engagement.
+	/// The regime declaration or resource set rejected activation.
 	#[error(transparent)]
-	Engage(#[from] EngageError),
-	/// The engagement's dwell policy rejected exit.
+	Start(#[from] StartError),
+	/// The activation's minimum-duration policy rejected exit.
 	#[error(transparent)]
-	Disengage(#[from] DisengageError),
-	/// The machine rejected a live state update.
+	Stop(#[from] StopError),
+	/// The handler rejected a live state update.
 	#[error(transparent)]
-	State(#[from] CampaignStateError),
+	State(#[from] RegimeStateError),
 	/// The durable lifecycle append failed.
 	#[error(transparent)]
 	Journal(#[from] JournalError),
@@ -452,15 +414,14 @@ pub(crate) mod context {
 	use omp_storage::transcript::{Entry, Kind};
 	use serde::Deserialize;
 
-	use super::PointCx;
 	use crate::{
 		Journal, JournalError,
-		campaign::{CampaignMachine, CampaignStateError, Reaction, Verdict},
 		journal_kinds::{CHECKPOINT_KIND, REWIND_REPORT_KIND},
 		r#loop::now_ms,
+		regime::{Next, Regime, RegimeContext, RegimeError, RegimeStateError},
 	};
 
-	/// Session-scoped checkpoint notice campaign.
+	/// Session-scoped checkpoint notice regime.
 	#[derive(Default)]
 	pub(crate) struct CheckpointNotice {
 		active: bool,
@@ -476,26 +437,25 @@ pub(crate) mod context {
 		}
 	}
 
-	impl CampaignMachine for CheckpointNotice {
-		fn react(&mut self, point: Point, _: &PointCx<'_>) -> Reaction {
-			if point == Point::Context && self.active {
-				Reaction::one(Verdict::Inject(vec![crate::prompt::checkpoint_active_reminder()]))
-			} else if self.active {
-				Reaction::one(Verdict::Pass)
-			} else {
-				Reaction::one(Verdict::Done)
+	impl Regime for CheckpointNotice {
+		fn apply(&mut self, ctx: &mut RegimeContext<'_>, next: Next<'_>) -> Result<(), RegimeError> {
+			if ctx.point() == Point::Context && self.active {
+				ctx.append_context(vec![crate::prompt::checkpoint_active_reminder()]);
+			} else if !self.active {
+				next.complete();
 			}
+			Ok(())
 		}
 
 		fn state(&self) -> Str {
 			Str::new_static(if self.active { "active" } else { "inactive" })
 		}
 
-		fn restore(&mut self, payload: &str) -> Result<(), CampaignStateError> {
+		fn restore(&mut self, payload: &str) -> Result<(), RegimeStateError> {
 			self.active = match payload {
 				"active" => true,
 				"inactive" => false,
-				_ => return Err(CampaignStateError::InvalidPayload),
+				_ => return Err(RegimeStateError::InvalidPayload),
 			};
 			Ok(())
 		}
@@ -632,9 +592,11 @@ pub(crate) mod settle {
 	};
 
 	use crate::{
-		campaign::{BindSlot, CampaignMachine, CampaignStateError, Reaction, ScopedBinding, Verdict},
 		continuation::{Continuation, ContinuationPolicy, ContinuationSource, LoopSignal},
 		r#loop::now_ms,
+		regime::{
+			Next, Regime, RegimeContext, RegimeError, RegimeStateError, ScopedSetting, SettingSlot,
+		},
 		turn::empty_stop,
 	};
 
@@ -643,7 +605,6 @@ pub(crate) mod settle {
 	pub(crate) struct EmptyOutputRetry {
 		spent: u8,
 	}
-	use super::PointCx;
 	use crate::prompt_assets::render_empty_stop_retry;
 
 	impl EmptyOutputRetry {
@@ -673,48 +634,42 @@ pub(crate) mod settle {
 			self.spent = 0;
 		}
 	}
-	impl CampaignMachine for EmptyOutputRetry {
-		fn react(&mut self, point: Point, _: &PointCx<'_>) -> Reaction {
-			if point != Point::Settle {
-				return Reaction::one(Verdict::Pass);
+	impl Regime for EmptyOutputRetry {
+		fn apply(&mut self, ctx: &mut RegimeContext<'_>, next: Next<'_>) -> Result<(), RegimeError> {
+			if ctx.point() != Point::Settle {
+				return Ok(());
 			}
 			let Some(item) = self.step() else {
-				return Reaction::one(Verdict::Fault {
-					detail: Str::new_static(
-						"Assistant returned no final output after retry cap; try switching models",
-					),
-				});
+				next.fail("Assistant returned no final output after retry cap; try switching models");
+				return Ok(());
 			};
-			Reaction {
-				verdicts: vec![
-					Verdict::Patch(crate::ContextPatch(Bytes::from_static(b"drop:turn-tail"))),
-					Verdict::Inject(vec![item]),
-					Verdict::Continue,
-				],
-			}
+			ctx.rewrite_context(crate::ContextPatch(Bytes::from_static(b"drop:turn-tail")));
+			ctx.append_context(vec![item]);
+			next.retry();
+			Ok(())
 		}
 
 		fn state(&self) -> Str {
 			Str::from(self.spent.to_string())
 		}
 
-		fn restore(&mut self, payload: &str) -> Result<(), CampaignStateError> {
+		fn restore(&mut self, payload: &str) -> Result<(), RegimeStateError> {
 			self.spent = payload
 				.parse()
-				.map_err(|_| CampaignStateError::InvalidPayload)?;
+				.map_err(|_| RegimeStateError::InvalidPayload)?;
 			Ok(())
 		}
 	}
 
-	/// Provider failover campaign that binds each route in chain order.
-	pub(crate) struct RetryChainCampaign {
+	/// Provider failover regime that scopes each route in chain order.
+	pub(crate) struct RetryChainRegime {
 		routes:         Vec<Str>,
 		cursor:         usize,
 		cooldown_ms:    u64,
 		cooldown_until: Option<u64>,
 	}
 
-	impl RetryChainCampaign {
+	impl RetryChainRegime {
 		pub(crate) fn new(routes: Vec<Str>) -> Self {
 			Self { routes, cursor: 0, cooldown_ms: 1_000, cooldown_until: None }
 		}
@@ -732,43 +687,43 @@ pub(crate) mod settle {
 		}
 	}
 
-	impl CampaignMachine for RetryChainCampaign {
-		fn react(&mut self, point: Point, cx: &PointCx<'_>) -> Reaction {
-			if !matches!(point, Point::PreModel | Point::Stream) {
-				return Reaction::one(Verdict::Pass);
+	impl Regime for RetryChainRegime {
+		fn apply(&mut self, ctx: &mut RegimeContext<'_>, _: Next<'_>) -> Result<(), RegimeError> {
+			if !matches!(ctx.point(), Point::PreModel | Point::Stream) {
+				return Ok(());
 			}
-			if self.cooldown_until.is_some_and(|until| cx.now_ms < until) {
-				return Reaction::one(Verdict::Pass);
+			if self
+				.cooldown_until
+				.is_some_and(|until| ctx.facts().now_ms < until)
+			{
+				return Ok(());
 			}
 			self.cooldown_until = None;
 			let Some(route) = self.routes.get(self.cursor).cloned() else {
-				return Reaction::one(Verdict::Done);
+				return Ok(());
 			};
 			self.cursor = self.cursor.saturating_add(1);
-			self.cooldown_until = Some(cx.now_ms.saturating_add(self.cooldown_ms));
-			Reaction {
-				verdicts: vec![
-					Verdict::Patch(crate::ContextPatch(bytes::Bytes::from_static(b"provider-failover"))),
-					Verdict::Bind(ScopedBinding { slot: BindSlot::ModelRoute, value: route }),
-				],
-			}
+			self.cooldown_until = Some(ctx.facts().now_ms.saturating_add(self.cooldown_ms));
+			ctx.rewrite_context(crate::ContextPatch(bytes::Bytes::from_static(b"provider-failover")));
+			ctx.set_scoped(ScopedSetting { slot: SettingSlot::ModelRoute, value: route });
+			Ok(())
 		}
 
 		fn state(&self) -> Str {
 			Str::from(format!("{}:{}", self.cursor, self.cooldown_until.unwrap_or(0)))
 		}
 
-		fn restore(&mut self, payload: &str) -> Result<(), CampaignStateError> {
+		fn restore(&mut self, payload: &str) -> Result<(), RegimeStateError> {
 			let (cursor, until) = payload
 				.split_once(':')
-				.ok_or(CampaignStateError::InvalidPayload)?;
+				.ok_or(RegimeStateError::InvalidPayload)?;
 			self.cursor = cursor
 				.parse()
-				.map_err(|_| CampaignStateError::InvalidPayload)?;
+				.map_err(|_| RegimeStateError::InvalidPayload)?;
 			self.cooldown_until = Some(
 				until
 					.parse()
-					.map_err(|_| CampaignStateError::InvalidPayload)?,
+					.map_err(|_| RegimeStateError::InvalidPayload)?,
 			);
 			Ok(())
 		}
@@ -843,7 +798,7 @@ pub(crate) mod stream {
 	use crate::{TtsrMatch, TtsrMatchContext, TtsrRegistry, TtsrSource, r#loop::now_ms};
 
 	#[derive(Clone)]
-	pub(crate) struct TtsrCampaignCut {
+	pub(crate) struct TtsrRegimeCancel {
 		pub(crate) matches: Vec<TtsrMatch>,
 		pub(crate) source:  TtsrSource,
 	}
@@ -872,19 +827,18 @@ pub(crate) mod stream {
 	}
 
 	#[derive(Default)]
-	pub(crate) struct TtsrCampaign {
+	pub(crate) struct TtsrRegime {
 		registry:    Option<TtsrRegistry>,
 		deferred:    Vec<DeferredTtsr>,
-		pending_cut: Option<TtsrCampaignCut>,
+		pending_cut: Option<TtsrRegimeCancel>,
 	}
 	use std::mem;
 
 	use omp_inference::recovery::repetition::StreamRecoveryKind;
 
-	use super::PointCx;
-	use crate::campaign::{CampaignMachine, CampaignStateError, Reaction, Verdict};
+	use crate::regime::{Next, Regime, RegimeContext, RegimeError, RegimeStateError};
 
-	impl TtsrCampaign {
+	impl TtsrRegime {
 		pub(crate) fn install(&mut self, registry: TtsrRegistry) {
 			self.registry = Some(registry);
 			self.deferred.clear();
@@ -913,7 +867,7 @@ pub(crate) mod stream {
 			&mut self,
 			state: &mut TtsrStreamPart,
 			fragment: &str,
-		) -> Option<TtsrCampaignCut> {
+		) -> Option<TtsrRegimeCancel> {
 			let registry = self.registry.as_mut()?;
 			let mut paths = Vec::new();
 			let mut snapshot = None;
@@ -952,7 +906,7 @@ pub(crate) mod stream {
 				.iter()
 				.any(|matched| matched.interrupt_mode.interrupts(state.source))
 			{
-				let cut = TtsrCampaignCut { matches, source: state.source };
+				let cut = TtsrRegimeCancel { matches, source: state.source };
 				self.pending_cut = Some(cut.clone());
 				return Some(cut);
 			}
@@ -989,32 +943,29 @@ pub(crate) mod stream {
 			self.pending_cut.is_some() || !self.deferred.is_empty()
 		}
 	}
-	impl CampaignMachine for TtsrCampaign {
-		fn react(&mut self, point: Point, _: &PointCx<'_>) -> Reaction {
-			if point != Point::Stream {
-				return Reaction::default();
+	impl Regime for TtsrRegime {
+		fn apply(&mut self, ctx: &mut RegimeContext<'_>, next: Next<'_>) -> Result<(), RegimeError> {
+			if ctx.point() != Point::Stream {
+				return Ok(());
 			}
-			let Some(cut) = self.pending_cut.take() else {
-				return Reaction::one(Verdict::Pass);
+			let Some(cancel) = self.pending_cut.take() else {
+				return Ok(());
 			};
-			let text = ttsr_reminder_text(&cut.matches);
-			Reaction {
-				verdicts: vec![
-					Verdict::Cut { reason: Str::new_static("stream rule interrupted generation") },
-					Verdict::Inject(vec![ttsr_reminder_item(text)]),
-				],
-			}
+			let text = ttsr_reminder_text(&cancel.matches);
+			ctx.append_context(vec![ttsr_reminder_item(text)]);
+			next.cancel("stream rule interrupted generation");
+			Ok(())
 		}
 
 		fn state(&self) -> Str {
 			Str::new_static("{}")
 		}
 
-		fn restore(&mut self, payload: &str) -> Result<(), CampaignStateError> {
+		fn restore(&mut self, payload: &str) -> Result<(), RegimeStateError> {
 			if payload == "{}" {
 				Ok(())
 			} else {
-				Err(CampaignStateError::InvalidPayload)
+				Err(RegimeStateError::InvalidPayload)
 			}
 		}
 	}

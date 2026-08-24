@@ -43,16 +43,17 @@ use thiserror::Error;
 
 use crate::{
 	ProjectionError,
-	arbiter::FoldFact,
-	campaign::CampaignEntry,
+	arbiter::RegimeFact,
 	events::EventBus,
 	journal_kinds::{
-		ARBITER_FOLD_KIND, CAMPAIGN_ENTRY_KIND, CHECKPOINT_KIND, CORE_EXTENSION, CORE_REVISION,
-		EntryKindDecl, EntryKindError, EntryKindRegistry, REWIND_REPORT_KIND, TTSR_INJECTION_KIND,
-		core_campaign_declarations, core_checkpoint_declarations, core_ttsr_declaration,
+		CHECKPOINT_KIND, CORE_EXTENSION, CORE_REVISION, EntryKindDecl, EntryKindError,
+		EntryKindRegistry, REGIME_FACT_KIND, REGIME_RECORD_KIND, REWIND_REPORT_KIND,
+		TTSR_INJECTION_KIND, core_checkpoint_declarations, core_regime_declarations,
+		core_ttsr_declaration,
 	},
 	project,
 	prompt::PromptHash,
+	regime::RegimeRecord,
 	ttsr::TtsrSource,
 };
 type ActivePrompt = (Hash32, Vec<u64>);
@@ -3173,42 +3174,40 @@ impl Journal {
 		Ok((receipt, false))
 	}
 
-	/// Appends one invisible core TTSR injection with its model-context
-	/// projection.
-	/// Appends one invisible arbiter-fold fact and emits no model context.
-	pub fn append_arbiter_fold(&mut self, ts: u64, fact: &FoldFact) -> Result<u64, JournalError> {
-		self.append_campaign_fact(
+	/// Appends one invisible regime-resolution fact with no model projection.
+	pub fn append_regime_fact(&mut self, ts: u64, fact: &RegimeFact) -> Result<u64, JournalError> {
+		self.append_regime_data(
 			ts,
-			ARBITER_FOLD_KIND,
-			sf!("fold-{}", omp_core::Ulid::generate()),
+			REGIME_FACT_KIND,
+			sf!("regime-fact-{}", omp_core::Ulid::generate()),
 			serde_json::value::to_raw_value(fact).map_err(transcript::Error::from)?,
 		)
 	}
 
-	/// Appends one first-class durable campaign lifecycle record.
-	pub fn append_campaign_entry(
+	/// Appends one first-class durable regime lifecycle record.
+	pub fn append_regime_record(
 		&mut self,
 		ts: u64,
-		entry: &CampaignEntry,
+		record: &RegimeRecord,
 	) -> Result<u64, JournalError> {
-		self.append_campaign_fact(
+		self.append_regime_data(
 			ts,
-			CAMPAIGN_ENTRY_KIND,
+			REGIME_RECORD_KIND,
 			sf!(
-				"campaign-{}-{}-{}-{}",
-				entry.engagement.as_str(),
-				entry.ladder_position,
-				entry.status,
-				Hash32::sum(entry.state.as_bytes()),
+				"regime-record-{}-{}-{}-{}",
+				record.activation.as_str(),
+				record.committed_steps,
+				record.status,
+				Hash32::sum(record.state.as_bytes()),
 			),
-			serde_json::value::to_raw_value(entry).map_err(transcript::Error::from)?,
+			serde_json::value::to_raw_value(record).map_err(transcript::Error::from)?,
 		)
 	}
 
-	/// Recovers the latest lifecycle record for every engagement.
-	pub fn recover_campaign_entries(&self) -> Result<Vec<CampaignEntry>, JournalError> {
+	/// Recovers the latest lifecycle record for every activation.
+	pub fn recover_regime_records(&self) -> Result<Vec<RegimeRecord>, JournalError> {
 		let log = self.load()?;
-		let mut latest = BTreeMap::<Str, CampaignEntry>::new();
+		let mut latest = BTreeMap::<Str, RegimeRecord>::new();
 		for index in log.as_ref().iter() {
 			let Some(transcript::Entry::Ok(event)) = log.get(index) else {
 				continue;
@@ -3216,22 +3215,22 @@ impl Journal {
 			let Kind::Custom(custom) = &event.kind else {
 				continue;
 			};
-			if custom.kind() != CAMPAIGN_ENTRY_KIND {
+			if custom.kind() != REGIME_RECORD_KIND {
 				continue;
 			}
 			let Some(data) = custom.data() else {
 				continue;
 			};
-			let Ok(entry) = serde_json::from_str::<CampaignEntry>(data.get()) else {
+			let Ok(record) = serde_json::from_str::<RegimeRecord>(data.get()) else {
 				continue;
 			};
-			latest.insert(entry.engagement.clone(), entry);
+			latest.insert(record.activation.clone(), record);
 		}
 		Ok(latest.into_values().collect())
 	}
 
-	/// Returns SETTLE fold facts explaining who vetoed a stop for `turn_id`.
-	pub fn settle_vetoes(&self, turn_id: &str) -> Result<Vec<FoldFact>, JournalError> {
+	/// Returns SETTLE regime facts that prevented stop for `turn_id`.
+	pub fn settle_rejections(&self, turn_id: &str) -> Result<Vec<RegimeFact>, JournalError> {
 		let log = self.load()?;
 		let mut facts = Vec::new();
 		for index in log.as_ref().iter() {
@@ -3241,13 +3240,13 @@ impl Journal {
 			let Kind::Custom(custom) = &event.kind else {
 				continue;
 			};
-			if custom.kind() != ARBITER_FOLD_KIND {
+			if custom.kind() != REGIME_FACT_KIND {
 				continue;
 			}
 			let Some(data) = custom.data() else {
 				continue;
 			};
-			let Ok(fact) = serde_json::from_str::<FoldFact>(data.get()) else {
+			let Ok(fact) = serde_json::from_str::<RegimeFact>(data.get()) else {
 				continue;
 			};
 			if fact.point == phase::Point::Settle
@@ -3255,7 +3254,7 @@ impl Journal {
 					.turn_id
 					.as_ref()
 					.is_some_and(|candidate| candidate == turn_id)
-				&& fact.winner != "pass"
+				&& fact.control != "none"
 			{
 				facts.push(fact);
 			}
@@ -3263,14 +3262,14 @@ impl Journal {
 		Ok(facts)
 	}
 
-	fn append_campaign_fact(
+	fn append_regime_data(
 		&mut self,
 		ts: u64,
 		kind: &'static str,
 		request_id: Str,
 		data: Box<RawValue>,
 	) -> Result<u64, JournalError> {
-		self.declare_entry_kinds(CORE_EXTENSION, core_campaign_declarations())?;
+		self.declare_entry_kinds(CORE_EXTENSION, core_regime_declarations())?;
 		let reply = self.handle_request(JournalRequest {
 			ts,
 			stamp: JournalRequestStamp {
@@ -3302,7 +3301,7 @@ impl Journal {
 		Ok(*reply
 			.indexes
 			.first()
-			.expect("single campaign fact append returns one payload index"))
+			.expect("single regime fact append returns one payload index"))
 	}
 
 	/// Appends one invisible core TTSR injection with its model-context

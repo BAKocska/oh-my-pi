@@ -10,17 +10,17 @@ pub(crate) const CORE_EXTENSION: &str = "dev.omp.core";
 pub(crate) const CHECKPOINT_KIND: &str = "dev.omp.core.checkpoint";
 pub(crate) const REWIND_REPORT_KIND: &str = "dev.omp.core.rewind-report";
 pub(crate) const TTSR_INJECTION_KIND: &str = "dev.omp.core.ttsr-injection";
-pub(crate) const ARBITER_FOLD_KIND: &str = "dev.omp.core.arbiter-fold";
-pub(crate) const CAMPAIGN_ENTRY_KIND: &str = "dev.omp.core.campaign-entry";
+pub(crate) const REGIME_FACT_KIND: &str = "dev.omp.core.regime-fact";
+pub(crate) const REGIME_RECORD_KIND: &str = "dev.omp.core.regime-record";
 pub(crate) const TERMINAL_ERROR_PROP: &str = "omp/terminal-error";
 pub(crate) const CORE_REVISION: &str = "core.1";
 
-pub(crate) fn core_campaign_declarations() -> Vec<EntryKindDecl> {
+pub(crate) fn core_regime_declarations() -> Vec<EntryKindDecl> {
 	vec![
-		EntryKindDecl::parse(ARBITER_FOLD_KIND, CORE_REVISION, false, false, None)
-			.expect("static arbiter fold revision is valid"),
-		EntryKindDecl::parse(CAMPAIGN_ENTRY_KIND, CORE_REVISION, false, false, None)
-			.expect("static campaign entry revision is valid"),
+		EntryKindDecl::parse(REGIME_FACT_KIND, CORE_REVISION, false, false, None)
+			.expect("static regime fact revision is valid"),
+		EntryKindDecl::parse(REGIME_RECORD_KIND, CORE_REVISION, false, false, None)
+			.expect("static regime record revision is valid"),
 	]
 }
 

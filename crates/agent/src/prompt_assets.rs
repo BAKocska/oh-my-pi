@@ -277,7 +277,7 @@ fn asset_name(id: PromptAssetId) -> &'static str {
 	NAMES[id as usize]
 }
 
-/// Returns the rich asset selected by a campaign prompt-slot binding.
+/// Returns the rich asset selected by a regime-scoped prompt setting.
 pub fn prompt_slot_asset(slot: &str) -> Option<&'static PromptAsset> {
 	let id = match slot {
 		"plan" | "plan-yolo" => PromptAssetId::ModePlan,

@@ -45,14 +45,14 @@ use crate::{
 	CompactionTier, Journal, JournalError, Mailbox, MailboxSender, ManualCompactionMode,
 	ManualCompactionOutcome, ManualCompactionRequest, ManualShakeMode, ManualShakeOutcome,
 	PROMPT_CACHE_WARM_SUFFIX_TOKENS, ProjectionError, PromptMemoryQuery, PromptMemorySnapshotSource,
-	SnapcompactPreparation, StreamingEditGuard, TtsrMatch, TtsrRegistry, TtsrSource, TurnClient, TurnInput, TurnSession,
-	YieldPayload, YieldPayloadError, YieldPayloadValidator,
+	SnapcompactPreparation, StreamingEditGuard, TtsrMatch, TtsrRegistry, TtsrSource, TurnClient,
+	TurnInput, TurnSession, YieldPayload, YieldPayloadError, YieldPayloadValidator,
 	arbiter::{
 		Arbiter, PointCx,
 		context::{compaction_instruction, recover_checkpoint_state, rewind_background_warning},
 		settle::{EmptyOutputRetry, source_candidate},
 		stream::{
-			TtsrCampaignCut, TtsrStreamPart, stream_recovery_item, ttsr_reminder_item,
+			TtsrRegimeCancel, TtsrStreamPart, stream_recovery_item, ttsr_reminder_item,
 			ttsr_reminder_text,
 		},
 	},
@@ -66,7 +66,7 @@ use crate::{
 		continues_loop, from_hook,
 	},
 	control::{
-		CampaignControl, ControlMailbox, ControlMailboxEvent, ControlSender, ScheduledRewind, channel,
+		ControlMailbox, ControlMailboxEvent, ControlSender, RegimeControl, ScheduledRewind, channel,
 	},
 	duplex::{DuplexError, DuplexManager},
 	events::{AgentEvent, AgentPhase, EventBus},
@@ -248,17 +248,18 @@ use tokio::{
 
 pub(crate) use crate::arbiter::context::{ActiveCheckpoint, CheckpointState, CompletedCheckpoint};
 use crate::{
-	AgentSettled, AgentSnapshot, ArbiterError, AutolearnController, AutolearnSettings, BindSlot,
-	CampaignMachine, CampaignSpec, CaptureDecision, CommittedCall, ControlError, EngageOptions,
-	EngageReceipt, Fold, HoldError, HoldSet, Interrupt, InterruptClass, InterruptSource,
-	LegacySessionStopCampaign, PendingInvokerCx, ProviderErrorEvent, RevivalReport, ScopedBinding,
-	TurnOptions, TurnReceipt, Verdict, WinnerKind, attachments, batch, capture_interrupt,
-	demote_interrupted_reasoning, effects_mutate_environment, execute_snapcompact, hook_event_mask,
-	inject_first_turn_metadata, is_capture_item,
+	AgentSettled, AgentSnapshot, ArbiterError, AutolearnController, AutolearnSettings,
+	CaptureDecision, CommittedCall, ControlError, Interrupt, InterruptClass, InterruptSource,
+	PendingInvokerCx, ProviderErrorEvent, Regime, RegimeSpec, RevivalReport, ScopedSetting,
+	SettingSlot, StartOptions, StartReceipt, TurnOptions, TurnReceipt, WaitError, WaitSet,
+	arbiter::ResolvedEvent,
+	attachments, batch, capture_interrupt, demote_interrupted_reasoning, effects_mutate_environment,
+	execute_snapcompact, hook_event_mask, inject_first_turn_metadata, is_capture_item,
 	journal::Compact,
 	prompt_assets,
 	prompt_assets::PromptAssetId,
 	prompt_keys,
+	regime::{ResolutionKind, SessionStopRegime, evaluate_regime},
 	tool_choice::{RejectReason, ToolChoiceQueue},
 };
 
@@ -280,7 +281,7 @@ pub enum AgentError {
 	/// Durable journal operation failed.
 	#[error(transparent)]
 	Journal(#[from] JournalError),
-	/// Campaign arbitration or lifecycle journaling failed.
+	/// Regime arbitration or lifecycle journaling failed.
 	#[error(transparent)]
 	Arbiter(#[from] ArbiterError),
 	/// Canonical thread projection failed.
@@ -307,9 +308,9 @@ pub enum AgentError {
 	/// Tool execution or lowering failed.
 	#[error(transparent)]
 	Batch(#[from] BatchError),
-	/// A required-deadline campaign hold expired or was aborted.
+	/// A required-deadline regime wait expired or was aborted.
 	#[error(transparent)]
-	CampaignHold(#[from] HoldError),
+	RegimeWait(#[from] WaitError),
 	/// Manual compaction was cancelled before its history rewrite committed.
 	#[error(transparent)]
 	CompactionCancelled(#[from] CompactionCancellation),
@@ -376,12 +377,12 @@ type TurnCompletion =
 
 enum RunTurnResult {
 	Complete(TurnCompletion),
-	Ttsr(TtsrCampaignCut),
+	Ttsr(TtsrRegimeCancel),
 }
 
 enum DriveSessionResult {
 	Complete(Outcome, BTreeMap<Str, SpeculativeCall>),
-	Ttsr(TtsrCampaignCut),
+	Ttsr(TtsrRegimeCancel),
 }
 /// Cloneable request handle for state owned by the live agent loop.
 #[derive(Clone)]
@@ -469,7 +470,7 @@ pub struct Agent<C: TurnClient> {
 	checkpoint_state: Arc<Mutex<CheckpointState>>,
 	arbiter: Arbiter,
 	tool_choices: ToolChoiceQueue,
-	holds: HoldSet,
+	waits: WaitSet,
 	pending_rewinds: VecDeque<ScheduledRewind>,
 	mailbox: Mailbox,
 	jobs: Arc<JobBoard>,
@@ -487,7 +488,7 @@ pub struct Agent<C: TurnClient> {
 	provider_error_gate: Option<Arc<HookGate>>,
 	continuations: ContinuationLedger,
 	continuation_policies: BTreeMap<Str, ContinuationPolicy>,
-	legacy_session_stop: LegacySessionStopCampaign,
+	session_stop_regime: SessionStopRegime,
 	continuation_source: Option<Arc<dyn ContinuationSource>>,
 	redemption_authority: Option<Arc<dyn RedemptionAuthority>>,
 	loop_signal: LoopSignal,
@@ -578,7 +579,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 			checkpoint_state,
 			arbiter: Arbiter::new(),
 			tool_choices: ToolChoiceQueue::new(),
-			holds: HoldSet::default(),
+			waits: WaitSet::default(),
 			pending_rewinds: VecDeque::new(),
 			mailbox,
 			jobs,
@@ -596,7 +597,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 			provider_error_gate: None,
 			continuations: ContinuationLedger::new(8),
 			continuation_policies: BTreeMap::new(),
-			legacy_session_stop: LegacySessionStopCampaign::default(),
+			session_stop_regime: SessionStopRegime::default(),
 			continuation_source: None,
 			redemption_authority: None,
 			loop_signal: LoopSignal::default(),
@@ -620,7 +621,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 		&self.state
 	}
 
-	/// Returns the named decision arbiter and durable campaign owner.
+	/// Returns the named decision arbiter and durable regime owner.
 	pub const fn arbiter(&self) -> &Arbiter {
 		&self.arbiter
 	}
@@ -630,33 +631,31 @@ impl<C: TurnClient + Clone> Agent<C> {
 		&mut self.arbiter
 	}
 
-	/// Engages and durably records one campaign.
-	pub fn engage_campaign(
+	/// Starts and durably records one regime activation.
+	pub fn start_regime(
 		&mut self,
-		spec: Arc<CampaignSpec>,
-		machine: Box<dyn CampaignMachine>,
-		options: EngageOptions,
-	) -> Result<EngageReceipt, AgentError> {
+		spec: Arc<RegimeSpec>,
+		handler: Box<dyn Regime>,
+		options: StartOptions,
+	) -> Result<StartReceipt, AgentError> {
 		Ok(self
 			.arbiter
-			.engage(spec, machine, &mut self.journal, options)?)
+			.start(spec, handler, &mut self.journal, options)?)
 	}
 
-	/// Disengages and durably records one campaign after dwell.
-	pub fn disengage_campaign(&mut self, engagement: &str, now_ms: u64) -> Result<bool, AgentError> {
-		Ok(self
-			.arbiter
-			.disengage(engagement, now_ms, &mut self.journal)?)
+	/// Stops and durably records one regime after minimum duration.
+	pub fn stop_regime(&mut self, activation: &str, now_ms: u64) -> Result<bool, AgentError> {
+		Ok(self.arbiter.stop(activation, now_ms, &mut self.journal)?)
 	}
 
-	/// Recovers durable campaign engagements through an application resolver.
-	pub fn recover_campaigns<F>(
+	/// Recovers durable regime activations through an application resolver.
+	pub fn recover_regimes<F>(
 		&mut self,
 		resolve: F,
 		now_ms: u64,
 	) -> Result<RevivalReport, AgentError>
 	where
-		F: FnMut(&str) -> Option<(Arc<CampaignSpec>, Box<dyn CampaignMachine>)>,
+		F: FnMut(&str) -> Option<(Arc<RegimeSpec>, Box<dyn Regime>)>,
 	{
 		Ok(self.arbiter.recover(&mut self.journal, resolve, now_ms)?)
 	}
@@ -666,10 +665,9 @@ impl<C: TurnClient + Clone> Agent<C> {
 		&mut self.tool_choices
 	}
 
-	/// Returns a cloneable handle for resolving required-deadline campaign
-	/// holds.
-	pub fn holds(&self) -> HoldSet {
-		self.holds.clone()
+	/// Returns a cloneable handle for resolving required-deadline regime waits.
+	pub fn waits(&self) -> WaitSet {
+		self.waits.clone()
 	}
 
 	/// Returns the ordered event feed handle.
@@ -715,20 +713,20 @@ impl<C: TurnClient + Clone> Agent<C> {
 		self.provider_error_gate = Some(gate);
 	}
 
-	/// Returns the active campaign prompt-slot binding.
+	/// Returns the active regime prompt setting.
 	pub fn prompt_slot(&self) -> Option<&str> {
 		self
 			.arbiter
-			.campaigns()
-			.slots()
-			.binding(&BindSlot::PromptSlot)
+			.regimes()
+			.resources()
+			.current(&SettingSlot::PromptSlot)
 	}
 
 	fn invocation_mode_props(arbiter: &mut Arbiter, effects: &omp_tool::Effects) -> pb::ValueMap {
 		let mode = arbiter
-			.campaigns()
-			.slots()
-			.binding(&BindSlot::PromptSlot)
+			.regimes()
+			.resources()
+			.current(&SettingSlot::PromptSlot)
 			.map(Str::new);
 		if effects_mutate_environment(effects)
 			&& mode
@@ -736,9 +734,9 @@ impl<C: TurnClient + Clone> Agent<C> {
 				.is_some_and(|mode| matches!(mode.as_str(), "plan-yolo" | "prewalk"))
 		{
 			arbiter
-				.campaigns_mut()
-				.slots_mut()
-				.pop_binding(&BindSlot::PromptSlot);
+				.regimes_mut()
+				.resources_mut()
+				.pop(&SettingSlot::PromptSlot);
 		}
 		batch::invocation_mode_props(mode.as_deref(), effects)
 	}
@@ -753,7 +751,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 		self.redemption_authority = Some(authority);
 	}
 
-	/// Installs a bounded provider failover route campaign.
+	/// Installs a bounded provider failover route regime.
 	pub fn set_provider_failover_routes(&mut self, routes: Vec<Str>) {
 		self.arbiter.set_retry_chain(routes);
 	}
@@ -778,13 +776,12 @@ impl<C: TurnClient + Clone> Agent<C> {
 	pub fn set_secret_obfuscator(&mut self, obfuscator: Arc<Mutex<SecretObfuscator>>) {
 		self.secret_obfuscator = Some(obfuscator);
 	}
+
 	/// Installs the smart unexpected-stop classifier.
-	pub fn set_unexpected_stop_classifier(
-		&mut self,
-		classifier: Arc<dyn UnexpectedStopClassifier>,
-	) {
+	pub fn set_unexpected_stop_classifier(&mut self, classifier: Arc<dyn UnexpectedStopClassifier>) {
 		self.unexpected_stop_classifier = Some(classifier);
 	}
+
 	/// Configures early validation for streamed edit arguments.
 	pub fn configure_streaming_edit_guard(&mut self, cwd: std::path::PathBuf, enabled: bool) {
 		self.streaming_edit_guard = Some(Arc::new(StreamingEditGuard::new(cwd, enabled)));
@@ -1139,6 +1136,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 			.await;
 		Ok(ManualCompactionOutcome { method: mode, event, tokens_before, tokens_after, frame_count })
 	}
+
 	async fn recover_context_overflow(&mut self, order: &CompactionMethodOrder) -> bool {
 		let mode = order.as_slice().iter().find_map(|tier| match tier {
 			CompactionTier::Local => Some(ManualCompactionMode::Soft),
@@ -1347,7 +1345,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 		} else {
 			self.drain_control();
 			let idle_fold =
-				self.fold_point(Point::Idle, Some(root_turn_id.as_str()), None, None, false)?;
+				self.resolve_point(Point::Idle, Some(root_turn_id.as_str()), None, None, false)?;
 			self.execute_scheduled_rewinds()?;
 			let snapshot = self.state.snapshot();
 			let queued = self
@@ -1357,7 +1355,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 			pending_indexes.extend_from_slice(self.journal.recoverable_settlement_events());
 			pending_indexes.sort_unstable();
 			pending_indexes.extend(self.stage_interrupts(&root_turn_id, queued)?);
-			for item in idle_fold.campaign.injects {
+			for item in idle_fold.regime.injects {
 				pending_indexes.push(self.journal.append_turn_input(
 					now,
 					root_turn_id.as_str(),
@@ -1455,13 +1453,11 @@ impl<C: TurnClient + Clone> Agent<C> {
 					if turn_error::Kind::try_from(error.kind) == Ok(turn_error::Kind::EmptyOutput) =>
 				{
 					if self.state.snapshot().unexpected_stop == UnexpectedStopMode::None {
-						self
-							.journal
-							.abort_turn(
-								now_ms(),
-								turn_id.as_str(),
-								AbortDisposition::Exhausted,
-							)?;
+						self.journal.abort_turn(
+							now_ms(),
+							turn_id.as_str(),
+							AbortDisposition::Exhausted,
+						)?;
 						self.arbiter.flush(&mut self.journal, now_ms())?;
 						self.context = None;
 						return Err(AgentError::Turn(TurnError::Terminal(error)));
@@ -1471,16 +1467,13 @@ impl<C: TurnClient + Clone> Agent<C> {
 							turn_id: Str::new(turn_id.as_str()),
 						})
 						.await;
-					let reaction = self.arbiter.react_empty_output_retry(&PointCx {
+					let draft = self.arbiter.apply_empty_output_retry(&PointCx {
 						turn_id: Some(turn_id.as_str()),
 						now_ms: now_ms(),
 						delivered: true,
 						..PointCx::default()
 					});
-					let exhausted = reaction
-						.verdicts
-						.iter()
-						.any(|verdict| matches!(verdict, crate::Verdict::Fault { .. }));
+					let exhausted = draft.failed();
 					let disposition = if exhausted {
 						AbortDisposition::Exhausted
 					} else {
@@ -1495,14 +1488,10 @@ impl<C: TurnClient + Clone> Agent<C> {
 						error.detail = EmptyOutputRetry::cap_detail(&error);
 						return Err(AgentError::Turn(TurnError::Terminal(error)));
 					}
-					let retry = reaction
-						.verdicts
-						.into_iter()
-						.find_map(|verdict| match verdict {
-							Verdict::Inject(mut items) => items.pop(),
-							_ => None,
-						})
-						.expect("empty-output retry campaign injects one retry item");
+					let retry = draft
+						.into_appended()
+						.pop()
+						.expect("empty-output retry regime appends one retry item");
 					let next_turn_id =
 						follow_up_id(&turn_id, u32::from(self.arbiter.empty_output_retry_spent()));
 					pending_indexes = self.append_pending(&next_turn_id, [retry])?;
@@ -1533,13 +1522,11 @@ impl<C: TurnClient + Clone> Agent<C> {
 						// Keep the terminal explanation in the canonical
 						// transcript while project_journal excludes this marked
 						// error-only frame from future provider context.
-						self
-							.journal
-							.append_optimistic(
-								now_ms(),
-								terminal_error_item(&error),
-								self.prompt_hash,
-							)?;
+						self.journal.append_optimistic(
+							now_ms(),
+							terminal_error_item(&error),
+							self.prompt_hash,
+						)?;
 						self.publish_live_history()?;
 						return Err(AgentError::Turn(TurnError::Terminal(error)));
 					}
@@ -1559,11 +1546,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 					// It must never consume a configured model-fallback route.
 					self
 						.journal
-						.abort_turn(
-							now_ms(),
-							turn_id.as_str(),
-							AbortDisposition::Exhausted,
-						)?;
+						.abort_turn(now_ms(), turn_id.as_str(), AbortDisposition::Exhausted)?;
 					self.arbiter.flush(&mut self.journal, now_ms())?;
 					self.context = None;
 					let order = self.state.snapshot().compaction.clone();
@@ -1578,7 +1561,9 @@ impl<C: TurnClient + Clone> Agent<C> {
 					return Err(AgentError::Turn(TurnError::Terminal(error)));
 				},
 				Err(AgentError::Turn(error @ TurnError::Terminal(_))) => {
-					let routes = self.provider_failover_routes(turn_id.as_str(), "turn_failed").await;
+					let routes = self
+						.provider_failover_routes(turn_id.as_str(), "turn_failed")
+						.await;
 					let disposition = if routes.is_empty() {
 						AbortDisposition::Exhausted
 					} else {
@@ -1602,7 +1587,9 @@ impl<C: TurnClient + Clone> Agent<C> {
 				},
 				Err(error) => {
 					self.publish_provider_error("turn_failed", Some(Str::new(error.to_string())));
-					let routes = self.provider_failover_routes(turn_id.as_str(), "turn_failed").await;
+					let routes = self
+						.provider_failover_routes(turn_id.as_str(), "turn_failed")
+						.await;
 					if !routes.is_empty() {
 						self.journal.abort_turn(
 							now_ms(),
@@ -1641,12 +1628,12 @@ impl<C: TurnClient + Clone> Agent<C> {
 			self.events.publish(AgentEvent::Snapshot(snapshot.clone()));
 			self.publish_live_history()?;
 			let turn_end =
-				self.fold_point(Point::TurnEnd, Some(turn_id.as_str()), None, None, false)?;
-			for item in turn_end.campaign.injects {
+				self.resolve_point(Point::TurnEnd, Some(turn_id.as_str()), None, None, false)?;
+			for item in turn_end.regime.injects {
 				let _ = self.mailbox.sender().try_enqueue(Interrupt {
 					class: InterruptClass::Immediate,
 					item,
-					source: InterruptSource::Continuation { owner: sf!("campaign") },
+					source: InterruptSource::Continuation { owner: sf!("regime") },
 				});
 			}
 			self.drain_control();
@@ -1752,12 +1739,12 @@ impl<C: TurnClient + Clone> Agent<C> {
 					)?;
 				}
 				let batch_fold =
-					self.fold_point(Point::Batch, Some(turn_id.as_str()), None, None, false)?;
-				for item in batch_fold.campaign.injects {
+					self.resolve_point(Point::Batch, Some(turn_id.as_str()), None, None, false)?;
+				for item in batch_fold.regime.injects {
 					boundary.push(Interrupt {
 						class: InterruptClass::Immediate,
 						item,
-						source: InterruptSource::Continuation { owner: sf!("campaign") },
+						source: InterruptSource::Continuation { owner: sf!("regime") },
 					});
 				}
 				let (interrupt_tx, interrupt_rx) = watch::channel(None);
@@ -1765,9 +1752,9 @@ impl<C: TurnClient + Clone> Agent<C> {
 				if aborted {
 					interrupt_tx.send_replace(Some(sf!("user interrupt")));
 				}
-				let campaign_cut = batch_fold.campaign.winner == WinnerKind::Cut;
-				if campaign_cut {
-					interrupt_tx.send_replace(Some(sf!("campaign cut")));
+				let regime_cancel = batch_fold.regime.control == ResolutionKind::Cancel;
+				if regime_cancel {
+					interrupt_tx.send_replace(Some(sf!("regime cancellation")));
 				}
 				let mut deadline_elapsed = false;
 				let mut abort_rx = self.abort_rx.clone();
@@ -1779,7 +1766,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 				yield_now().await;
 				if !aborted && *self.abort_rx.borrow() != abort_generation {
 					aborted = true;
-					if !campaign_cut {
+					if !regime_cancel {
 						interrupt_tx.send_replace(Some(sf!("user interrupt")));
 					}
 				}
@@ -1814,11 +1801,11 @@ impl<C: TurnClient + Clone> Agent<C> {
 									ControlMailboxEvent::Closed => std::future::pending::<()>().await,
 									ControlMailboxEvent::JournalHandled => {},
 									ControlMailboxEvent::Rewind(rewind) => self.pending_rewinds.push_back(rewind),
-									ControlMailboxEvent::Campaign(campaign) => Self::handle_campaign_control(
+									ControlMailboxEvent::Regime(regime) => Self::handle_regime_control(
 										&mut self.arbiter,
 										&mut self.journal,
 										&mut self.tool_choices,
-										campaign,
+										regime,
 									),
 								}
 							},
@@ -1948,12 +1935,13 @@ impl<C: TurnClient + Clone> Agent<C> {
 				self.transition(AgentPhase::Idle);
 				return Ok(run_summary(Some(outcome), committed_turns, false));
 			}
-			let idle_fold = self.fold_point(Point::Idle, Some(turn_id.as_str()), None, None, false)?;
-			for item in idle_fold.campaign.injects {
+			let idle_fold =
+				self.resolve_point(Point::Idle, Some(turn_id.as_str()), None, None, false)?;
+			for item in idle_fold.regime.injects {
 				let _ = self.mailbox.sender().try_enqueue(Interrupt {
 					class: InterruptClass::Immediate,
 					item,
-					source: InterruptSource::Continuation { owner: sf!("campaign") },
+					source: InterruptSource::Continuation { owner: sf!("regime") },
 				});
 			}
 			let mut idle = self
@@ -2072,6 +2060,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 			.winner
 			.routes()
 	}
+
 	async fn classify_unexpected_stop(&self, outcome: &Outcome) -> bool {
 		if outcome.stop() != pb::StopReason::StopEndTurn
 			|| outcome
@@ -2110,29 +2099,31 @@ impl<C: TurnClient + Clone> Agent<C> {
 			.collect()
 	}
 
-	fn fold_point(
+	fn resolve_point(
 		&mut self,
 		point: Point,
 		turn_id: Option<&str>,
 		invocation_id: Option<&str>,
 		stream_delta: Option<&str>,
 		delivered: bool,
-	) -> Result<Fold, AgentError> {
+	) -> Result<ResolvedEvent, AgentError> {
 		let pending_invoker = self
 			.tool_choices
 			.pending_head()
 			.map(|head| PendingInvokerCx { id: head.id, source_tool: head.source_tool });
+		let checkpoint_active = self.checkpoint_state.lock().active.is_some();
 		let cx = PointCx {
 			turn_id,
 			invocation_id,
 			stream_delta,
 			now_ms: now_ms(),
 			delivered,
+			checkpoint_active,
 			pending_invoker,
 		};
 		Ok(self
 			.arbiter
-			.fold_and_record(point, &cx, None, &mut self.journal)?)
+			.resolve_and_record(point, &cx, None, &mut self.journal)?)
 	}
 
 	/// Runs the settled-boundary domain hook and converts an accepted decision
@@ -2154,23 +2145,19 @@ impl<C: TurnClient + Clone> Agent<C> {
 				AgentSettledEvent { agent_id: sf!("agent"), turn_id: Str::new(turn_id.as_str()) };
 			let outcome = gate.gate_domain(&event).await;
 			let winner = if outcome.winner == AgentSettled::Continue {
-				let reaction =
-					CampaignMachine::react(&mut self.legacy_session_stop, Point::Settle, &PointCx {
-						turn_id: Some(turn_id.as_str()),
-						now_ms: now,
-						..PointCx::default()
-					});
-				if reaction
-					.verdicts
-					.iter()
-					.any(|verdict| matches!(verdict, crate::Verdict::Continue))
-				{
+				let facts =
+					PointCx { turn_id: Some(turn_id.as_str()), now_ms: now, ..PointCx::default() };
+				let draft = evaluate_regime(Point::Settle, &facts, "session-stop", 0, |ctx, next| {
+					self.session_stop_regime.apply(ctx, next)
+				})
+				.expect("core session-stop regime is infallible");
+				if draft.requests_retry() {
 					AgentSettled::Continue
 				} else {
 					AgentSettled::Settle
 				}
 			} else {
-				self.legacy_session_stop = LegacySessionStopCampaign::default();
+				self.session_stop_regime = SessionStopRegime::default();
 				AgentSettled::Settle
 			};
 			builtins.consider(
@@ -2184,22 +2171,22 @@ impl<C: TurnClient + Clone> Agent<C> {
 			);
 		}
 		let (mut candidate, mut policy) = builtins.into_parts();
-		let settle_fold = self.arbiter.fold_and_record(
+		let settle_fold = self.arbiter.resolve_and_record(
 			Point::Settle,
 			&PointCx { turn_id: Some(turn_id.as_str()), now_ms: now, ..PointCx::default() },
 			None,
 			&mut self.journal,
 		)?;
-		if settle_fold.campaign.winner == WinnerKind::Continue
+		if settle_fold.regime.control == ResolutionKind::Retry
 			&& matches!(candidate, Continuation::Settle)
 		{
 			candidate = Continuation::Continue {
 				owner:          settle_fold
-					.campaign
-					.winner_lane
-					.unwrap_or_else(|| sf!("campaign")),
+					.regime
+					.controlling_activation
+					.unwrap_or_else(|| sf!("regime")),
 				item:           recovery_prompt_item(PromptAssetId::AutoContinue),
-				label:          Some(sf!("campaign")),
+				label:          Some(sf!("regime")),
 				collapse_prior: false,
 			};
 			policy = ContinuationPolicy::default();
@@ -2254,7 +2241,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 
 	/// Installs the compiled stream-rule generation used by subsequent turns.
 	pub fn set_ttsr_registry(&mut self, registry: TtsrRegistry) {
-		self.arbiter.ttsr_campaign_mut().install(registry);
+		self.arbiter.ttsr_regime_mut().install(registry);
 	}
 
 	/// Installs a host activity assertion acquired only while a turn is active.
@@ -2489,8 +2476,8 @@ impl<C: TurnClient + Clone> Agent<C> {
 				.checkpoint_notice_mut()
 				.set_active(checkpoint_active);
 			let context_fold =
-				self.fold_point(Point::Context, Some(turn_id.as_str()), None, None, false)?;
-			for item in context_fold.campaign.injects {
+				self.resolve_point(Point::Context, Some(turn_id.as_str()), None, None, false)?;
+			for item in context_fold.regime.injects {
 				match &mut provider_input {
 					TurnInput::Full(thread) => thread.items.push(item),
 					TurnInput::Delta(_, delta) => delta.append.push(item),
@@ -2514,7 +2501,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 				pending_invoker,
 				..PointCx::default()
 			};
-			self.arbiter.fold_and_record(
+			self.arbiter.resolve_and_record(
 				Point::ToolChoice,
 				&choice_cx,
 				Some(&mut self.tool_choices),
@@ -2531,16 +2518,16 @@ impl<C: TurnClient + Clone> Agent<C> {
 					Some(wire_tool_choice::from_parts(mode as i32, name));
 			}
 			let pre_model =
-				self.fold_point(Point::PreModel, Some(turn_id.as_str()), None, None, false)?;
-			for binding in pre_model.campaign.binds {
-				if let ScopedBinding { slot: BindSlot::ModelRoute, value } = binding {
+				self.resolve_point(Point::PreModel, Some(turn_id.as_str()), None, None, false)?;
+			for setting in pre_model.regime.settings {
+				if let ScopedSetting { slot: SettingSlot::ModelRoute, value } = setting {
 					frozen_options.params.model = value.to_string();
 				}
 			}
-			for ticket in pre_model.campaign.holds {
-				self.holds.insert(ticket)?;
+			for ticket in pre_model.regime.waits {
+				self.waits.insert(ticket)?;
 			}
-			self.holds.wait_empty(self.abort_rx.clone()).await?;
+			self.waits.wait_empty(self.abort_rx.clone()).await?;
 			let start = TurnStart {
 				turn_id: turn_id.as_str().to_str(),
 				item_events: input_events.clone(),
@@ -2657,7 +2644,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 						&outcome,
 					)?;
 					self.last_toolset_hash = Some(toolset_hash);
-					self.arbiter.ttsr_campaign_mut().advance_message();
+					self.arbiter.ttsr_regime_mut().advance_message();
 					self.tool_choices.resolve();
 					return Ok(RunTurnResult::Complete((
 						outcome,
@@ -2737,13 +2724,13 @@ impl<C: TurnClient + Clone> Agent<C> {
 			.append_ttsr_injection(now_ms(), turn_id, source, &names, content)?;
 		self
 			.arbiter
-			.ttsr_campaign_mut()
+			.ttsr_regime_mut()
 			.mark_injected(names.iter().map(Str::as_str));
 		Ok(())
 	}
 
 	fn take_deferred_ttsr(&mut self, turn_id: &str) -> Result<Option<Item>, AgentError> {
-		let Some((source, matches, text, item)) = self.arbiter.ttsr_campaign_mut().take_deferred()
+		let Some((source, matches, text, item)) = self.arbiter.ttsr_regime_mut().take_deferred()
 		else {
 			return Ok(None);
 		};
@@ -2784,11 +2771,11 @@ impl<C: TurnClient + Clone> Agent<C> {
 						ControlMailboxEvent::Closed => std::future::pending::<()>().await,
 						ControlMailboxEvent::JournalHandled => {},
 						ControlMailboxEvent::Rewind(rewind) => self.pending_rewinds.push_back(rewind),
-						ControlMailboxEvent::Campaign(campaign) => Self::handle_campaign_control(
+						ControlMailboxEvent::Regime(regime) => Self::handle_regime_control(
 							&mut self.arbiter,
 							&mut self.journal,
 							&mut self.tool_choices,
-							campaign,
+							regime,
 						),
 					}
 				},
@@ -2802,7 +2789,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 			runtime_duration(INTERRUPT_GRACE),
 		);
 		if enforce_ttsr {
-			self.arbiter.ttsr_campaign_mut().reset_streams();
+			self.arbiter.ttsr_regime_mut().reset_streams();
 		}
 		let mut speculative = BTreeMap::new();
 		let mut part_calls: BTreeMap<u32, Str> = BTreeMap::new();
@@ -2855,12 +2842,12 @@ impl<C: TurnClient + Clone> Agent<C> {
 								self.control_serviced_during_turn = true;
 								continue;
 							},
-							ControlMailboxEvent::Campaign(campaign) => {
-								Self::handle_campaign_control(
+							ControlMailboxEvent::Regime(regime) => {
+								Self::handle_regime_control(
 									&mut self.arbiter,
 									&mut self.journal,
 									&mut self.tool_choices,
-									campaign,
+									regime,
 								);
 								self.control_serviced_during_turn = true;
 								continue;
@@ -2910,12 +2897,12 @@ impl<C: TurnClient + Clone> Agent<C> {
 									self.control_serviced_during_turn = true;
 									continue;
 								},
-								ControlMailboxEvent::Campaign(campaign) => {
-									Self::handle_campaign_control(
+								ControlMailboxEvent::Regime(regime) => {
+									Self::handle_regime_control(
 									&mut self.arbiter,
 									&mut self.journal,
 									&mut self.tool_choices,
-									campaign,
+									regime,
 								);
 									self.control_serviced_during_turn = true;
 									continue;
@@ -3040,7 +3027,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 					}
 					let admission = self
 						.arbiter
-						.fold_and_record(
+						.resolve_and_record(
 							Point::Admission,
 							&PointCx {
 								turn_id: Some(turn_id.as_str()),
@@ -3051,21 +3038,21 @@ impl<C: TurnClient + Clone> Agent<C> {
 							None,
 							&mut self.journal,
 						)
-						.map_err(|_| TurnError::Protocol("failed to journal admission fold"))?;
-					if admission.campaign.winner == WinnerKind::Deny {
-						return Err(TurnError::Protocol("campaign denied tool admission"));
+						.map_err(|_| TurnError::Protocol("failed to journal admission resolution"))?;
+					if admission.regime.control == ResolutionKind::Reject {
+						return Err(TurnError::Protocol("regime rejected tool admission"));
 					}
-					for ticket in admission.campaign.holds {
+					for ticket in admission.regime.waits {
 						self
-							.holds
+							.waits
 							.insert(ticket)
-							.map_err(|_| TurnError::Protocol("campaign admission hold is invalid"))?;
+							.map_err(|_| TurnError::Protocol("regime admission wait is invalid"))?;
 					}
 					self
-						.holds
+						.waits
 						.wait_empty(self.abort_rx.clone())
 						.await
-						.map_err(|_| TurnError::Protocol("campaign admission hold did not resolve"))?;
+						.map_err(|_| TurnError::Protocol("regime admission wait did not resolve"))?;
 					let opened = SpeculativeCall::open_with_props(
 						&self.env,
 						&self.events,
@@ -3106,16 +3093,13 @@ impl<C: TurnClient + Clone> Agent<C> {
 						guard.push_fragment(call_id.as_str(), fragment);
 					}
 					let trigger = if let Some(state) = ttsr_parts.get_mut(&part.index) {
-						self
-							.arbiter
-							.ttsr_campaign_mut()
-							.check_delta(state, fragment)
+						self.arbiter.ttsr_regime_mut().check_delta(state, fragment)
 					} else {
 						None
 					};
 					let stream_fold = self
 						.arbiter
-						.fold_and_record(
+						.resolve_and_record(
 							Point::Stream,
 							&PointCx {
 								turn_id: Some(turn_id.as_str()),
@@ -3126,12 +3110,12 @@ impl<C: TurnClient + Clone> Agent<C> {
 							None,
 							&mut self.journal,
 						)
-						.map_err(|_| TurnError::Protocol("failed to journal stream campaign fold"))?;
-					if stream_fold.campaign.winner == WinnerKind::Cut {
+						.map_err(|_| TurnError::Protocol("failed to journal stream regime resolution"))?;
+					if stream_fold.regime.control == ResolutionKind::Cancel {
 						if let Some(trigger) = trigger {
 							return Ok(DriveSessionResult::Ttsr(trigger));
 						}
-						return Err(TurnError::Protocol("campaign cut the stream"));
+						return Err(TurnError::Protocol("regime cancelled the stream"));
 					}
 					if let Some(call_id) = part_calls.get(&part.index) {
 						speculative
@@ -3216,19 +3200,19 @@ impl<C: TurnClient + Clone> Agent<C> {
 		while let Ok(command) = self.receivers.host_commands.try_recv() {
 			self.handle_host_control(command);
 		}
-		let mut campaigns = Vec::new();
+		let mut regimes = Vec::new();
 		self.control_mailbox.drain_ready(
 			&mut self.journal,
 			CONTROL_DRAIN_LIMIT,
 			&mut self.pending_rewinds,
-			&mut campaigns,
+			&mut regimes,
 		);
-		for campaign in campaigns {
-			Self::handle_campaign_control(
+		for regime in regimes {
+			Self::handle_regime_control(
 				&mut self.arbiter,
 				&mut self.journal,
 				&mut self.tool_choices,
-				campaign,
+				regime,
 			);
 		}
 	}
@@ -3513,52 +3497,52 @@ impl<C: TurnClient + Clone> Agent<C> {
 		Ok(item)
 	}
 
-	fn handle_campaign_control(
+	fn handle_regime_control(
 		arbiter: &mut Arbiter,
 		journal: &mut Journal,
 		tool_choices: &mut ToolChoiceQueue,
-		command: CampaignControl,
+		command: RegimeControl,
 	) {
 		match command {
-			CampaignControl::Engage { spec, machine, options, reply } => {
+			RegimeControl::Start { spec, handler, options, reply } => {
 				let result = arbiter
-					.engage(spec, machine, journal, options)
+					.start(spec, handler, journal, options)
 					.map_err(ControlError::from);
 				let _ = reply.send(result);
 			},
-			CampaignControl::Active { reply } => {
-				let _ = reply.send(Ok(arbiter.campaigns().entries()));
+			RegimeControl::Active { reply } => {
+				let _ = reply.send(Ok(arbiter.regimes().records()));
 			},
-			CampaignControl::Disengage { engagement, now_ms, reply } => {
+			RegimeControl::Stop { activation, now_ms, reply } => {
 				let result = arbiter
-					.disengage(engagement.as_str(), now_ms, journal)
+					.stop(activation.as_str(), now_ms, journal)
 					.map_err(ControlError::from);
 				let _ = reply.send(result);
 			},
-			CampaignControl::RegisterPendingInvoker { id, source_tool, invoker, reply } => {
+			RegimeControl::RegisterPendingInvoker { id, source_tool, invoker, reply } => {
 				tool_choices.register_pending_invoker(id, source_tool, invoker);
 				let _ = reply.send(Ok(()));
 			},
-			CampaignControl::RemovePendingInvoker { id, reply } => {
+			RegimeControl::RemovePendingInvoker { id, reply } => {
 				tool_choices.remove_pending_invoker(id.as_str());
 				let _ = reply.send(Ok(()));
 			},
-			CampaignControl::Step { engagement, reason, reply } => {
+			RegimeControl::Advance { activation, reason, reply } => {
 				let _ = reason;
 				let result = arbiter
-					.step(engagement.as_str(), now_ms(), journal)
+					.advance(activation.as_str(), now_ms(), journal)
 					.map_err(ControlError::from);
 				let _ = reply.send(result);
 			},
-			CampaignControl::Cut { engagement, reply } => {
+			RegimeControl::Cancel { activation, reply } => {
 				let result = arbiter
-					.cut(engagement.as_str(), now_ms(), journal)
+					.cancel(activation.as_str(), now_ms(), journal)
 					.map_err(ControlError::from);
 				let _ = reply.send(result);
 			},
-			CampaignControl::UpdateState { engagement, payload, reply } => {
+			RegimeControl::UpdateState { activation, payload, reply } => {
 				let result = arbiter
-					.update_state(engagement.as_str(), payload.as_ref(), now_ms(), journal)
+					.update_state(activation.as_str(), payload.as_ref(), now_ms(), journal)
 					.map_err(ControlError::from);
 				let _ = reply.send(result);
 			},
@@ -4226,7 +4210,7 @@ fn stream_watchdog_error(
 		let _ = mailbox.try_enqueue(Interrupt {
 			class:  InterruptClass::TurnBoundary,
 			item:   stream_recovery_item(kind),
-			source: InterruptSource::Continuation { owner: sf!("campaign") },
+			source: InterruptSource::Continuation { owner: sf!("regime") },
 		});
 	}
 	TurnError::Rpc(tonic::Status::deadline_exceeded("stream watchdog elapsed"))
@@ -4369,14 +4353,13 @@ fn terminal_error_item(error: &pb::TurnError) -> Item {
 		created_at_ms: now_ms(),
 		kind:          Some(item::Kind::Message(thread::Message {
 			role:  thread::Role::Assistant as i32,
-			parts: vec![thread::Part {
-				kind: Some(part::Kind::Text(error.detail.clone())),
-			}],
+			parts: vec![thread::Part { kind: Some(part::Kind::Text(error.detail.clone())) }],
 		})),
 		props:         Some(pb::ValueMap {
-			fields: BTreeMap::from([(crate::journal_kinds::TERMINAL_ERROR_PROP.to_owned(), pb::Value {
-				kind: Some(value::Kind::Bool(true)),
-			})]),
+			fields: BTreeMap::from([(
+				crate::journal_kinds::TERMINAL_ERROR_PROP.to_owned(),
+				pb::Value { kind: Some(value::Kind::Bool(true)) },
+			)]),
 		}),
 	}
 }
@@ -5409,17 +5392,14 @@ mod tests {
 					..pb::TurnError::default()
 				})),
 			})]]))),
-			opened: Arc::clone(&opened),
+			opened:  Arc::clone(&opened),
 		};
 		let (env, _transport) = EnvClient::in_process(1);
 		let state = AgentState::new(AgentSnapshot::default());
 		let mut agent = Agent::new(client, env, state.clone(), journal, test_caps());
 
 		let result = agent
-			.submit(
-				[message(thread::Role::User, "oversized request")],
-				TurnId::new("payload-turn"),
-			)
+			.submit([message(thread::Role::User, "oversized request")], TurnId::new("payload-turn"))
 			.await;
 		assert!(matches!(
 			result,
@@ -5428,17 +5408,16 @@ mod tests {
 		));
 		assert_eq!(opened.lock().len(), 1, "same-model retries are forbidden");
 
-		let live = agent.journal().live_item_events().expect("live item events");
+		let live = agent
+			.journal()
+			.live_item_events()
+			.expect("live item events");
 		let display = agent.journal().items_at(&live).expect("display projection");
 		assert_eq!(display.len(), 2, "user input plus durable terminal error");
 		let log = agent.journal().load().expect("journal log");
-		let provider = project_journal(
-			&log,
-			log.as_ref(),
-			state.snapshot().registry.as_ref(),
-			&test_caps(),
-		)
-		.expect("provider projection");
+		let provider =
+			project_journal(&log, log.as_ref(), state.snapshot().registry.as_ref(), &test_caps())
+				.expect("provider projection");
 		assert_eq!(provider.items.len(), 1, "terminal error-only frame stays display-only");
 		fs::remove_file(path).expect("remove journal");
 	}
@@ -5464,27 +5443,18 @@ mod tests {
 				outcome_script(end_outcome("I will make that change now.")),
 				outcome_script(end_outcome("Done.")),
 			]))),
-			opened: Arc::clone(&opened),
+			opened:  Arc::clone(&opened),
 		};
 		let (env, _transport) = EnvClient::in_process(1);
 		let mut snapshot = AgentSnapshot::default();
 		snapshot.unexpected_stop = UnexpectedStopMode::Smart;
-		let mut agent = Agent::new(
-			client,
-			env,
-			AgentState::new(snapshot),
-			journal,
-			test_caps(),
-		);
-		agent.set_unexpected_stop_classifier(Arc::new(ScriptedUnexpectedStopClassifier(
-			Mutex::new(VecDeque::from([true, false])),
-		)));
+		let mut agent = Agent::new(client, env, AgentState::new(snapshot), journal, test_caps());
+		agent.set_unexpected_stop_classifier(Arc::new(ScriptedUnexpectedStopClassifier(Mutex::new(
+			VecDeque::from([true, false]),
+		))));
 
 		let summary = agent
-			.submit(
-				[message(thread::Role::User, "finish the task")],
-				TurnId::new("smart-stop"),
-			)
+			.submit([message(thread::Role::User, "finish the task")], TurnId::new("smart-stop"))
 			.await
 			.expect("smart continuation succeeds");
 		assert_eq!(summary.committed_turns, 2);

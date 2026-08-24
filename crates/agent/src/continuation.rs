@@ -140,7 +140,7 @@ pub enum SettledParticipant {
 	AgentSettled,
 }
 
-/// Degenerate pre-campaign SETTLE fold over the two built-in participants.
+/// Degenerate built-in SETTLE fold preceding regime resolution.
 pub struct SettledFold {
 	candidate: Continuation,
 	policy:    ContinuationPolicy,
