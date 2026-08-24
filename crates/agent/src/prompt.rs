@@ -522,7 +522,8 @@ pub struct PromptCapabilitiesInput {
 	pub delegation:        PromptDelegationInput,
 	/// Mounted mutation conveniences.
 	pub mutations:         MutationPromptInput,
-	/// Live dynamic-device transport guidance, when `dyn` is callable.
+	/// Live dynamic-device transport guidance, when the `xd` shell builtin is
+	/// live.
 	pub device_guidance:   Option<Str>,
 	/// AutoQA filing guidance, when the reporting device is mounted.
 	pub auto_qa_guidance:  Option<Str>,

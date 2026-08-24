@@ -184,7 +184,6 @@ fn full_workspace(
 			tools:             Arc::from([
 				tool("ast_edit", "ast"),
 				tool("bash", "shell"),
-				tool("dyn", "device"),
 				tool("edit", "hl"),
 				tool("glob", "glob"),
 				tool("grep", "regex"),

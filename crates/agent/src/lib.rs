@@ -61,7 +61,7 @@ pub use approvals::{
 	ApprovalBook, ApprovalDecision, ApprovalGuard, ApprovalInbox, ApprovalRequest, ApprovalRoute,
 	ApprovalSource, ApprovalSpec, ApprovalTicket, TicketState,
 };
-pub use arbiter::{Arbiter, ArbiterError, PendingInvokerCx, PointCx, RegimeFact};
+pub use arbiter::{Arbiter, ArbiterError, PointCx, RegimeFact};
 pub use attachments::{
 	Attachment, AttachmentError, AttachmentIndex, DEFAULT_PROVIDER_IMAGE_BUDGET,
 	MAX_TRANSIENT_IMAGE_BYTES, NormalizeAttachmentError, NormalizedAttachmentImage,

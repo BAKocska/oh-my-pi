@@ -4,11 +4,10 @@
 //! queue therefore never mutates or reorders a tool-call batch that the model
 //! has already emitted.
 
-use std::{collections::VecDeque, future::Future, pin::Pin, sync::Arc, vec};
+use std::{collections::VecDeque, sync::Arc, vec};
 
 use omp_core::{Str, sf};
 use omp_inference::call::ToolChoice;
-use serde_json::Value;
 
 /// Why a claimed choice could not be settled successfully.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, strum::IntoStaticStr)]
@@ -24,8 +23,6 @@ pub enum RejectReason {
 	Removed,
 	/// The selected tool was not available in the request manifest.
 	Unavailable,
-	/// The directive-owned invoker was not called by the model.
-	NotInvoked,
 }
 
 /// Resolution selected by a directive after a rejected claim.
@@ -66,10 +63,6 @@ pub struct RejectInfo {
 	pub reason: RejectReason,
 }
 
-/// Future returned by a directive-owned tool invoker.
-pub type InvokeFuture = Pin<Box<dyn Future<Output = Value> + Send + 'static>>;
-/// Handler that bypasses a registered tool executor for a directive-owned call.
-pub type Invoker = Arc<dyn Fn(Value) -> InvokeFuture + Send + Sync + 'static>;
 /// Successful-settlement notification.
 pub type ResolveHandler = Arc<dyn Fn(ResolveInfo) + Send + Sync + 'static>;
 /// Rejection policy callback.
@@ -82,8 +75,6 @@ pub struct DirectiveCallbacks {
 	pub on_resolved: Option<ResolveHandler>,
 	/// Selects the disposition of a rejected choice.
 	pub on_rejected: Option<RejectHandler>,
-	/// Optional executor for the forced tool call.
-	pub on_invoked:  Option<Invoker>,
 }
 
 /// Options shared by all directive producers.
@@ -127,22 +118,6 @@ struct InFlight {
 	label:          Str,
 	choice:         ToolChoice,
 	callbacks:      DirectiveCallbacks,
-	invoked:        bool,
-}
-
-struct PendingInvoker {
-	id:          Str,
-	source_tool: Str,
-	invoker:     Invoker,
-}
-
-/// Metadata for the most recently registered pending preview invoker.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PendingInvokerHead<'a> {
-	/// Unique preview identity.
-	pub id:          &'a str,
-	/// Tool that staged the preview.
-	pub source_tool: &'a str,
 }
 
 /// Queue of tool-choice directives claimed strictly for future model requests.
@@ -155,7 +130,6 @@ pub struct ToolChoiceQueue {
 	queue:               VecDeque<Directive>,
 	in_flight:           Option<InFlight>,
 	last_resolved_label: Option<Str>,
-	pending_invokers:    Vec<PendingInvoker>,
 	next_root:           u64,
 }
 
@@ -166,7 +140,6 @@ impl ToolChoiceQueue {
 			queue:               VecDeque::new(),
 			in_flight:           None,
 			last_resolved_label: None,
-			pending_invokers:    Vec::new(),
 			next_root:           0,
 		}
 	}
@@ -208,7 +181,6 @@ impl ToolChoiceQueue {
 					label:          head.label.clone(),
 					choice:         choice.clone(),
 					callbacks:      head.callbacks.clone(),
-					invoked:        false,
 				});
 				return Some(choice);
 			}
@@ -217,17 +189,10 @@ impl ToolChoiceQueue {
 	}
 
 	/// Settles the active claim.
-	///
-	/// A directive with an invoker resolves only after that invoker was
-	/// dispatched; otherwise it follows the `NotInvoked` rejection policy.
 	pub fn resolve(&mut self) {
 		let Some(in_flight) = self.in_flight.take() else {
 			return;
 		};
-		if in_flight.callbacks.on_invoked.is_some() && !in_flight.invoked {
-			self.reject_claim(in_flight, RejectReason::NotInvoked);
-			return;
-		}
 		self.last_resolved_label = Some(in_flight.label);
 		if let Some(callback) = in_flight.callbacks.on_resolved {
 			callback(ResolveInfo { choice: in_flight.choice });
@@ -246,71 +211,6 @@ impl ToolChoiceQueue {
 		self.in_flight.is_some()
 	}
 
-	/// Dispatches the active directive-owned invoker.
-	///
-	/// Merely inspecting queue state never marks the directive invoked.
-	pub fn invoke_in_flight(&mut self, input: Value) -> Option<InvokeFuture> {
-		let invoker = self.in_flight_invoker()?;
-		Some(invoker(input))
-	}
-
-	pub(crate) fn in_flight_invoker(&mut self) -> Option<Invoker> {
-		let in_flight = self.in_flight.as_mut()?;
-		let invoker = in_flight.callbacks.on_invoked.as_ref()?;
-		in_flight.invoked = true;
-		Some(Arc::clone(invoker))
-	}
-
-	/// Registers or replaces one uniquely identified, non-forcing preview
-	/// invoker.
-	pub fn register_pending_invoker(&mut self, id: Str, source_tool: Str, invoker: Invoker) {
-		self.remove_pending_invoker(id.as_str());
-		self
-			.pending_invokers
-			.push(PendingInvoker { id, source_tool, invoker });
-	}
-
-	/// Removes one pending preview invoker by exact identity.
-	pub fn remove_pending_invoker(&mut self, id: &str) {
-		self.pending_invokers.retain(|pending| pending.id != id);
-	}
-
-	/// Removes every non-forcing preview invoker without changing directives.
-	pub fn clear_pending_invokers(&mut self) {
-		self.pending_invokers.clear();
-	}
-
-	/// Returns whether at least one preview invoker is pending.
-	pub fn has_pending_invoker(&self) -> bool {
-		!self.pending_invokers.is_empty()
-	}
-
-	/// Dispatches the most recently registered non-forcing preview invoker.
-	pub fn invoke_pending(&self, input: Value) -> Option<InvokeFuture> {
-		self
-			.pending_invokers
-			.last()
-			.map(|pending| (pending.invoker)(input))
-	}
-
-	pub(crate) fn pending_invoker(&self) -> Option<Invoker> {
-		self
-			.pending_invokers
-			.last()
-			.map(|pending| Arc::clone(&pending.invoker))
-	}
-
-	/// Returns metadata for the most recently registered pending invoker.
-	pub fn pending_head(&self) -> Option<PendingInvokerHead<'_>> {
-		self
-			.pending_invokers
-			.last()
-			.map(|pending| PendingInvokerHead {
-				id:          pending.id.as_str(),
-				source_tool: pending.source_tool.as_str(),
-			})
-	}
-
 	/// Removes queued directives with `label`, rejecting a matching claim first.
 	pub fn remove_by_label(&mut self, label: &str) {
 		if self
@@ -323,11 +223,10 @@ impl ToolChoiceQueue {
 		self.queue.retain(|directive| directive.label != label);
 	}
 
-	/// Clears directives, the active claim, previews, and observations.
+	/// Clears directives, the active claim, and observations.
 	pub fn clear(&mut self) {
 		self.reject(RejectReason::Cleared);
 		self.queue.clear();
-		self.pending_invokers.clear();
 		self.last_resolved_label = None;
 	}
 

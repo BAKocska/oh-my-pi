@@ -38,7 +38,6 @@ use crate::{
 		ActivationId, Regime, RegimeRecord, RegimeSpec, RegimeStepResult, StartError, StartOptions,
 		StartReceipt, StopError,
 	},
-	tool_choice::Invoker,
 };
 
 /// A cloneable sender for authenticated extension CONTROL operations.
@@ -175,24 +174,6 @@ pub enum RegimeControl {
 		/// Correlated result.
 		reply:      flume::Sender<Result<bool, ControlError>>,
 	},
-	/// Register or replace one staged-preview invoker.
-	RegisterPendingInvoker {
-		/// Stable preview identity.
-		id:          Str,
-		/// Tool that staged the preview.
-		source_tool: Str,
-		/// Resolution invoker.
-		invoker:     Invoker,
-		/// Correlated acknowledgement.
-		reply:       flume::Sender<Result<(), ControlError>>,
-	},
-	/// Remove one staged-preview invoker.
-	RemovePendingInvoker {
-		/// Stable preview identity.
-		id:    Str,
-		/// Correlated acknowledgement.
-		reply: flume::Sender<Result<(), ControlError>>,
-	},
 	/// Advance one activation's committed-step count.
 	Advance {
 		/// Activation identity.
@@ -231,9 +212,6 @@ impl RegimeControl {
 				let _ = reply.send(Err(ControlError::Closed));
 			},
 			Self::Stop { reply, .. } => {
-				let _ = reply.send(Err(ControlError::Closed));
-			},
-			Self::RegisterPendingInvoker { reply, .. } | Self::RemovePendingInvoker { reply, .. } => {
 				let _ = reply.send(Err(ControlError::Closed));
 			},
 			Self::Advance { reply, .. } => {
@@ -633,42 +611,6 @@ impl ControlSender {
 		self
 			.start_regime(spec, handler, StartOptions { now_ms: r#loop::now_ms(), queue })
 			.await
-	}
-
-	/// Registers or replaces a staged-preview resolution invoker.
-	pub async fn register_pending_invoker(
-		&self,
-		id: Str,
-		source_tool: Str,
-		invoker: Invoker,
-	) -> Result<(), ControlError> {
-		let (reply, response) = flume::bounded(1);
-		self
-			.commands
-			.send(ControlCommand::Regime(RegimeControl::RegisterPendingInvoker {
-				id,
-				source_tool,
-				invoker,
-				reply,
-			}))
-			.map_err(|_| ControlError::Closed)?;
-		response
-			.recv_async()
-			.await
-			.map_err(|_| ControlError::Closed)?
-	}
-
-	/// Removes a staged-preview resolution invoker.
-	pub async fn remove_pending_invoker(&self, id: Str) -> Result<(), ControlError> {
-		let (reply, response) = flume::bounded(1);
-		self
-			.commands
-			.send(ControlCommand::Regime(RegimeControl::RemovePendingInvoker { id, reply }))
-			.map_err(|_| ControlError::Closed)?;
-		response
-			.recv_async()
-			.await
-			.map_err(|_| ControlError::Closed)?
 	}
 
 	/// Advances one activation's committed-step accounting on the sole mutable

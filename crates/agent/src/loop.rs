@@ -250,8 +250,8 @@ pub(crate) use crate::arbiter::context::{ActiveCheckpoint, CheckpointState, Comp
 use crate::{
 	AgentSettled, AgentSnapshot, ArbiterError, AutolearnController, AutolearnSettings,
 	CaptureDecision, CommittedCall, ControlError, Interrupt, InterruptClass, InterruptSource,
-	PendingInvokerCx, ProviderErrorEvent, Regime, RegimeSpec, RevivalReport, ScopedSetting,
-	SettingSlot, StartOptions, StartReceipt, TurnOptions, TurnReceipt, WaitError, WaitSet,
+	ProviderErrorEvent, Regime, RegimeSpec, RevivalReport, ScopedSetting, SettingSlot, StartOptions,
+	StartReceipt, TurnOptions, TurnReceipt, WaitError, WaitSet,
 	arbiter::ResolvedEvent,
 	attachments, batch, capture_interrupt, demote_interrupted_reasoning, effects_mutate_environment,
 	execute_snapcompact, hook_event_mask, inject_first_turn_metadata, is_capture_item,
@@ -1679,29 +1679,6 @@ impl<C: TurnClient + Clone> Agent<C> {
 					.filter(|call| call.identity().name.as_str() == "edit")
 					.map(|call| call.call_id().clone())
 					.collect::<BTreeSet<_>>();
-				for call in &mut calls {
-					if call.identity().name != "dyn" {
-						continue;
-					}
-					let Ok(input) = serde_json::from_slice::<Value>(call.raw_args()) else {
-						continue;
-					};
-					let resolution = input
-						.get("do_")
-						.and_then(Value::as_str)
-						.is_some_and(|operation| matches!(operation, "invoke/resolve" | "invoke/reject"));
-					if !resolution {
-						continue;
-					}
-					let invoker = self
-						.tool_choices
-						.in_flight_invoker()
-						.or_else(|| self.tool_choices.pending_invoker());
-					if let Some(invoker) = invoker {
-						call.set_override_invoker(invoker, input);
-					}
-					break;
-				}
 				let made_environment_effect = calls
 					.iter()
 					.any(|call| effects_mutate_environment(call.effects()));
@@ -1804,7 +1781,6 @@ impl<C: TurnClient + Clone> Agent<C> {
 									ControlMailboxEvent::Regime(regime) => Self::handle_regime_control(
 										&mut self.arbiter,
 										&mut self.journal,
-										&mut self.tool_choices,
 										regime,
 									),
 								}
@@ -2107,10 +2083,6 @@ impl<C: TurnClient + Clone> Agent<C> {
 		stream_delta: Option<&str>,
 		delivered: bool,
 	) -> Result<ResolvedEvent, AgentError> {
-		let pending_invoker = self
-			.tool_choices
-			.pending_head()
-			.map(|head| PendingInvokerCx { id: head.id, source_tool: head.source_tool });
 		let checkpoint_active = self.checkpoint_state.lock().active.is_some();
 		let cx = PointCx {
 			turn_id,
@@ -2119,7 +2091,6 @@ impl<C: TurnClient + Clone> Agent<C> {
 			now_ms: now_ms(),
 			delivered,
 			checkpoint_active,
-			pending_invoker,
 		};
 		Ok(self
 			.arbiter
@@ -2355,7 +2326,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 					snapshot
 						.enabled_tools
 						.iter()
-						.filter(|name| matches!(name.as_str(), "dyn" | "manage_skill" | "learn"))
+						.filter(|name| matches!(name.as_str(), "manage_skill" | "learn"))
 						.cloned()
 						.collect::<Vec<_>>()
 						.into()
@@ -2485,22 +2456,8 @@ impl<C: TurnClient + Clone> Agent<C> {
 			}
 			publish_input_attachments(self.journal.session_id().0.as_str(), &provider_input);
 			obfuscate_provider_input(&mut provider_input, self.secret_obfuscator.as_ref())?;
-			let pending_invoker = self
-				.tool_choices
-				.pending_head()
-				.map(|head| (Str::new(head.id), Str::new(head.source_tool)));
-			let pending_invoker = pending_invoker
-				.as_ref()
-				.map(|(id, source_tool)| PendingInvokerCx {
-					id:          id.as_str(),
-					source_tool: source_tool.as_str(),
-				});
-			let choice_cx = PointCx {
-				turn_id: Some(turn_id.as_str()),
-				now_ms: now_ms(),
-				pending_invoker,
-				..PointCx::default()
-			};
+			let choice_cx =
+				PointCx { turn_id: Some(turn_id.as_str()), now_ms: now_ms(), ..PointCx::default() };
 			self.arbiter.resolve_and_record(
 				Point::ToolChoice,
 				&choice_cx,
@@ -2774,7 +2731,6 @@ impl<C: TurnClient + Clone> Agent<C> {
 						ControlMailboxEvent::Regime(regime) => Self::handle_regime_control(
 							&mut self.arbiter,
 							&mut self.journal,
-							&mut self.tool_choices,
 							regime,
 						),
 					}
@@ -2846,7 +2802,6 @@ impl<C: TurnClient + Clone> Agent<C> {
 								Self::handle_regime_control(
 									&mut self.arbiter,
 									&mut self.journal,
-									&mut self.tool_choices,
 									regime,
 								);
 								self.control_serviced_during_turn = true;
@@ -2901,7 +2856,6 @@ impl<C: TurnClient + Clone> Agent<C> {
 									Self::handle_regime_control(
 									&mut self.arbiter,
 									&mut self.journal,
-									&mut self.tool_choices,
 									regime,
 								);
 									self.control_serviced_during_turn = true;
@@ -3208,12 +3162,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 			&mut regimes,
 		);
 		for regime in regimes {
-			Self::handle_regime_control(
-				&mut self.arbiter,
-				&mut self.journal,
-				&mut self.tool_choices,
-				regime,
-			);
+			Self::handle_regime_control(&mut self.arbiter, &mut self.journal, regime);
 		}
 	}
 
@@ -3497,12 +3446,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 		Ok(item)
 	}
 
-	fn handle_regime_control(
-		arbiter: &mut Arbiter,
-		journal: &mut Journal,
-		tool_choices: &mut ToolChoiceQueue,
-		command: RegimeControl,
-	) {
+	fn handle_regime_control(arbiter: &mut Arbiter, journal: &mut Journal, command: RegimeControl) {
 		match command {
 			RegimeControl::Start { spec, handler, options, reply } => {
 				let result = arbiter
@@ -3518,14 +3462,6 @@ impl<C: TurnClient + Clone> Agent<C> {
 					.stop(activation.as_str(), now_ms, journal)
 					.map_err(ControlError::from);
 				let _ = reply.send(result);
-			},
-			RegimeControl::RegisterPendingInvoker { id, source_tool, invoker, reply } => {
-				tool_choices.register_pending_invoker(id, source_tool, invoker);
-				let _ = reply.send(Ok(()));
-			},
-			RegimeControl::RemovePendingInvoker { id, reply } => {
-				tool_choices.remove_pending_invoker(id.as_str());
-				let _ = reply.send(Ok(()));
 			},
 			RegimeControl::Advance { activation, reason, reply } => {
 				let _ = reason;

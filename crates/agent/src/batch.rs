@@ -34,7 +34,6 @@ use tokio::{sync::Notify, task, time};
 use crate::{
 	events::{AgentEvent, EventBus, EventProvenance, EventVisibility},
 	project::{tool_result_item, tool_result_item_canonical_parts},
-	tool_choice::Invoker,
 };
 
 /// Namespaced invocation property carrying the environment-enforced mode.
@@ -774,7 +773,6 @@ impl SpeculativeCall {
 			pump,
 			events,
 			usage: Default::default(),
-			override_invoker: None,
 		}
 	}
 }
@@ -801,7 +799,6 @@ pub struct CommittedCall {
 	pump:             InvocationPump,
 	events:           EventBus,
 	usage:            v1::Usage,
-	override_invoker: Option<(Invoker, Value)>,
 }
 
 impl CommittedCall {
@@ -838,11 +835,6 @@ impl CommittedCall {
 	/// Attaches the cumulative usage receipt observed before tool execution.
 	pub fn set_cumulative_usage(&mut self, usage: v1::Usage) {
 		self.usage = usage;
-	}
-
-	/// Bypasses the registered executor with one directive-owned invocation.
-	pub fn set_override_invoker(&mut self, invoker: Invoker, input: Value) {
-		self.override_invoker = Some((invoker, input));
 	}
 }
 
@@ -1089,26 +1081,13 @@ use interruptible::lower_verdict;
 
 async fn run_call(
 	index: usize,
-	mut call: CommittedCall,
+	call: CommittedCall,
 	registry: &Registry,
 	caps: &CapsBase,
 	interrupt: Receiver<InterruptRequest>,
 	grace: Duration,
 	updates: Option<flume::Sender<BatchUpdate>>,
 ) -> (usize, BatchResult) {
-	if let Some((invoker, input)) = call.override_invoker.take() {
-		let value = invoker(input).await;
-		let outcome = CallOutcome::<Value, Value>::Ok(value);
-		let raw = Bytes::from(
-			serde_json::to_vec(&outcome).expect("directive-owned invocation outcome is valid JSON"),
-		);
-		let parts = harness_parts(&outcome)
-			.expect("successful directive-owned outcome uses the harness renderer");
-		let mut result = lower_tool_parts(&call, &raw, false, false, &parts)
-			.expect("directive-owned invocation lowers to a canonical tool result");
-		result.outcome = Some(durable_outcome(&raw, &outcome));
-		return (index, result);
-	}
 	let receipt = match call.pump.begin_authorization(
 		call.raw_args.clone(),
 		Bytes::copy_from_slice(call.effect_token.as_bytes()),

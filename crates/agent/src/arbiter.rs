@@ -16,15 +16,6 @@ use crate::{
 	tool_choice::ToolChoiceQueue,
 };
 
-/// Borrowed pending-preview metadata exposed to regime handlers.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PendingInvokerCx<'a> {
-	/// Unique staged-preview identity.
-	pub id:          &'a str,
-	/// Tool that staged the preview.
-	pub source_tool: &'a str,
-}
-
 /// Immutable facts available to lanes at one decision point.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PointCx<'a> {
@@ -40,8 +31,6 @@ pub struct PointCx<'a> {
 	pub delivered:         bool,
 	/// Whether an exploration checkpoint is currently active.
 	pub checkpoint_active: bool,
-	/// Most recently registered staged-preview invoker.
-	pub pending_invoker:   Option<PendingInvokerCx<'a>>,
 }
 
 /// Durable forensic representation of one resolved regime event.

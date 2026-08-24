@@ -1538,7 +1538,6 @@ impl RegimeSet {
 		tool: Str,
 		head: bool,
 	) {
-		let pending_invoker = (tool == "dyn").then(|| queue.pending_invoker()).flatten();
 		let resolved_tx = self.force_tx.clone();
 		let rejected_tx = self.force_tx.clone();
 		let resolved_id = activation.clone();
@@ -1564,7 +1563,6 @@ impl RegimeSet {
 					});
 					RejectOutcome::Drop
 				})),
-				on_invoked:  pending_invoker,
 			},
 		});
 	}
