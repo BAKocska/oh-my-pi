@@ -2787,7 +2787,7 @@ impl EnvServer {
 		self.checkpoint_control.bind(id, sender.clone());
 		self
 			.previews
-			.install_activation_observer(staged_preview::observer(sender));
+			.install_activation_observer(staged_preview::observer(sender, self.previews.clone()));
 		Ok(AgentControlBinding { server: Arc::clone(self), id })
 	}
 

@@ -705,7 +705,7 @@ fn native_workdir_prefix(
 	cwd: &Path,
 ) -> Result<Option<Str>, native::NativeError> {
 	cancelled(stop)?;
-	let Some(worktree) = repository.work_dir() else {
+	let Some(worktree) = repository.workdir() else {
 		return Ok(None);
 	};
 	let cwd = std::fs::canonicalize(cwd).map_err(native::op_error)?;

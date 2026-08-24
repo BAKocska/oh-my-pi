@@ -992,12 +992,28 @@ impl GitMutation {
 			.raw(self.cwd(), DiffOptions { cached, binary: true, ..Default::default() }, &[], cancel)
 			.await?;
 		let files = diff::parse_unified(raw);
-		let file = files
+		let file = if let Some(file) = files
 			.iter()
 			.find(|file| file_matches_path(file, path.as_bytes()))
-			.ok_or_else(|| SelectionError::PathMissing { path: path.to_str() })?;
+		{
+			file.clone()
+		} else {
+			let raw = GitDiff::new(self.runner.clone())
+				.raw(
+					self.cwd(),
+					DiffOptions { cached, binary: true, ..Default::default() },
+					&[path],
+					cancel,
+				)
+				.await?;
+			let mut requested = diff::parse_unified(raw);
+			if requested.len() != 1 {
+				return Err(SelectionError::PathMissing { path: path.to_str() }.into());
+			}
+			requested.pop().expect("one requested file diff")
+		};
 		let patch = build_line_patch_with_endings(
-			file,
+			&file,
 			path,
 			range,
 			if reverse {
@@ -1005,7 +1021,7 @@ impl GitMutation {
 			} else {
 				LinePatchDirection::Apply
 			},
-			&self.line_endings(file, cached, path, cancel).await?,
+			&self.line_endings(&file, cached, path, cancel).await?,
 		)?;
 		let options =
 			PatchOptions { binary: true, cached: cached || !reverse, reverse, ..Default::default() };
@@ -1038,7 +1054,9 @@ impl GitMutation {
 		};
 		let old = self.blob_or_empty(&old_spec, cancel).await?;
 		let new = if cached {
-			self.blob_or_empty(&format!(":0:{new_path}"), cancel).await?
+			self
+				.blob_or_empty(&format!(":0:{new_path}"), cancel)
+				.await?
 		} else {
 			match tokio::fs::read(self.cwd().join(new_path)).await {
 				Ok(bytes) => Bytes::from(bytes),
@@ -1389,8 +1407,7 @@ fn build_line_patch_with_endings(
 	let mut delta = 0_i64;
 	let mut selected_changes = 0_usize;
 	for hunk in &file.hunks {
-		let Some(transformed) =
-			transform_hunk(hunk, selection, delta, direction, line_endings)
+		let Some(transformed) = transform_hunk(hunk, selection, delta, direction, line_endings)
 		else {
 			continue;
 		};
@@ -1463,7 +1480,8 @@ impl LineEndings {
 	}
 
 	fn old_is_crlf(&self, line: u64) -> bool {
-		line.checked_sub(1)
+		line
+			.checked_sub(1)
 			.and_then(|index| usize::try_from(index).ok())
 			.and_then(|index| self.old_crlf.get(index))
 			.copied()
@@ -1471,7 +1489,8 @@ impl LineEndings {
 	}
 
 	fn new_is_crlf(&self, line: u64) -> bool {
-		line.checked_sub(1)
+		line
+			.checked_sub(1)
 			.and_then(|index| usize::try_from(index).ok())
 			.and_then(|index| self.new_crlf.get(index))
 			.copied()
@@ -1557,13 +1576,23 @@ fn transform_hunk(
 			Some(b'-') => {
 				let selected = selection.old.is_some_and(|range| range.contains(old_line));
 				matched |= selected;
-				deletions.push(PendingHunkLine { raw: line, marker, selected, crlf: line_endings.old_is_crlf(old_line) });
+				deletions.push(PendingHunkLine {
+					raw: line,
+					marker,
+					selected,
+					crlf: line_endings.old_is_crlf(old_line),
+				});
 				old_line += 1;
 			},
 			Some(b'+') => {
 				let selected = selection.new.is_some_and(|range| range.contains(new_line));
 				matched |= selected;
-				additions.push(PendingHunkLine { raw: line, marker, selected, crlf: line_endings.new_is_crlf(new_line) });
+				additions.push(PendingHunkLine {
+					raw: line,
+					marker,
+					selected,
+					crlf: line_endings.new_is_crlf(new_line),
+				});
 				new_line += 1;
 			},
 			_ => {
@@ -1669,12 +1698,7 @@ fn append_transformed_change_block(
 	additions.clear();
 }
 
-fn append_hunk_line(
-	body: &mut BytesMut,
-	line: &[u8],
-	marker: Option<&[u8]>,
-	crlf: bool,
-) {
+fn append_hunk_line(body: &mut BytesMut, line: &[u8], marker: Option<&[u8]>, crlf: bool) {
 	if crlf {
 		let content = line
 			.strip_suffix(b"\r\n")

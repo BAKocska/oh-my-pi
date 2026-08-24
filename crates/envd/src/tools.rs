@@ -45,7 +45,7 @@ use omp_tools::{
 	BuiltinRendererIdentities,
 	ask::PresenterSlot,
 	checkpoint,
-	device::{DeviceCatalog, dyn_enabled, dyn_tool, flatten_slots},
+	device::{DeviceCatalog, flatten_slots, xd_enabled},
 	edit::{EditRevisionCandidates, resolve_edit_revision},
 	eval::{EvalSessionControl, TaskDescriptionSnapshot},
 	goal,
@@ -103,6 +103,7 @@ use super::{
 		seal_registry_evidence,
 	},
 	workspace::WorkspaceHost,
+	xd::XdHost,
 };
 use crate::{
 	browser_daemon::BrowserDaemon, github_url::GithubCredentialBridge, host_settings::HostSettings,
@@ -1747,7 +1748,7 @@ fn configured_model_identity(
 /// occupy device presentation entries and explicit worker routes; only the
 /// environment's worker supervisor can invoke them.
 pub(crate) fn production_registry<
-	I: omp_tools::device::DeviceInvoker + 'static,
+	I: omp_tools::device::DeviceInvoker + Clone + 'static,
 	P: PreludeInvoker + 'static,
 >(
 	documents: &DocumentHost,
@@ -1851,7 +1852,6 @@ pub(crate) fn production_registry<
 		"memory_edit",
 		"learn",
 		"manage_skill",
-		"dyn",
 		"lsp",
 		"debug",
 		"computer",
@@ -2289,12 +2289,13 @@ pub(crate) fn production_registry<
 		registry.register(rewind, Presentation::Slot, core_claims())?;
 	}
 	let catalog = DeviceCatalog::default();
-	if tool_settings.enabled("dyn") && dyn_enabled(policy) {
-		registry.register(
-			dyn_tool(device_invoker, catalog.clone(), policy),
-			Presentation::Slot,
-			core_claims(),
-		)?;
+	let xd_installed = tool_settings.enabled("xd") && xd_enabled(policy);
+	if xd_installed {
+		exec.install_devices(Arc::new(XdHost::new(
+			catalog.clone(),
+			Arc::new(device_invoker),
+			previews.clone(),
+		)));
 	}
 	let shell_identity = if tool_settings.enabled("shell") && shell_settings.enabled {
 		let sibling_tools = registry
@@ -2307,6 +2308,7 @@ pub(crate) fn production_registry<
 		let snapshot = omp_tools::shell::ShellPromptSnapshot {
 			sibling_tools,
 			platform: Str::new(consts::OS),
+			devices: xd_installed,
 			embedded_builtins: shell_settings.embedded_builtins,
 			interceptor_enabled: shell_settings.interceptor.enabled,
 			interceptor_rules: shell_settings

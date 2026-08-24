@@ -58,6 +58,7 @@ pub mod worker;
 pub mod worker_pool;
 pub mod workspace;
 pub mod workspace_roots;
+mod xd;
 use std::{
 	env,
 	fs::{self, OpenOptions},

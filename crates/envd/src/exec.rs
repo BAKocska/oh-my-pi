@@ -252,6 +252,7 @@ struct HostInner {
 	starting:      Mutex<HashSet<Str>>,
 	environment:   Mutex<WorkspaceEnvironment>,
 	github_cache:  Mutex<Option<Arc<GithubCache>>>,
+	devices:       Mutex<Option<Arc<crate::xd::XdHost>>>,
 	persistence:   Mutex<Option<ProcessPersistence>>,
 	next_order:    AtomicU64,
 }
@@ -446,6 +447,7 @@ impl ExecHost {
 				starting:      Mutex::new(HashSet::new()),
 				environment:   Mutex::new(read_workspace_environment()),
 				github_cache:  Mutex::new(None),
+				devices:       Mutex::new(None),
 				persistence:   Mutex::new(None),
 				next_order:    AtomicU64::new(1),
 			}),
@@ -498,6 +500,12 @@ impl ExecHost {
 		self
 	}
 
+	/// Installs the live dynamic-device bridge used by subsequently opened
+	/// sessions.
+	pub fn install_devices(&self, host: Arc<crate::xd::XdHost>) {
+		*self.inner.devices.lock() = Some(host);
+	}
+
 	/// Opens a persistent shell carrying its own cwd and environment state.
 	pub async fn open_session(
 		&self,
@@ -529,6 +537,9 @@ impl ExecHost {
 			.working_dir(cwd)
 			.do_not_inherit_env(true)
 			.builtins(omp_shell_engine::builtins::default_builtins());
+		if let Some(host) = self.inner.devices.lock().clone() {
+			builder = builder.builtin("xd", crate::xd::registration(host));
+		}
 		for (name, value) in variables.iter() {
 			let mut variable = ShellVariable::new(value.to_string());
 			variable.export();

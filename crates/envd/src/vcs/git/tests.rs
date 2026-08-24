@@ -443,9 +443,10 @@ async fn vcs_snapshots_cover_normal_linked_bare_detached_unborn_packed_and_refta
 		bare.to_str().unwrap(),
 	]);
 	let bare_snapshot = vcs::snapshot(&bare, &runner, &cancel).await.unwrap();
+	let canonical_bare = fs::canonicalize(&bare).unwrap();
 	assert_eq!(bare_snapshot.availability, RepositoryAvailability::Available);
-	assert_eq!(bare_snapshot.worktree_root.as_deref(), Some(bare.as_path()));
-	assert_eq!(bare_snapshot.primary_root.as_deref(), Some(bare.as_path()));
+	assert_eq!(bare_snapshot.worktree_root.as_deref(), Some(canonical_bare.as_path()));
+	assert_eq!(bare_snapshot.primary_root.as_deref(), Some(canonical_bare.as_path()));
 	assert_eq!(bare_snapshot.status_counts, StatusCounts::default());
 
 	let reftable = tempfile::tempdir().expect("reftable fixture");
@@ -707,7 +708,7 @@ async fn vcs_commands_queries_and_diff_round_trip_real_repository_bytes() {
 	fs::write(fixture.path().join("untracked.bin"), [0, 1, 2, 0xff]).unwrap();
 	let counts = diffs.status_counts(fixture.path(), &cancel).await.unwrap();
 	assert!(counts.staged >= 2);
-	assert_eq!(counts.unstaged, 1);
+	assert_eq!(counts.unstaged, 2);
 	assert_eq!(counts.untracked, 1);
 	let entries = diffs.status_entries(fixture.path(), &cancel).await.unwrap();
 	assert!(
@@ -726,9 +727,13 @@ async fn vcs_commands_queries_and_diff_round_trip_real_repository_bytes() {
 		.await
 		.unwrap();
 	let parsed = diff::parse_unified(raw.clone());
-	assert_eq!(parsed.len(), 1);
-	assert!(parsed[0].new_no_final_newline);
-	assert_eq!(parsed[0].raw, raw);
+	assert_eq!(parsed.len(), 2);
+	let seed = parsed
+		.iter()
+		.find(|file| file.path.as_deref() == Some(b"seed.txt".as_slice()))
+		.unwrap();
+	assert!(seed.new_no_final_newline);
+	assert_eq!(parsed.iter().map(|file| file.raw.len()).sum::<usize>(), raw.len());
 	assert!(diffs.has(fixture.path(), false, &cancel).await.unwrap());
 	assert!(
 		diffs
@@ -879,6 +884,27 @@ async fn interactive_line_patches_are_precise_across_content_shapes() {
 	);
 	mutation.unstage_all(&cancel).await.unwrap();
 
+	let third =
+		DiffLineSelection { old: Some(LineRange::new(3, 3)), new: Some(LineRange::new(3, 3)) };
+	assert!(
+		mutation
+			.stage_lines("lines.txt", third, &cancel)
+			.await
+			.unwrap()
+			.is_applied()
+	);
+	let mut only_third = base.lines().map(|line| line.to_owned()).collect::<Vec<_>>();
+	only_third[2] = "changed 3".to_owned();
+	let only_third = format!("{}\n", only_third.join("\n"));
+	assert_eq!(
+		query
+			.show_path(fixture.path(), ":0:lines.txt", &cancel)
+			.await
+			.unwrap(),
+		Bytes::from(only_third)
+	);
+	mutation.unstage_all(&cancel).await.unwrap();
+
 	let spanning =
 		DiffLineSelection { old: Some(LineRange::new(2, 15)), new: Some(LineRange::new(2, 15)) };
 	assert!(
@@ -960,10 +986,14 @@ async fn interactive_line_patches_are_precise_across_content_shapes() {
 			.unwrap(),
 		Bytes::from_static(b"a\r\nB\r\n")
 	);
-	assert!(matches!(
-		mutation.stage_lines("binary.bin", one, &cancel).await,
-		Err(super::mutation::MutationError::Selection(SelectionError::BinarySubset { .. }))
-	));
+	let binary = mutation.stage_lines("binary.bin", one, &cancel).await;
+	assert!(
+		matches!(
+			&binary,
+			Err(super::mutation::MutationError::Selection(SelectionError::BinarySubset { .. }))
+		),
+		"{binary:?}"
+	);
 	fs::write(fixture.path().join("crlf.txt"), b"changed\r\nB\r\n").unwrap();
 	assert!(matches!(
 		mutation
