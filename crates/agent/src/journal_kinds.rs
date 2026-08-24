@@ -12,6 +12,7 @@ pub(crate) const REWIND_REPORT_KIND: &str = "dev.omp.core.rewind-report";
 pub(crate) const TTSR_INJECTION_KIND: &str = "dev.omp.core.ttsr-injection";
 pub(crate) const ARBITER_FOLD_KIND: &str = "dev.omp.core.arbiter-fold";
 pub(crate) const CAMPAIGN_ENTRY_KIND: &str = "dev.omp.core.campaign-entry";
+pub(crate) const TERMINAL_ERROR_PROP: &str = "omp/terminal-error";
 pub(crate) const CORE_REVISION: &str = "core.1";
 
 pub(crate) fn core_campaign_declarations() -> Vec<EntryKindDecl> {

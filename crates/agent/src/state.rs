@@ -15,8 +15,35 @@ use tokio::sync::watch::{self, Receiver};
 
 use crate::{
 	InterruptedReasoningDialect, TurnOptions,
+	CompactionMethodOrder,
 	prompt::{CanonicalPromptSource, PromptError, PromptSource, RenderedPrompt, render_prompt},
 };
+
+/// Automatic recovery policy for unexpectedly terminated assistant turns.
+#[derive(
+	Clone,
+	Copy,
+	Debug,
+	Default,
+	Eq,
+	PartialEq,
+	serde::Serialize,
+	serde::Deserialize,
+	strum::Display,
+	strum::EnumString,
+	strum::IntoStaticStr,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case", ascii_case_insensitive)]
+pub enum UnexpectedStopMode {
+	/// Disable automatic unexpected-stop recovery.
+	None,
+	/// Retry terminal turns that produced no visible message or tool call.
+	#[default]
+	Mechanical,
+	/// Add a small-model classifier for text-only terminal turns.
+	Smart,
+}
 
 /// Bounded loop-level retry policy for recoverable turn failures.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -104,6 +131,11 @@ pub struct AgentSnapshot {
 	pub deadline:          Option<Instant>,
 	/// Bounded loop-level recovery policy.
 	pub retry:             RetryPolicy,
+	/// Ordered context-overflow recovery ladder; empty disables automatic
+	/// recovery compaction.
+	pub compaction:        CompactionMethodOrder,
+	/// Unexpected assistant-stop recovery policy.
+	pub unexpected_stop:  UnexpectedStopMode,
 }
 
 impl AgentSnapshot {
@@ -120,6 +152,8 @@ impl AgentSnapshot {
 			defer_interrupts: false,
 			deadline: None,
 			retry: RetryPolicy::default(),
+			compaction: CompactionMethodOrder::default(),
+			unexpected_stop: UnexpectedStopMode::Mechanical,
 		}
 	}
 
@@ -149,6 +183,8 @@ impl fmt::Debug for AgentSnapshot {
 			.field("defer_interrupts", &self.defer_interrupts)
 			.field("deadline", &self.deadline)
 			.field("retry", &self.retry)
+			.field("compaction", &self.compaction)
+			.field("unexpected_stop", &self.unexpected_stop)
 			.finish()
 	}
 }

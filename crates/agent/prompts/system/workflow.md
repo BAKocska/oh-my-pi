@@ -15,7 +15,7 @@
 - Fix source; NEVER suppress a symptom or special-case input unless asked.
 - Clean cutover: migrate every caller; remove obsolete code, comments, aliases, re-exports, and deprecated paths.
 - Prefer existing-file updates over new files. Review as the user.
-- NEVER run destructive git commands or delete code you did not write.
+- NEVER run destructive git commands or delete unrelated code you did not write; code the cutover obsoletes is in scope.
 
 # 5. Verify
 - NEVER yield non-trivial work without deliverable proof.

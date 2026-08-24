@@ -49,6 +49,7 @@ mod revival;
 mod schedule;
 pub mod scheduler;
 mod state;
+pub mod streaming_edit_guard;
 mod subagent;
 pub mod tool_choice;
 mod tree;
@@ -150,7 +151,7 @@ pub use lifecycle::{
 };
 pub use r#loop::{
 	AbortHandle, Agent, AgentError, AgentHostControl, AgentRunSummary, RewindTarget, RunActivity,
-	RunSettlement,
+	RunSettlement, UnexpectedStopClassifier,
 };
 pub use mailbox::{
 	DEFERRED_DIAGNOSTIC_DOCUMENT_PROP, DEFERRED_DIAGNOSTIC_GENERATION_PROP,
@@ -192,7 +193,7 @@ pub use prompt::{
 	RuntimePromptSource, SECURITY_REVIEW_INSTRUCTION_V1, SlotAssembler, SlotClass, SlotDecl, SlotId,
 	SlotPatch, SlotRegistration, SlotSource, ToolInventoryMode, VcsIdentity, VolatilePrompt,
 	VolatilePromptJournal, WorkflowPromptSource, WorkspacePromptSource, WorkspaceRootInput,
-	WorkspaceRootsInput, WorkspaceTreeInput, render_prompt,
+	WorkspaceRootsInput, WorkspaceTreeInput, dedupe_context_file_indices, render_prompt,
 };
 pub use read_only_policy::is_read_only_agent;
 pub use revival::{RevivalError, RevivedSession, revive, revive_existing};
@@ -200,7 +201,8 @@ pub use schedule::{
 	Firing, FiringOutcome, MissedRunPolicy, Schedule, ScheduleBudget, ScheduleDelivery,
 	ScheduleError, ScheduleJournal, ScheduleScope, Scheduler, Trigger, UpgradePolicy, firing_key,
 };
-pub use state::{AgentSnapshot, AgentState, RetryPolicy, RetryPolicyError};
+pub use state::{AgentSnapshot, AgentState, RetryPolicy, RetryPolicyError, UnexpectedStopMode};
+pub use streaming_edit_guard::{StreamingEditAbort, StreamingEditDialect, StreamingEditGuard};
 pub use subagent::{
 	MAX_DISPOSITION_PREVIEW_BYTES, MAX_PROGRESS_ACTIVITY_BYTES, MAX_TERMINAL_SUMMARY_BYTES,
 	SubagentActivity, SubagentActivityKind, SubagentDisposition, SubagentGeneration,

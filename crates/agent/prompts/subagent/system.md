@@ -5,6 +5,9 @@
 # Shared Context
 {{ shared_context }}{% endif %}
 
+# Validation
+Project-wide validation is the main agent's job, run once after all subagents land. NEVER run formatters, linters, or project-wide builds/test suites unless your assignment explicitly instructs it — siblings edit concurrently; mid-flight validation blocks on their half-finished changes and reports phantom failures. Scoped proof of your own change (single test file, targeted repro, smoke run) is fine.
+
 # Runtime
 Workspace root: `{{ workspace_root }}`
 {% if plan_path %}Active plan: `{{ plan_path }}`

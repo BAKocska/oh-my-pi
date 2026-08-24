@@ -1,7 +1,9 @@
 //! Durable N-turn agent policy loop.
 
 use std::{
-	collections::{BTreeMap, VecDeque},
+	collections::{BTreeMap, BTreeSet, VecDeque},
+	future::Future,
+	pin::Pin,
 	str,
 	sync::Arc,
 	time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -43,7 +45,7 @@ use crate::{
 	CompactionTier, Journal, JournalError, Mailbox, MailboxSender, ManualCompactionMode,
 	ManualCompactionOutcome, ManualCompactionRequest, ManualShakeMode, ManualShakeOutcome,
 	PROMPT_CACHE_WARM_SUFFIX_TOKENS, ProjectionError, PromptMemoryQuery, PromptMemorySnapshotSource,
-	SnapcompactPreparation, TtsrMatch, TtsrRegistry, TtsrSource, TurnClient, TurnInput, TurnSession,
+	SnapcompactPreparation, StreamingEditGuard, TtsrMatch, TtsrRegistry, TtsrSource, TurnClient, TurnInput, TurnSession,
 	YieldPayload, YieldPayloadError, YieldPayloadValidator,
 	arbiter::{
 		Arbiter, PointCx,
@@ -74,7 +76,7 @@ use crate::{
 	mailbox::DrainPoint,
 	project::project_journal,
 	prompt::{PromptError, PromptHash},
-	state::AgentState,
+	state::{AgentState, UnexpectedStopMode},
 	turn::Error as TurnError,
 };
 
@@ -84,6 +86,7 @@ const TOOL_DEADLINE: omp_core::Duration =
 	omp_core::Duration::new(300, omp_core::DurationUnit::Seconds);
 const CONTROL_DRAIN_LIMIT: usize = 32;
 const MEMORY_RECALL_QUERY_MAX_CHARS: usize = 32 * 1024;
+const UNEXPECTED_STOP_RETRY_CAP: u8 = 3;
 
 /// Typed settlement of one complete caller submission.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, strum::IntoStaticStr)]
@@ -356,6 +359,14 @@ pub trait RunActivity: Send + Sync + 'static {
 	/// Releases the host activity assertion.
 	fn exit(&self);
 }
+/// Small-model decision boundary used only by smart unexpected-stop mode.
+pub trait UnexpectedStopClassifier: Send + Sync + 'static {
+	/// Returns whether a visible text-only stop should be continued.
+	fn should_continue<'a>(
+		&'a self,
+		text: &'a str,
+	) -> Pin<Box<dyn Future<Output = Result<bool, Str>> + Send + 'a>>;
+}
 
 #[must_use]
 struct RunActivityGuard(Arc<dyn RunActivity>);
@@ -489,6 +500,9 @@ pub struct Agent<C: TurnClient> {
 	blob_store: Option<BlobStore>,
 	artifact_catalog: Option<Arc<Mutex<ArtifactCatalog>>>,
 	autolearn: Option<AutolearnController>,
+	unexpected_stop_classifier: Option<Arc<dyn UnexpectedStopClassifier>>,
+	unexpected_stop_retries: u8,
+	streaming_edit_guard: Option<Arc<StreamingEditGuard>>,
 }
 
 impl<C: TurnClient + Clone> Agent<C> {
@@ -595,6 +609,9 @@ impl<C: TurnClient + Clone> Agent<C> {
 			blob_store: None,
 			artifact_catalog: None,
 			autolearn: None,
+			unexpected_stop_classifier: None,
+			unexpected_stop_retries: 0,
+			streaming_edit_guard: None,
 		}
 	}
 
@@ -760,6 +777,17 @@ impl<C: TurnClient + Clone> Agent<C> {
 	/// tool arguments.
 	pub fn set_secret_obfuscator(&mut self, obfuscator: Arc<Mutex<SecretObfuscator>>) {
 		self.secret_obfuscator = Some(obfuscator);
+	}
+	/// Installs the smart unexpected-stop classifier.
+	pub fn set_unexpected_stop_classifier(
+		&mut self,
+		classifier: Arc<dyn UnexpectedStopClassifier>,
+	) {
+		self.unexpected_stop_classifier = Some(classifier);
+	}
+	/// Configures early validation for streamed edit arguments.
+	pub fn configure_streaming_edit_guard(&mut self, cwd: std::path::PathBuf, enabled: bool) {
+		self.streaming_edit_guard = Some(Arc::new(StreamingEditGuard::new(cwd, enabled)));
 	}
 
 	/// Returns the shared non-blocking telemetry fan-out handle.
@@ -1111,6 +1139,24 @@ impl<C: TurnClient + Clone> Agent<C> {
 			.await;
 		Ok(ManualCompactionOutcome { method: mode, event, tokens_before, tokens_after, frame_count })
 	}
+	async fn recover_context_overflow(&mut self, order: &CompactionMethodOrder) -> bool {
+		let mode = order.as_slice().iter().find_map(|tier| match tier {
+			CompactionTier::Local => Some(ManualCompactionMode::Soft),
+			CompactionTier::Snapcompact => Some(ManualCompactionMode::Snapcompact),
+			CompactionTier::Remote => Some(ManualCompactionMode::Remote),
+			CompactionTier::Prune
+			| CompactionTier::DropMedia
+			| CompactionTier::Elide
+			| CompactionTier::Handoff => None,
+		});
+		let Some(mode) = mode else {
+			return false;
+		};
+		self
+			.compact_manual(ManualCompactionRequest { mode: Some(mode), focus: None })
+			.await
+			.is_ok()
+	}
 
 	/// Rewinds the durable session to a live prefix and returns the fresh
 	/// projection.
@@ -1341,6 +1387,9 @@ impl<C: TurnClient + Clone> Agent<C> {
 			});
 
 		loop {
+			if let Some(guard) = self.streaming_edit_guard.as_ref() {
+				guard.reset();
+			}
 			self
 				.firehose
 				.publish(FirehoseEvent::TurnStart(FirehoseTurnStart {
@@ -1405,6 +1454,18 @@ impl<C: TurnClient + Clone> Agent<C> {
 				Err(AgentError::Turn(TurnError::Terminal(mut error)))
 					if turn_error::Kind::try_from(error.kind) == Ok(turn_error::Kind::EmptyOutput) =>
 				{
+					if self.state.snapshot().unexpected_stop == UnexpectedStopMode::None {
+						self
+							.journal
+							.abort_turn(
+								now_ms(),
+								turn_id.as_str(),
+								AbortDisposition::Exhausted,
+							)?;
+						self.arbiter.flush(&mut self.journal, now_ms())?;
+						self.context = None;
+						return Err(AgentError::Turn(TurnError::Terminal(error)));
+					}
 					self
 						.redeem_recovery(RedemptionEvidence::Restore {
 							turn_id: Str::new(turn_id.as_str()),
@@ -1448,8 +1509,76 @@ impl<C: TurnClient + Clone> Agent<C> {
 					turn_id = next_turn_id;
 					continue;
 				},
+				Err(AgentError::Turn(TurnError::Terminal(error)))
+					if turn_error::Kind::try_from(error.kind)
+						== Ok(turn_error::Kind::PayloadRejected) =>
+				{
+					// A different configured model may accept the same bytes or
+					// media budget. Consult that chain before any maintenance,
+					// but never replay the fixed payload against this model.
+					let routes = self
+						.provider_failover_routes(turn_id.as_str(), "payload_rejected")
+						.await;
+					let disposition = if routes.is_empty() {
+						AbortDisposition::Exhausted
+					} else {
+						AbortDisposition::Continue
+					};
+					self
+						.journal
+						.abort_turn(now_ms(), turn_id.as_str(), disposition)?;
+					self.arbiter.flush(&mut self.journal, now_ms())?;
+					self.context = None;
+					if routes.is_empty() {
+						// Keep the terminal explanation in the canonical
+						// transcript while project_journal excludes this marked
+						// error-only frame from future provider context.
+						self
+							.journal
+							.append_optimistic(
+								now_ms(),
+								terminal_error_item(&error),
+								self.prompt_hash,
+							)?;
+						self.publish_live_history()?;
+						return Err(AgentError::Turn(TurnError::Terminal(error)));
+					}
+					self.arbiter.set_retry_chain(routes);
+					let next_turn_id = follow_up_id(&turn_id, committed_turns);
+					pending_indexes = self.append_pending(&next_turn_id, [recovery_prompt_item(
+						PromptAssetId::AutoContinue,
+					)])?;
+					turn_id = next_turn_id;
+					continue;
+				},
+				Err(AgentError::Turn(TurnError::Terminal(error)))
+					if turn_error::Kind::try_from(error.kind)
+						== Ok(turn_error::Kind::ContextOverflow) =>
+				{
+					// Usage/token-backed overflow stays on the compaction ladder.
+					// It must never consume a configured model-fallback route.
+					self
+						.journal
+						.abort_turn(
+							now_ms(),
+							turn_id.as_str(),
+							AbortDisposition::Exhausted,
+						)?;
+					self.arbiter.flush(&mut self.journal, now_ms())?;
+					self.context = None;
+					let order = self.state.snapshot().compaction.clone();
+					if self.recover_context_overflow(&order).await {
+						let next_turn_id = follow_up_id(&turn_id, committed_turns);
+						pending_indexes = self.append_pending(&next_turn_id, [recovery_prompt_item(
+							PromptAssetId::AutoContinue,
+						)])?;
+						turn_id = next_turn_id;
+						continue;
+					}
+					return Err(AgentError::Turn(TurnError::Terminal(error)));
+				},
 				Err(AgentError::Turn(error @ TurnError::Terminal(_))) => {
-					let routes = self.provider_failover_routes(turn_id.as_str()).await;
+					let routes = self.provider_failover_routes(turn_id.as_str(), "turn_failed").await;
 					let disposition = if routes.is_empty() {
 						AbortDisposition::Exhausted
 					} else {
@@ -1473,7 +1602,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 				},
 				Err(error) => {
 					self.publish_provider_error("turn_failed", Some(Str::new(error.to_string())));
-					let routes = self.provider_failover_routes(turn_id.as_str()).await;
+					let routes = self.provider_failover_routes(turn_id.as_str(), "turn_failed").await;
 					if !routes.is_empty() {
 						self.journal.abort_turn(
 							now_ms(),
@@ -1558,6 +1687,11 @@ impl<C: TurnClient + Clone> Agent<C> {
 				for call in &mut calls {
 					call.set_cumulative_usage(self.cumulative_usage.clone());
 				}
+				let edit_call_ids = calls
+					.iter()
+					.filter(|call| call.identity().name.as_str() == "edit")
+					.map(|call| call.call_id().clone())
+					.collect::<BTreeSet<_>>();
 				for call in &mut calls {
 					if call.identity().name != "dyn" {
 						continue;
@@ -1714,6 +1848,12 @@ impl<C: TurnClient + Clone> Agent<C> {
 					{
 						controller.observe_settled_tool_execution();
 					}
+					if result.outcome().is_some()
+						&& edit_call_ids.contains(result.call_id())
+						&& let Some(guard) = self.streaming_edit_guard.as_ref()
+					{
+						guard.invalidate_call(result.call_id().as_str());
+					}
 					if let Some(outcome) = result.outcome().cloned() {
 						let call_id = result.call_id().clone();
 						self
@@ -1786,6 +1926,20 @@ impl<C: TurnClient + Clone> Agent<C> {
 				turn_id = next_turn_id;
 				continue;
 			}
+			if snapshot.unexpected_stop == UnexpectedStopMode::Smart
+				&& self.unexpected_stop_retries < UNEXPECTED_STOP_RETRY_CAP
+				&& self.classify_unexpected_stop(&outcome).await
+			{
+				self.unexpected_stop_retries = self.unexpected_stop_retries.saturating_add(1);
+				let next_turn_id = follow_up_id(&turn_id, committed_turns);
+				pending_indexes = self.append_pending(&next_turn_id, [recovery_prompt_item(
+					PromptAssetId::AutoContinue,
+				)])?;
+				last_outcome = Some(outcome);
+				turn_id = next_turn_id;
+				continue;
+			}
+			self.unexpected_stop_retries = 0;
 			immediate.append(&mut boundary);
 			boundary = immediate;
 
@@ -1905,18 +2059,38 @@ impl<C: TurnClient + Clone> Agent<C> {
 			})));
 	}
 
-	async fn provider_failover_routes(&self, turn_id: &str) -> Vec<Str> {
+	async fn provider_failover_routes(&self, turn_id: &str, code: &'static str) -> Vec<Str> {
 		let Some(gate) = self.provider_error_gate.as_ref() else {
 			return Vec::new();
 		};
 		gate
 			.gate_domain(&ProviderErrorEvent {
-				code:    sf!("turn_failed"),
+				code:    Str::new_static(code),
 				turn_id: Str::new(turn_id),
 			})
 			.await
 			.winner
 			.routes()
+	}
+	async fn classify_unexpected_stop(&self, outcome: &Outcome) -> bool {
+		if outcome.stop() != pb::StopReason::StopEndTurn
+			|| outcome
+				.output
+				.iter()
+				.any(|item| matches!(item.kind.as_ref(), Some(item::Kind::ToolCall(_))))
+		{
+			return false;
+		}
+		let Some(text) = authoritative_assistant(outcome) else {
+			return false;
+		};
+		let Some(classifier) = self.unexpected_stop_classifier.as_ref() else {
+			return false;
+		};
+		classifier
+			.should_continue(text.as_str())
+			.await
+			.unwrap_or(false)
 	}
 
 	fn append_pending(
@@ -2592,6 +2766,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 		// handles.
 		let pending_tool_results = turn_input_has_tool_results(&input);
 		let stream_recovery_mailbox = self.mailbox.sender();
+		let streaming_edit_guard = self.streaming_edit_guard.clone();
 		let client = self.client.clone();
 		let opening = client.turn(turn_id.clone(), input, options);
 		tokio::pin!(opening);
@@ -2651,6 +2826,13 @@ impl<C: TurnClient + Clone> Agent<C> {
 							pending_tool_results,
 						));
 					},
+					abort = wait_streaming_edit_abort(streaming_edit_guard.as_deref()) => {
+						return Err(TurnError::Protocol(if abort.path.is_empty() {
+							"streaming edit guard rejected streamed edit"
+						} else {
+							"streaming edit guard found a stale edit target"
+						}));
+					},
 					command = self.receivers.host_commands.recv_async() => {
 						match command {
 							Ok(command) => {
@@ -2698,6 +2880,13 @@ impl<C: TurnClient + Clone> Agent<C> {
 								saw_stream_event,
 								pending_tool_results,
 							));
+						},
+						abort = wait_streaming_edit_abort(streaming_edit_guard.as_deref()) => {
+							return Err(TurnError::Protocol(if abort.path.is_empty() {
+								"streaming edit guard rejected streamed edit"
+							} else {
+								"streaming edit guard found a stale edit target"
+							}));
 						},
 						command = self.receivers.host_commands.recv_async() => {
 							match command {
@@ -2844,6 +3033,11 @@ impl<C: TurnClient + Clone> Agent<C> {
 						.map_err(|_| TurnError::Protocol("stream named unknown tool"))?
 						.clone();
 					let call_id = part.tool_call_id.as_str().to_str();
+					if name.as_str() == "edit"
+						&& let Some(guard) = streaming_edit_guard.as_ref()
+					{
+						guard.start(call_id.clone(), &rev);
+					}
 					let admission = self
 						.arbiter
 						.fold_and_record(
@@ -2906,6 +3100,11 @@ impl<C: TurnClient + Clone> Agent<C> {
 				Some(turn_event::Event::PartDelta(part)) => {
 					let fragment = str::from_utf8(&part.chunk)
 						.map_err(|_| TurnError::Protocol("stream fragment is not UTF-8"))?;
+					if let Some(call_id) = part_calls.get(&part.index)
+						&& let Some(guard) = streaming_edit_guard.as_ref()
+					{
+						guard.push_fragment(call_id.as_str(), fragment);
+					}
 					let trigger = if let Some(state) = ttsr_parts.get_mut(&part.index) {
 						self
 							.arbiter
@@ -3995,6 +4194,17 @@ async fn wait_stream_watchdog(timeout_ms: Option<u64>) {
 		None => future::pending().await,
 	}
 }
+async fn wait_streaming_edit_abort(
+	guard: Option<&StreamingEditGuard>,
+) -> crate::StreamingEditAbort {
+	match guard {
+		Some(guard) => guard
+			.recv_abort()
+			.await
+			.expect("streaming edit guard worker remains live"),
+		None => future::pending().await,
+	}
+}
 
 fn turn_input_has_tool_results(input: &TurnInput) -> bool {
 	let items = match input {
@@ -4151,6 +4361,23 @@ fn recovery_prompt_item(id: PromptAssetId) -> Item {
 			}],
 		})),
 		props:         None,
+	}
+}
+fn terminal_error_item(error: &pb::TurnError) -> Item {
+	Item {
+		seq:           0,
+		created_at_ms: now_ms(),
+		kind:          Some(item::Kind::Message(thread::Message {
+			role:  thread::Role::Assistant as i32,
+			parts: vec![thread::Part {
+				kind: Some(part::Kind::Text(error.detail.clone())),
+			}],
+		})),
+		props:         Some(pb::ValueMap {
+			fields: BTreeMap::from([(crate::journal_kinds::TERMINAL_ERROR_PROP.to_owned(), pb::Value {
+				kind: Some(value::Kind::Bool(true)),
+			})]),
+		}),
 	}
 }
 
@@ -5170,6 +5397,101 @@ mod tests {
 				if path.as_str() == "/summary"
 		));
 	}
+	#[tokio::test]
+	async fn payload_rejection_is_terminal_once_but_remains_display_durable() {
+		let (journal, path) = test_journal("payload-terminal");
+		let opened = Arc::new(Mutex::new(Vec::new()));
+		let client = ScriptedClient {
+			scripts: Arc::new(Mutex::new(VecDeque::from([vec![Ok(pb::TurnEvent {
+				event: Some(turn_event::Event::Error(pb::TurnError {
+					kind: turn_error::Kind::PayloadRejected as i32,
+					detail: "request bytes rejected".to_owned(),
+					..pb::TurnError::default()
+				})),
+			})]]))),
+			opened: Arc::clone(&opened),
+		};
+		let (env, _transport) = EnvClient::in_process(1);
+		let state = AgentState::new(AgentSnapshot::default());
+		let mut agent = Agent::new(client, env, state.clone(), journal, test_caps());
+
+		let result = agent
+			.submit(
+				[message(thread::Role::User, "oversized request")],
+				TurnId::new("payload-turn"),
+			)
+			.await;
+		assert!(matches!(
+			result,
+			Err(AgentError::Turn(TurnError::Terminal(error)))
+				if error.kind == turn_error::Kind::PayloadRejected as i32
+		));
+		assert_eq!(opened.lock().len(), 1, "same-model retries are forbidden");
+
+		let live = agent.journal().live_item_events().expect("live item events");
+		let display = agent.journal().items_at(&live).expect("display projection");
+		assert_eq!(display.len(), 2, "user input plus durable terminal error");
+		let log = agent.journal().load().expect("journal log");
+		let provider = project_journal(
+			&log,
+			log.as_ref(),
+			state.snapshot().registry.as_ref(),
+			&test_caps(),
+		)
+		.expect("provider projection");
+		assert_eq!(provider.items.len(), 1, "terminal error-only frame stays display-only");
+		fs::remove_file(path).expect("remove journal");
+	}
+
+	#[derive(Debug)]
+	struct ScriptedUnexpectedStopClassifier(Mutex<VecDeque<bool>>);
+
+	impl UnexpectedStopClassifier for ScriptedUnexpectedStopClassifier {
+		fn should_continue<'a>(
+			&'a self,
+			_text: &'a str,
+		) -> Pin<Box<dyn Future<Output = Result<bool, Str>> + Send + 'a>> {
+			Box::pin(future::ready(Ok(self.0.lock().pop_front().unwrap_or(false))))
+		}
+	}
+
+	#[tokio::test]
+	async fn smart_unexpected_stop_classifies_visible_text() {
+		let (journal, path) = test_journal("smart-unexpected-stop");
+		let opened = Arc::new(Mutex::new(Vec::new()));
+		let client = ScriptedClient {
+			scripts: Arc::new(Mutex::new(VecDeque::from([
+				outcome_script(end_outcome("I will make that change now.")),
+				outcome_script(end_outcome("Done.")),
+			]))),
+			opened: Arc::clone(&opened),
+		};
+		let (env, _transport) = EnvClient::in_process(1);
+		let mut snapshot = AgentSnapshot::default();
+		snapshot.unexpected_stop = UnexpectedStopMode::Smart;
+		let mut agent = Agent::new(
+			client,
+			env,
+			AgentState::new(snapshot),
+			journal,
+			test_caps(),
+		);
+		agent.set_unexpected_stop_classifier(Arc::new(ScriptedUnexpectedStopClassifier(
+			Mutex::new(VecDeque::from([true, false])),
+		)));
+
+		let summary = agent
+			.submit(
+				[message(thread::Role::User, "finish the task")],
+				TurnId::new("smart-stop"),
+			)
+			.await
+			.expect("smart continuation succeeds");
+		assert_eq!(summary.committed_turns, 2);
+		assert_eq!(opened.lock().len(), 2);
+		fs::remove_file(path).expect("remove journal");
+	}
+
 	#[test]
 	fn restores_nested_model_arguments_without_changing_operator_values() {
 		let rule = SecretRule::new(

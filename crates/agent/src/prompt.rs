@@ -2,6 +2,7 @@
 
 use std::{
 	array,
+	cmp::Ordering,
 	collections::HashSet,
 	fmt::{self, Display, Write as _},
 	path::PathBuf,
@@ -58,7 +59,7 @@ pub(crate) fn checkpoint_active_reminder() -> Item {
 	}
 }
 
-/// Immutable bytes and identity for one workspace context file.
+/// Immutable bytes, identity, and authority for one workspace context file.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContextFile {
 	/// Workspace-relative or absolute path presented to the model.
@@ -67,13 +68,23 @@ pub struct ContextFile {
 	pub origin:  Str,
 	/// Exact file bytes captured for this snapshot.
 	pub content: Bytes,
+	/// Ancestor distance from the workspace directory; zero is most authoritative.
+	///
+	/// `None` denotes an unscoped source and is less authoritative than every
+	/// project-scoped source.
+	pub depth:   Option<u16>,
 }
 
 impl ContextFile {
 	/// Creates an immutable context-file input.
 	#[inline]
 	pub fn new(path: impl Into<PathBuf>, content: impl Into<Bytes>) -> Self {
-		Self { path: path.into(), origin: Str::default(), content: content.into() }
+		Self {
+			path: path.into(),
+			origin: Str::default(),
+			content: content.into(),
+			depth: None,
+		}
 	}
 
 	/// Attaches the canonical source origin retained by discovery.
@@ -81,6 +92,95 @@ impl ContextFile {
 		self.origin = origin.into();
 		self
 	}
+
+	/// Attaches the source's ancestor distance from its workspace directory.
+	pub fn with_depth(mut self, depth: u16) -> Self {
+		self.depth = Some(depth);
+		self
+	}
+}
+
+fn split_comparable_prompt_blocks(content: &str) -> Vec<String> {
+	let normalized = omp_scribe::canon::canonicalize_prompt(content);
+	if normalized.is_empty() {
+		return Vec::new();
+	}
+
+	let mut blocks = Vec::new();
+	let mut current = Vec::new();
+	let mut in_fence = false;
+	for line in normalized.split('\n') {
+		let trimmed = line.trim_start();
+		if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+			in_fence = !in_fence;
+			current.push(line);
+			continue;
+		}
+		if !in_fence && line.trim().is_empty() {
+			let block = current.join("\n");
+			let block = block.trim();
+			if !block.is_empty() {
+				blocks.push(block.to_owned());
+			}
+			current.clear();
+			continue;
+		}
+		current.push(line);
+	}
+	let block = current.join("\n");
+	let block = block.trim();
+	if !block.is_empty() {
+		blocks.push(block.to_owned());
+	}
+	blocks
+}
+
+fn context_blocks_contain(source: &[String], candidate: &[String]) -> bool {
+	!source.is_empty()
+		&& !candidate.is_empty()
+		&& candidate.len() <= source.len()
+		&& source.windows(candidate.len()).any(|window| window == candidate)
+}
+
+/// Returns retained context-file indices in least-to-most-authoritative order.
+///
+/// Files are authority-sorted by descending depth before normalized contiguous
+/// paragraph containment is evaluated. Paragraph splitting is fence-aware, so
+/// instructions shown only inside Markdown code fences cannot suppress active
+/// context. Stable input order breaks equal-depth ties; missing depths sort
+/// first and are therefore least authoritative. Returned indices preserve exact
+/// source bytes rather than normalized content.
+pub fn dedupe_context_file_indices(context_files: &[ContextFile]) -> Vec<usize> {
+	let mut order = (0..context_files.len()).collect::<Vec<_>>();
+	order.sort_by(|left, right| {
+		match (context_files[*left].depth, context_files[*right].depth) {
+			(None, None) => Ordering::Equal,
+			(None, Some(_)) => Ordering::Less,
+			(Some(_), None) => Ordering::Greater,
+			(Some(left), Some(right)) => right.cmp(&left),
+		}
+	});
+	let blocks = order
+		.iter()
+		.map(|index| {
+			let content = String::from_utf8_lossy(&context_files[*index].content);
+			split_comparable_prompt_blocks(&content)
+		})
+		.collect::<Vec<_>>();
+	order
+		.iter()
+		.enumerate()
+		.filter_map(|(position, index)| {
+			let contained = blocks
+				.iter()
+				.enumerate()
+				.any(|(candidate, candidate_blocks)| {
+					candidate > position
+						&& context_blocks_contain(candidate_blocks, &blocks[position])
+				});
+			(!contained).then_some(*index)
+		})
+		.collect()
 }
 
 /// Stable source-control identity included in a workspace prompt.
@@ -598,23 +698,24 @@ impl PromptFacts {
 		}
 		props.set(
 			prompt_keys::CONTEXT_FILES,
-			self
-				.context_files
-				.iter()
-				.filter_map(|file| {
-					let source = String::from_utf8_lossy(&file.content);
-					let content = dedupe_prompt_source(&source, &mut seen);
-					(!content.is_empty()).then(|| {
-						let path = file.path.to_string_lossy().into_owned();
-						map! {
-							"path" => path.clone(),
-							"origin" => if file.origin.is_empty() {
-								Str::from(path)
-							} else {
-								file.origin.clone()
-							},
-							"content" => content,
-						}
+			dedupe_context_file_indices(&self.context_files)
+				.into_iter()
+				.filter_map(|index| {
+					let file = &self.context_files[index];
+					let content = String::from_utf8_lossy(&file.content);
+					if content.trim().is_empty() {
+						return None;
+					}
+					seen.extend(split_comparable_prompt_blocks(&content));
+					let path = file.path.to_string_lossy().into_owned();
+					Some(map! {
+						"path" => path.clone(),
+						"origin" => if file.origin.is_empty() {
+							Str::from(path)
+						} else {
+							file.origin.clone()
+						},
+						"content" => content.into_owned(),
 					})
 				})
 				.collect::<Vec<_>>(),
@@ -814,17 +915,14 @@ fn root_value(root: &WorkspaceRootInput) -> Value {
 }
 
 fn dedupe_prompt_source(content: &str, seen: &mut HashSet<String>) -> String {
-	let normalized = omp_scribe::canon::canonicalize_prompt(content);
-	let mut out = String::with_capacity(normalized.len());
-	for paragraph in normalized
-		.split("\n\n")
-		.filter(|paragraph| !paragraph.is_empty())
-	{
-		if seen.insert(paragraph.to_owned()) {
+	let mut out = String::with_capacity(content.len());
+	for block in split_comparable_prompt_blocks(content) {
+		if !seen.contains(&block) {
 			if !out.is_empty() {
 				out.push_str("\n\n");
 			}
-			out.push_str(paragraph);
+			out.push_str(&block);
+			seen.insert(block);
 		}
 	}
 	out
@@ -1878,11 +1976,195 @@ impl Display for PromptHash {
 mod tests {
 	use super::*;
 
+	fn context(path: &str, content: &str, depth: Option<u16>) -> ContextFile {
+		let file = ContextFile::new(path, content.as_bytes().to_vec());
+		match depth {
+			Some(depth) => file.with_depth(depth),
+			None => file,
+		}
+	}
+
+	fn retained_paths(files: &[ContextFile]) -> Vec<&str> {
+		dedupe_context_file_indices(files)
+			.into_iter()
+			.map(|index| files[index].path.to_str().unwrap())
+			.collect()
+	}
+
 	#[test]
 	fn canonical_source_is_deterministic_for_default_props() {
 		let props = Props::new();
 		let first = CanonicalPromptSource.banded_render(&props).unwrap();
 		let second = CanonicalPromptSource.banded_render(&props).unwrap();
 		assert_eq!(first, second);
+	}
+
+	#[test]
+	fn context_dedup_uses_normalized_contiguous_paragraph_containment() {
+		let files = [
+			context("/far/AGENTS.md", "  Shared A.  \n\n Shared B. ", Some(5)),
+			context(
+				"/project/AGENTS.md",
+				"Shared A.\n\nShared B.\n\nProject-only.",
+				Some(0),
+			),
+		];
+		assert_eq!(retained_paths(&files), ["/project/AGENTS.md"]);
+	}
+
+	#[test]
+	fn closer_context_survives_a_farther_superset_regardless_of_input_order() {
+		let files = [
+			context("/project/AGENTS.md", "Shared.", Some(0)),
+			context("/far/AGENTS.md", "Shared.\n\nFar-only.", Some(5)),
+		];
+		assert_eq!(retained_paths(&files), ["/far/AGENTS.md", "/project/AGENTS.md"]);
+	}
+
+	#[test]
+	fn context_dedup_keeps_non_contiguous_and_changed_paragraphs() {
+		let interleaved = [
+			context("/far/AGENTS.md", "First.\n\nSecond.\n\nThird.", Some(5)),
+			context(
+				"/project/AGENTS.md",
+				"First.\n\nInterleaved.\n\nSecond.\n\nThird.",
+				Some(0),
+			),
+		];
+		assert_eq!(
+			retained_paths(&interleaved),
+			["/far/AGENTS.md", "/project/AGENTS.md"]
+		);
+
+		let changed = [
+			context("/far/AGENTS.md", "Always use tabs.", Some(5)),
+			context("/project/AGENTS.md", "Always use spaces.", Some(0)),
+		];
+		assert_eq!(retained_paths(&changed), ["/far/AGENTS.md", "/project/AGENTS.md"]);
+	}
+
+	#[test]
+	fn context_dedup_preserves_repeated_paragraph_multiplicity() {
+		let files = [
+			context("/far/AGENTS.md", "Repeat.\n\nRepeat.", Some(5)),
+			context("/project/AGENTS.md", "Repeat.", Some(0)),
+		];
+		assert_eq!(retained_paths(&files), ["/far/AGENTS.md", "/project/AGENTS.md"]);
+	}
+
+	#[test]
+	fn fenced_examples_do_not_become_active_containment_instructions() {
+		for fence in ["```", "~~~"] {
+			let example = format!("Bad prompt example:\n\n{fence}\nNever delete user data.\n{fence}");
+			let files = [
+				context("/far/AGENTS.md", "Never delete user data.", Some(5)),
+				context("/project/AGENTS.md", &example, Some(0)),
+			];
+			assert_eq!(
+				retained_paths(&files),
+				["/far/AGENTS.md", "/project/AGENTS.md"]
+			);
+		}
+	}
+
+	#[test]
+	fn fence_boundaries_do_not_make_surrounding_paragraphs_contiguous() {
+		let files = [
+			context("/far/AGENTS.md", "Before.\n\nAfter.", Some(5)),
+			context(
+				"/project/AGENTS.md",
+				"Before.\n\n```\nexample\n```\n\nAfter.",
+				Some(0),
+			),
+		];
+		assert_eq!(retained_paths(&files), ["/far/AGENTS.md", "/project/AGENTS.md"]);
+	}
+
+	#[test]
+	fn fenced_example_paragraphs_do_not_suppress_active_prompt_rules() {
+		let mut seen = HashSet::new();
+		let example = "```\nExample preface.\n\nNever delete user data.\n\nExample suffix.\n```";
+		assert_eq!(dedupe_prompt_source(example, &mut seen), example);
+		assert_eq!(
+			dedupe_prompt_source("Never delete user data.", &mut seen),
+			"Never delete user data."
+		);
+	}
+
+	#[test]
+	fn equal_and_missing_depths_use_stable_later_authority() {
+		let equal = [
+			context("/first/AGENTS.md", "Shared.", Some(2)),
+			context("/second/AGENTS.md", "Shared.\n\nSecond-only.", Some(2)),
+		];
+		assert_eq!(retained_paths(&equal), ["/second/AGENTS.md"]);
+
+		let missing = [
+			context("/first/AGENTS.md", "Shared.", None),
+			context("/second/AGENTS.md", "Shared.\n\nSecond-only.", None),
+		];
+		assert_eq!(retained_paths(&missing), ["/second/AGENTS.md"]);
+	}
+
+	#[test]
+	fn project_context_is_more_authoritative_than_unscoped_context() {
+		let identical = [
+			context("/project/AGENTS.md", "Shared.", Some(0)),
+			context("/user/AGENTS.md", "Shared.", None),
+		];
+		assert_eq!(retained_paths(&identical), ["/project/AGENTS.md"]);
+
+		let user_superset = [
+			context("/project/AGENTS.md", "Shared.", Some(0)),
+			context("/user/AGENTS.md", "Shared.\n\nUser-only.", None),
+		];
+		assert_eq!(
+			retained_paths(&user_superset),
+			["/user/AGENTS.md", "/project/AGENTS.md"]
+		);
+	}
+
+	#[test]
+	fn context_projection_preserves_retained_source_exactly() {
+		let content = "  Repeat exactly.  \n\nRepeat exactly.\n";
+		let facts = PromptFacts::new(
+			"/workspace",
+			Arc::<[ContextFile]>::from([context("AGENTS.md", content, Some(0))]),
+		);
+		let props = facts.props().unwrap();
+		let Some(Value::List(files)) = props.get(prompt_keys::CONTEXT_FILES) else {
+			panic!("context file list missing");
+		};
+		let Value::Map(file) = &files[0] else {
+			panic!("context file map missing");
+		};
+		assert_eq!(file.get(prompt_keys::CONTENT).and_then(Value::as_str), Some(content));
+	}
+
+	#[test]
+	fn workflow_prompt_scopes_delete_safety_to_unrelated_code() {
+		let workflow = include_str!("../prompts/system/workflow.md");
+		assert!(workflow.contains(
+			"delete unrelated code you did not write; code the cutover obsoletes is in scope"
+		));
+		assert!(!workflow.contains("or delete code you did not write."));
+	}
+
+	#[test]
+	fn advisor_prompt_escalates_only_concrete_technical_risk() {
+		let advisor = include_str!("../prompts/modes/advisor.md");
+		for contract in [
+			"concrete technical risk or transcript-evident execution failure",
+			"NEVER advise on user intent or ceremony",
+			"Serializing ≥2 independent, non-overlapping units",
+			"Implementation guesses accessible source, contracts, docs, or logs",
+			"transcript-confirmed specialized tool bypassed",
+			"dropping explicit exhaustive/multi-target scope",
+			"Substitutes stubs, TODOs, toys, or mocks",
+			"Yields before explicit convergence condition",
+			"remove obsolete tests",
+		] {
+			assert!(advisor.contains(contract), "missing advisor contract: {contract}");
+		}
 	}
 }

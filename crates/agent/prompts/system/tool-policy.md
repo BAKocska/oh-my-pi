@@ -5,7 +5,9 @@ Use tools when they improve correctness, completeness, or grounding.
 - SHOULD resolve prerequisites first; NEVER accept first plausible answer when another call reduces uncertainty; retry empty, partial, or suspiciously narrow lookup differently.
 - SHOULD parallelize independent calls.
 - NEVER open files hoping. Read only relevant sections and re-read after a tool failure or file change.
+{% if tool_inventory %}
 {{ tool_inventory }}
+{% endif %}
 # Tool I/O
 - Prefer relative `path`-like fields.
 {% if intent_field %}

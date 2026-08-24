@@ -145,6 +145,13 @@ fn truncate_parts_for_persistence(parts: &mut [thread_pb::Part]) {
 		}
 	}
 }
+fn is_terminal_error_item(item: &thread_pb::Item) -> bool {
+	item.props
+		.as_ref()
+		.and_then(|props| props.fields.get(journal_kinds::TERMINAL_ERROR_PROP))
+		.and_then(|value| value.kind.as_ref())
+		.is_some_and(|kind| matches!(kind, value::Kind::Bool(true)))
+}
 ///
 /// Rewinds are already resolved in `live`. Sequence amendments update only the
 /// working copy; original item events remain untouched.
@@ -164,6 +171,9 @@ pub fn project_journal(
 		};
 		match &event.kind {
 			Kind::Item(record) => {
+				if is_terminal_error_item(&record.item) {
+					continue;
+				}
 				let position = items.len();
 				let mut item = record.item.clone();
 				if amended.contains(index)
