@@ -198,6 +198,7 @@ The directive vocabulary is closed. Its three shapes are:
 | `filter-reasoning-history` | `filter_reasoning_history` | Scalar |
 | `flatten-root-unions` | `flatten_root_unions` | Scalar |
 | `include-encrypted-reasoning` | `include_encrypted_reasoning` | Scalar |
+| `image-encoding-format` | `image_encoding_format` | Scalar |
 | `max-tokens-field` | `max_tokens_field` | Scalar |
 | `official-endpoint` | `official_endpoint` | Scalar |
 | `omit-reasoning-effort` | `omit_reasoning_effort` | Scalar |
@@ -212,6 +213,7 @@ The directive vocabulary is closed. Its three shapes are:
 | `requires-tool-result-id` | `requires_tool_result_id` | Scalar |
 | `signing-endpoint` | `signing_endpoint` | Scalar |
 | `stream-idle-timeout-ms` | `stream_idle_timeout_ms` | Scalar |
+| `thinking-close-max-retries` | `thinking_close_max_retries` | Scalar |
 | `supports-developer-role` | `supports_developer_role` | Scalar |
 | `supports-eager-tool-input-streaming` | `supports_eager_tool_input_streaming` | Scalar |
 | `supports-forced-tool-choice` | `supports_forced_tool_choice` | Scalar |

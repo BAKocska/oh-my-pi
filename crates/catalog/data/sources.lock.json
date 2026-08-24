@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "source_digest": "48a0ebff05e9060e1b3091d84eb73728ea816f3fada1ba590783c26aae0ca6b4",
+  "source_digest": "69e1f8d93a78ffa900c34b7ca623da0762007f4633e3a0d76bae602f261d85bf",
   "inputs": [
     {
       "id": "catalog-policy.manifest.v1",
@@ -179,7 +179,7 @@
     {
       "id": "compat.cascade.classes.deepseek.v1",
       "path": "crates/catalog/compat/classes/deepseek.kdl",
-      "sha256": "d613be52d4625bbe4d048af8ce32ede7917379963fc3821a3ca1c7f0fd05c78b",
+      "sha256": "effa3a5eacf32840a52f5de01dcd5f11eb9a07e042c3e154f531a2321676b848",
       "source": "census 2026-08: .omp/local/quirks + frozen oracle"
     },
     {
@@ -389,7 +389,7 @@
     {
       "id": "compat.cascade.providers.github-copilot.v1",
       "path": "crates/catalog/compat/providers/github-copilot.kdl",
-      "sha256": "c3db6e2fdbaee28031f7ba8c83f8fa06a357c15afec01bf728bc7980ad8ad3c0",
+      "sha256": "6c3635a2c5d1f10c44c1ecb372274366cbae520819fe5b49123fda304202d30e",
       "source": "census 2026-08: .omp/local/quirks + frozen oracle"
     },
     {
@@ -521,7 +521,7 @@
     {
       "id": "compat.cascade.providers.opencode-go.v1",
       "path": "crates/catalog/compat/providers/opencode-go.kdl",
-      "sha256": "9bf29b1e4429a815973d6a3899703d17b2d3e666a9bd21fa12a9bf53aa256a42",
+      "sha256": "a510f7867d4e22ed056b6eb24b44c784e0413b8ae1e03e17ce368a0f6df6a444",
       "source": "census 2026-08: .omp/local/quirks + frozen oracle"
     },
     {
@@ -611,7 +611,7 @@
     {
       "id": "compat.cascade.providers.venice.v1",
       "path": "crates/catalog/compat/providers/venice.kdl",
-      "sha256": "3fd89a6858ea8093224ff52f8e408bb58ceced127255936b7807b46dd9a4fbfe",
+      "sha256": "144ba907f09cccd25935a3aac43040b801822f635b18e323987f5706c0fcecde",
       "source": "census 2026-08: .omp/local/quirks + frozen oracle"
     },
     {

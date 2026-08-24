@@ -2,6 +2,7 @@
 
 provider "venice" {
 	thinking-mode "effort"
+	reasoning-disable-mode "venice-disable-thinking"
 	class "gemini" {
 		revision ">=3 <3.1" {
 			thinking-requires-effort #true

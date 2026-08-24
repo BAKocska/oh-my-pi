@@ -283,6 +283,10 @@ policy_enum!(/// Wire operation used to explicitly disable reasoning.
 		#[serde(rename = "none-effort")]
 		#[strum(to_string = "none-effort", serialize = "none-effort")]
 		NoneEffort,
+		/// Send `venice_parameters.disable_thinking = true`.
+		#[serde(rename = "venice-disable-thinking")]
+		#[strum(to_string = "venice-disable-thinking", serialize = "venice-disable-thinking")]
+		VeniceDisableThinking,
 	}
 );
 policy_enum!(/// Whether the output-token limit field is emitted.
@@ -433,7 +437,19 @@ pub struct ReasoningBodyOverride {
 	/// Typed thinking object.
 	pub thinking:        Option<ThinkingToggle>,
 	/// Qwen-compatible thinking switch.
-	pub enable_thinking: Option<bool>,
+	pub enable_thinking:   Option<bool>,
+	/// Venice request controls.
+	pub venice_parameters: Option<VeniceParameters>,
+}
+
+/// Typed Venice request controls carried by compatibility policy.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VeniceParameters {
+	/// Explicitly disable reasoning for this request.
+	pub disable_thinking:             Option<bool>,
+	/// Include Venice's provider-authored system prompt.
+	pub include_venice_system_prompt: Option<bool>,
 }
 
 /// Additional body fields applied only while reasoning is enabled.
@@ -543,6 +559,8 @@ pub struct StreamingPolicy {
 	pub protocol: Option<StreamProtocol>,
 	/// Optional first-event and idle timeouts.
 	pub watchdog: Option<StreamWatchdog>,
+	/// Maximum retries for a reasoning-only stream close.
+	pub thinking_close_max_retries: Option<u32>,
 }
 
 /// Usage-report projection policy.
@@ -678,7 +696,11 @@ impl WirePolicy {
 				extended_mode:              None,
 				glyph_tokenization:         None,
 			},
-			streaming:  StreamingPolicy { protocol: None, watchdog: None },
+			streaming:  StreamingPolicy {
+				protocol:                   None,
+				watchdog:                   None,
+				thinking_close_max_retries: None,
+			},
 			usage:      UsagePolicy { in_streaming: None },
 			image:      ImagePolicy { encoding: None, supports_detail_original: None },
 			audio:      AudioPolicy { api_version: None },
@@ -1005,6 +1027,8 @@ mod tests {
 		signing_endpoint: Option<bool>,
 		#[serde(rename = "wire/stream_idle_timeout_ms")]
 		stream_idle_timeout_ms: Option<u64>,
+		#[serde(rename = "wire/thinking_close_max_retries")]
+		thinking_close_max_retries: Option<u32>,
 		#[serde(rename = "wire/supports_developer_role")]
 		supports_developer_role: Option<bool>,
 		#[serde(rename = "wire/supports_eager_tool_input_streaming")]
@@ -1084,8 +1108,9 @@ mod tests {
 			policy.reasoning.extra_body = shape.extra_body;
 			policy.reasoning.when_thinking = shape.when_thinking.map(|when| WhenThinkingPolicy {
 				extra_body:      ReasoningBodyOverride {
-					thinking:        None,
-					enable_thinking: when.extra_body.enable_thinking,
+					thinking:          None,
+					enable_thinking:   when.extra_body.enable_thinking,
+					venice_parameters: None,
 				},
 				thinking_format: when.thinking_format,
 			});
@@ -1095,6 +1120,7 @@ mod tests {
 			policy.streaming.watchdog = shape
 				.stream_idle_timeout_ms
 				.map(|idle_ms| StreamWatchdog { first_event_ms: None, idle_ms: Some(idle_ms) });
+			policy.streaming.thinking_close_max_retries = shape.thinking_close_max_retries;
 			policy.usage.in_streaming = shape.supports_usage_in_streaming;
 			policy.image.supports_detail_original = shape.supports_image_detail_original;
 			policy

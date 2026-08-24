@@ -31,7 +31,7 @@ provider "opencode-go" {
 		}
 	}
 	// residue: taxonomy ranks and exact globs do not isolate these models.
-	models "deepseek-v4-flash" "glm-5" "glm-5.1" {
+	models "glm-5" "glm-5.1" {
 		thinking-efforts "minimal" "low" "medium" "high" "xhigh"
 	}
 	// residue: taxonomy ranks and exact globs do not isolate these models.

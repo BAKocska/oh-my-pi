@@ -234,8 +234,10 @@ fn axis_vocabulary_matches_the_oracles_and_reviewed_extensions() {
 	// rewriting source digests in an unrelated port.
 	oracle_axes.extend([
 		"glyph_tokenization".to_owned(),
+		"image_encoding_format".to_owned(),
 		"leaked_thinking_healer".to_owned(),
 		"template_reasoning_effort".to_owned(),
+		"thinking_close_max_retries".to_owned(),
 		"thinking_tool_choice_conflict".to_owned(),
 	]);
 	oracle_axes.sort_unstable();
@@ -309,6 +311,28 @@ fn cascade_resolves_every_catalog_model_to_oracle_plus_census_overlay() {
 			// forced choices and must cascade to automatic tool selection.
 			expected.insert("supports_forced_tool_choice".into(), Value::from(false));
 		}
+		if class == "deepseek" {
+			let model_name = model.model.to_ascii_lowercase();
+			let encoding = if model_name.contains("deepseek-ocr")
+				|| model_name.contains("janus")
+				|| model_name.contains("vision")
+				|| model_name.contains("vl")
+			{
+				"open_ai_url"
+			} else {
+				"none"
+			};
+			expected.insert("image_encoding_format".into(), Value::from(encoding));
+		}
+		if model.provider == "venice" {
+			expected.insert(
+				"reasoning_disable_mode".into(),
+				Value::from("venice-disable-thinking"),
+			);
+		}
+		if model.id == "github-copilot/grok-4.6" {
+			expected.insert("thinking_close_max_retries".into(), Value::from(1));
+		}
 		if model.provider == "xai"
 			&& classification
 				.family
@@ -362,6 +386,12 @@ fn cascade_resolves_every_catalog_model_to_oracle_plus_census_overlay() {
 
 		// Thinking: exact against the profile oracle; empty when not profiled.
 		let mut expected_thinking = thinking_oracle.get(&model.id).cloned().unwrap_or_default();
+		if model.id == "opencode-go/deepseek-v4-flash" {
+			expected_thinking.insert(
+				"efforts".into(),
+				Value::from(vec![Value::from("low"), Value::from("high"), Value::from("max")]),
+			);
+		}
 		if model.id == "baseten/moonshotai/Kimi-K3" {
 			expected_thinking.extend([
 				("defaultLevel".into(), Value::from("max")),
@@ -603,13 +633,70 @@ fn copilot_grok_46_residue_grants_the_responses_xhigh_ladder() {
 			"github-copilot/{model}: effort mode"
 		);
 		// The /responses policy drops the chat-completions compat residue:
-		// no wire overrides survive for the migrated ids.
-		assert!(
-			resolved.wire.is_empty(),
-			"github-copilot/{model}: unexpected wire residue {:?}",
-			resolved.wire
-		);
+		// no wire overrides survive except the bounded retry cap on the
+		// repeatedly truncated reasoning-only base SKU.
+		if model == "grok-4.6" {
+			assert_eq!(
+				resolved.wire.get("thinking_close_max_retries"),
+				Some(&Value::from(1)),
+				"github-copilot/{model}: retry cap"
+			);
+			assert_eq!(resolved.wire.len(), 1, "github-copilot/{model}: wire residue");
+		} else {
+			assert!(
+				resolved.wire.is_empty(),
+				"github-copilot/{model}: unexpected wire residue {:?}",
+				resolved.wire
+			);
+		}
 	}
+}
+
+#[test]
+fn deepseek_image_venice_off_and_opencode_effort_policies_resolve() {
+	let cascade = CompatCascade::bundled().expect("bundled cascade parses");
+	let resolve = |provider: &str, model: &str, reasoning: bool| {
+		let classification = classify(ClassificationInput {
+			phase: ClassificationPhase::CatalogCompiler,
+			provider,
+			model,
+			observed_at_ms: None,
+		});
+		cascade
+			.resolve(&ResolveTarget {
+				provider,
+				class: classification.class.as_str(),
+				family: classification.family.as_ref().map(|family| family.as_str()),
+				revision: classification.revision,
+				model,
+				reasoning,
+			})
+			.unwrap_or_else(|error| panic!("{provider}/{model}: {error}"))
+	};
+
+	let flash = resolve("opencode-go", "deepseek-v4-flash", true);
+	assert_eq!(
+		flash.thinking.get("efforts"),
+		Some(&Value::from(vec!["low", "high", "max"])),
+	);
+	assert_eq!(flash.wire.get("image_encoding_format"), Some(&Value::from("none")));
+	let copilot_grok = resolve("github-copilot", "grok-4.6", true);
+	assert_eq!(
+		copilot_grok.wire.get("thinking_close_max_retries"),
+		Some(&Value::from(1)),
+	);
+
+	let ocr = resolve("novita", "deepseek/deepseek-ocr-2", false);
+	assert_eq!(
+		ocr.wire.get("image_encoding_format"),
+		Some(&Value::from("open_ai_url")),
+	);
+
+	let venice = resolve("venice", "qwen3-235b", true);
+	assert_eq!(
+		venice.wire.get("reasoning_disable_mode"),
+		Some(&Value::from("venice-disable-thinking")),
+	);
 }
 
 #[test]
@@ -823,6 +910,33 @@ fn run_policy_case(cascade: &CompatCascade, case: &Case) {
 		let overlay = census_thinking_format(provider, class).map(Value::from);
 		if let Some(overlay) = overlay.as_ref() {
 			expected.entry("thinking_format").or_insert(overlay);
+		}
+		let model_name = model.to_ascii_lowercase();
+		let image_encoding = (class == "deepseek").then(|| {
+			Value::from(
+				if model_name.contains("deepseek-ocr")
+					|| model_name.contains("janus")
+					|| model_name.contains("vision")
+					|| model_name.contains("vl")
+				{
+					"open_ai_url"
+				} else {
+					"none"
+				},
+			)
+		});
+		if let Some(image_encoding) = image_encoding.as_ref() {
+			expected.insert("image_encoding_format", image_encoding);
+		}
+		let venice_off =
+			(provider == "venice").then(|| Value::from("venice-disable-thinking"));
+		if let Some(venice_off) = venice_off.as_ref() {
+			expected.insert("reasoning_disable_mode", venice_off);
+		}
+		let retry_cap =
+			(provider == "github-copilot" && model == "grok-4.6").then(|| Value::from(1));
+		if let Some(retry_cap) = retry_cap.as_ref() {
+			expected.insert("thinking_close_max_retries", retry_cap);
 		}
 		assert_eq!(resolved_json, expected, "{}: resolved overrides", case.id);
 	}

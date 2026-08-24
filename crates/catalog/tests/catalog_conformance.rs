@@ -12,7 +12,8 @@ use omp_catalog::{
 	compile::{CompiledCatalog, compile_oracle},
 	policy::{
 		ApplyPatchWireKind, ComputerUseConfigSupport, ComputerUseWireSupport, ExtendedContextMode,
-		MaxOutputTokensEmission, MaxTokensField, ReasoningDisableMode, ThinkingFormat, WirePolicy,
+		ImageEncodingFormat, MaxOutputTokensEmission, MaxTokensField, ReasoningDisableMode,
+		ThinkingFormat, WirePolicy,
 	},
 	pricing::{PriceUnit, UsageDimensions},
 	provider::{
@@ -107,11 +108,18 @@ const INFERRED_CURSOR_THINKING: &[(&str, &[ThinkingEffort])] = &[
 	]),
 ];
 const REVIEWED_THINKING_CORRECTIONS: &[(&str, &[ThinkingEffort])] =
-	&[("baseten/moonshotai/Kimi-K3", &[
-		ThinkingEffort::Low,
-		ThinkingEffort::High,
-		ThinkingEffort::Max,
-	])];
+	&[
+		("baseten/moonshotai/Kimi-K3", &[
+			ThinkingEffort::Low,
+			ThinkingEffort::High,
+			ThinkingEffort::Max,
+		]),
+		("opencode-go/deepseek-v4-flash", &[
+			ThinkingEffort::Low,
+			ThinkingEffort::High,
+			ThinkingEffort::Max,
+		]),
+	];
 const CURATED_THINKING_OVERRIDES: &[&str] =
 	&["baseten/moonshotai/Kimi-K3", "nanogpt/linkup-research"];
 /// Frozen-profile members whose compiled thinking intentionally gained a
@@ -1038,6 +1046,37 @@ fn with_model_behavior(
 		} else {
 			ComputerUseConfigSupport::Unsupported
 		});
+	}
+	policy
+}
+fn with_reviewed_wire_overrides(
+	mut policy: WirePolicy,
+	key: &str,
+	provider: &str,
+	class: &str,
+) -> WirePolicy {
+	if REVIEWED_WIRE_TOOL_CHOICE_DISABLED.contains(&key) {
+		policy.tool.supports_tool_choice = Some(false);
+	}
+	if class == "deepseek" {
+		let model = key.split_once('/').map_or(key, |(_, model)| model).to_ascii_lowercase();
+		policy.image.encoding = Some(
+			if model.contains("deepseek-ocr")
+				|| model.contains("janus")
+				|| model.contains("vision")
+				|| model.contains("vl")
+			{
+				ImageEncodingFormat::OpenAiUrl
+			} else {
+				ImageEncodingFormat::None
+			},
+		);
+	}
+	if provider == "venice" {
+		policy.reasoning.disable_mode = Some(ReasoningDisableMode::VeniceDisableThinking);
+	}
+	if key == "github-copilot/grok-4.6" {
+		policy.streaming.thinking_close_max_retries = Some(1);
 	}
 	policy
 }
@@ -2038,6 +2077,17 @@ fn exact_override_rows_and_qwen_collapses_remain_present_and_auditable() {
 			.thinking
 			.as_ref()
 			.expect("exact thinking behavior");
+		let expected_efforts = REVIEWED_THINKING_CORRECTIONS
+			.iter()
+			.find_map(|(key, efforts)| (*key == case.model).then_some(efforts.to_vec()))
+			.unwrap_or_else(|| {
+				expected_thinking
+					.efforts
+					.iter()
+					.copied()
+					.map(Into::into)
+					.collect()
+			});
 		let actual_thinking = model
 			.thinking
 			.as_ref()
@@ -2056,12 +2106,7 @@ fn exact_override_rows_and_qwen_collapses_remain_present_and_auditable() {
 		);
 		assert_eq!(
 			actual_thinking.efforts.as_slice(),
-			expected_thinking
-				.efforts
-				.iter()
-				.copied()
-				.map(Into::into)
-				.collect::<Vec<_>>(),
+			expected_efforts.as_slice(),
 			"{} thinking efforts",
 			case.model
 		);
@@ -2611,6 +2656,12 @@ fn every_thinking_profile_is_interned_and_attached_to_its_exact_model_set() {
 		for key in profile.models {
 			// #8369: reviewed defaults split these members off the frozen shape.
 			let mut expected_shape = profile.shape.clone();
+			if let Some((_, efforts)) = REVIEWED_THINKING_CORRECTIONS
+				.iter()
+				.find(|(reviewed, _)| *reviewed == key)
+			{
+				expected_shape.efforts = efforts.iter().copied().collect();
+			}
 			if REVIEWED_THINKING_DEFAULTS.contains(&key.as_str()) {
 				expected_shape.default_level = Some(ThinkingEffort::High);
 				expected_shape.requires_effort = Some(true);
@@ -2664,7 +2715,7 @@ fn every_thinking_profile_is_interned_and_attached_to_its_exact_model_set() {
 			"{key} unexpectedly has a fixture thinking profile"
 		);
 	}
-	assert_eq!(expected_ids.len(), 51);
+	assert_eq!(expected_ids.len(), 52);
 	let actual_ids = compiled
 		.thinking_policies
 		.iter()
@@ -2734,11 +2785,8 @@ fn every_sparse_wire_profile_has_a_stable_distinct_content_id() {
 				.unwrap_or_else(|| panic!("{key} behavior fixture is missing"));
 			let expected_policy = with_census_thinking_format(policy.clone(), provider, class);
 			let mut expected_policy = with_model_behavior(expected_policy, behavior);
-			if REVIEWED_WIRE_TOOL_CHOICE_DISABLED.contains(&key.as_str()) {
-				// #8244: the Responses route rejects forced tool choice for
-				// DeepSeek V4; the frozen wire profile predates the override.
-				expected_policy.tool.supports_tool_choice = Some(false);
-			}
+			expected_policy =
+				with_reviewed_wire_overrides(expected_policy, key.as_str(), provider, class);
 			let attached_id = expected_policy.content_id();
 			assert!(
 				expected_by_model
@@ -2782,6 +2830,12 @@ fn every_sparse_wire_profile_has_a_stable_distinct_content_id() {
 			};
 			let expected_policy = with_census_thinking_format(base, provider, class);
 			let expected_policy = with_model_behavior(expected_policy, behavior);
+			let expected_policy = with_reviewed_wire_overrides(
+				expected_policy,
+				model.key.as_str(),
+				provider,
+				class,
+			);
 			let actual_policy = compiled
 				.wire_policies
 				.iter()

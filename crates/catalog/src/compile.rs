@@ -553,6 +553,8 @@ pub struct SourceWirePolicy {
 	/// Model stream idle timeout.
 	#[serde(alias = "streamIdleTimeoutMs")]
 	pub stream_idle_timeout_ms: Option<u64>,
+	/// Maximum retries for a reasoning-only stream close.
+	pub thinking_close_max_retries: Option<u32>,
 	/// Stream protocol.
 	pub stream_protocol: Option<Str>,
 	/// Audio API version.
@@ -3908,6 +3910,9 @@ fn compile_wire_policy(
 		watchdog.idle_ms = Some(idle_ms);
 		policy.streaming.watchdog = Some(watchdog);
 	}
+	policy.streaming.thinking_close_max_retries = source
+		.thinking_close_max_retries
+		.or(policy.streaming.thinking_close_max_retries);
 	Ok(policy)
 }
 

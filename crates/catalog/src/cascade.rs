@@ -95,6 +95,7 @@ pub const KNOWN_AXES: &[(&str, AxisSet, &str, AxisKind)] = &[
 	("flatten-root-unions", AxisSet::Wire, "flatten_root_unions", AxisKind::Scalar),
 	("glyph-tokenization", AxisSet::Wire, "glyph_tokenization", AxisKind::Scalar),
 	("include-encrypted-reasoning", AxisSet::Wire, "include_encrypted_reasoning", AxisKind::Scalar),
+	("image-encoding-format", AxisSet::Wire, "image_encoding_format", AxisKind::Scalar),
 	("leaked-thinking-healer", AxisSet::Wire, "leaked_thinking_healer", AxisKind::Scalar),
 	("max-tokens-field", AxisSet::Wire, "max_tokens_field", AxisKind::Scalar),
 	("official-endpoint", AxisSet::Wire, "official_endpoint", AxisKind::Scalar),
@@ -126,6 +127,12 @@ pub const KNOWN_AXES: &[(&str, AxisSet, &str, AxisKind)] = &[
 	("requires-tool-result-id", AxisSet::Wire, "requires_tool_result_id", AxisKind::Scalar),
 	("signing-endpoint", AxisSet::Wire, "signing_endpoint", AxisKind::Scalar),
 	("stream-idle-timeout-ms", AxisSet::Wire, "stream_idle_timeout_ms", AxisKind::Scalar),
+	(
+		"thinking-close-max-retries",
+		AxisSet::Wire,
+		"thinking_close_max_retries",
+		AxisKind::Scalar,
+	),
 	("supports-developer-role", AxisSet::Wire, "supports_developer_role", AxisKind::Scalar),
 	(
 		"supports-eager-tool-input-streaming",

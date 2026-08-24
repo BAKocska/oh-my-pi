@@ -1,6 +1,10 @@
 // Model-lineage compat for "deepseek"; regenerated from the frozen census using class taxonomy selectors.
 
 class "deepseek" {
+	image-encoding-format "none"
+	models "*deepseek-ocr*" "*janus*" "*vision*" "*vl*" {
+		image-encoding-format "open_ai_url"
+	}
 	on "aiand" "aimlapi" "alibaba-token-plan" "baseten" "coreweave" "deepseek" "fireworks" \
 		"huggingface" "kilo" "nanogpt" "novita" "nvidia" "opencode-go" "opencode-zen" "together" \
 		"venice" "vercel-ai-gateway" "wafer-serverless" "zenmux" {
@@ -16,8 +20,8 @@ class "deepseek" {
 		}
 	}
 	on "aiand" "aimlapi" "coreweave" "deepseek" "fireworks" "gmi-cloud" "huggingface" "kilo" \
-		"nanogpt" "novita" "nvidia" "ollama-cloud" "opencode-zen" "openrouter" "together" "venice" \
-		"wafer-serverless" "zenmux" {
+		"nanogpt" "novita" "nvidia" "ollama-cloud" "opencode-go" "opencode-zen" "openrouter" \
+		"together" "venice" "wafer-serverless" "zenmux" {
 		family "flash" {
 			thinking-efforts "low" "high" "max"
 		}
