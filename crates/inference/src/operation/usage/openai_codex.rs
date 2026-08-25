@@ -30,6 +30,7 @@ use crate::{
 		OAuthHttpResponse,
 	},
 	catalog::{AuthSpecId, ProviderId},
+	id::AccountId,
 	operation::usage::{
 		ConsoleUsageFetcher, ConsoleUsageObservation, UsageCredentialRequirement, UsageFetchError,
 	},
@@ -607,20 +608,38 @@ impl CodexRedemption {
 
 	/// Attempts one saved-reset redemption; `true` means a credit was consumed.
 	pub async fn redeem(&self, reason: CodexRedemptionReason) -> bool {
-		let record = self
+		let account = self
 			.accounts
 			.accounts()
 			.into_iter()
-			.find(|record| record.enabled && record.provider == self.provider);
-		let (account, principal) = match record {
-			Some(record) => (record.account, record.principal),
+			.find(|record| record.enabled && record.provider == self.provider)
+			.map(|record| record.account);
+		match account {
+			Some(account) => self.redeem_account(reason, &account).await,
+			None => false,
+		}
+	}
+
+	/// Attempts one saved-reset redemption for one exact durable account.
+	pub async fn redeem_account(
+		&self,
+		reason: CodexRedemptionReason,
+		account: &AccountId<str>,
+	) -> bool {
+		let record = self.accounts.accounts().into_iter().find(|record| {
+			record.enabled
+				&& record.provider == self.provider
+				&& record.account.as_str() == account.as_ref()
+		});
+		let principal = match record {
+			Some(record) => record.principal,
 			None => return false,
 		};
 		let Ok(lease) = self
 			.broker
 			.lease(CredentialNeed {
 				spec:        self.auth.clone(),
-				account:     Some(account),
+				account:     Some(account.to_owned()),
 				principal:   Some(principal),
 				valid_after: SystemTime::now(),
 			})
@@ -631,14 +650,14 @@ impl CodexRedemption {
 		let Some(token) = lease.scalar_secret() else {
 			return false;
 		};
-		let (account_id, _) = parse_codex_jwt_identity(token.expose_secret());
+		let (provider_account_id, _) = parse_codex_jwt_identity(token.expose_secret());
 		let mut coordinator = self.coordinator.lock().await;
 		matches!(
 			coordinator
 				.redeem(
 					reason,
 					token.expose_secret(),
-					account_id.as_deref(),
+					provider_account_id.as_deref(),
 					self.http.as_ref(),
 					Instant::now(),
 				)

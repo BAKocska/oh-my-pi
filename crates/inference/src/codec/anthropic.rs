@@ -7,7 +7,7 @@ use omp_catalog::{
 };
 use omp_core::{Str, encoding::base64, sf};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, value::RawValue};
+use serde_json::{Map, Value, value::RawValue};
 use strum::IntoStaticStr;
 
 use super::{
@@ -22,7 +22,7 @@ use crate::{
 	call::{
 		CacheRetention, ChatRequest, ContentPart as CanonicalPart, CountTokensRequest, HostedTool,
 		MediaInput, OpaqueJson, OperationCall, ProviderProof, ReasoningRequest, ReasoningVisibility,
-		Role, Setting, StructuredOutput, ToolChoice, ToolResultContent,
+		Role, Setting, StructuredOutput, ToolChoice, ToolDefinition, ToolResultContent,
 	},
 	error::{Error, ErrorDetail, ErrorKind, ErrorPhase, RetryAction},
 	event::{BlockKind, ChatEvent, FinishReason, ToolCall, UsageUpdate},
@@ -632,34 +632,492 @@ struct CountTokensBody {
 	tools:    Vec<Tool>,
 }
 
-/// Rewrites a tool schema root for Anthropic's `input_schema` validator, which
-/// rejects `allOf`/`anyOf`/`oneOf` at the top level (HTTP 400
-/// `invalid_request_error`). Root combinators are spilled into the root
-/// `description` so the constraint stays model-visible; nested combinators are
-/// untouched.
-fn spill_root_combinators(schema: &mut Value) {
-	let Some(object) = schema.as_object_mut() else {
-		return;
-	};
-	for key in ["allOf", "anyOf", "oneOf"] {
-		let Some(spilled) = object.remove(key) else {
-			continue;
-		};
-		let Ok(rendered) = serde_json::to_string(&spilled) else {
-			continue;
-		};
-		let description = object
-			.entry("description")
-			.or_insert_with(|| Value::String(String::new()));
-		if let Value::String(text) = description {
-			if !text.is_empty() {
-				text.push_str("\n\n");
+/// JSON Schema keys Anthropic's Messages validator accepts on every node.
+///
+/// Mirrors pi's `normalizeAnthropicToolSchema` (itself the Anthropic SDK
+/// `_transform.py` whitelist plus live Messages API guardrails): anything
+/// outside the kept sets draws an HTTP 400 `invalid_request_error` (e.g.
+/// `For 'integer' type, property 'minimum' is not supported`) and is demoted
+/// into the node's `description` so the constraint stays model-visible.
+const SCHEMA_UNIVERSAL_KEEP: &[&str] = &[
+	"$ref",
+	"$defs",
+	"$schema",
+	"definitions",
+	"type",
+	"anyOf",
+	"allOf",
+	"enum",
+	"const",
+	"description",
+	"title",
+	"default",
+	"nullable",
+];
+/// Keys additionally preserved on `type: "object"` nodes.
+const SCHEMA_OBJECT_KEEP: &[&str] = &["properties", "required", "additionalProperties"];
+/// Keys additionally preserved on `type: "array"` nodes; `minItems` survives
+/// only when its value is 0 or 1.
+const SCHEMA_ARRAY_KEEP: &[&str] = &["items", "prefixItems", "minItems"];
+/// Keys additionally preserved on `type: "string"` nodes; `format` survives
+/// only for [`SCHEMA_STRING_FORMATS`] values.
+const SCHEMA_STRING_KEEP: &[&str] = &["format"];
+/// String `format` values Anthropic accepts (SDK `SupportedStringFormats`).
+const SCHEMA_STRING_FORMATS: &[&str] =
+	&["date-time", "time", "date", "duration", "email", "hostname", "uri", "ipv4", "ipv6", "uuid"];
+/// Schema combinator keys: spilled at the `input_schema` root (Anthropic
+/// rejects root combinators), kept when nested — except `oneOf`, which is
+/// outside the supported subset and spills at every position.
+const SCHEMA_COMBINATORS: &[&str] = &["anyOf", "allOf", "oneOf"];
+/// Tools eligible for Anthropic strict tool use, by wire name.
+///
+/// Strict grammars carry provider-side compile cost, so only high-traffic
+/// argument-heavy tools opt in; mirrors pi's `bash`/`python`/`edit`/`find`
+/// allowlist under omp tool names.
+const STRICT_TOOL_ALLOWLIST: &[&str] = &["bash", "shell", "python", "eval", "edit", "find", "glob"];
+/// Maximum tools promoted to strict per request.
+const MAX_STRICT_TOOLS: usize = 20;
+/// Cross-tool budget of properties kept optional under strict.
+const MAX_STRICT_OPTIONAL_PARAMETERS: usize = 24;
+/// Cross-tool budget of union-typed nodes under strict.
+const MAX_STRICT_UNION_PARAMETERS: usize = 16;
+/// Keywords whose presence anywhere in the raw wire schema disqualifies a
+/// tool from strict promotion.
+///
+/// Anthropic's strict grammar subset supports anyOf/type-array unions only:
+/// `oneOf`/`allOf`/`$ref` compile unpredictably (rejections arrive as 400s),
+/// and `patternProperties`/`propertyNames` describe open key sets that the
+/// strict pipeline's injected `additionalProperties: false` would contradict.
+const STRICT_INCOMPATIBLE_KEYWORDS: &[&str] =
+	&["oneOf", "allOf", "$ref", "patternProperties", "propertyNames"];
+
+fn type_array_includes(kinds: &[Value], name: &str) -> bool {
+	kinds.iter().any(|kind| kind.as_str() == Some(name))
+}
+
+/// `minItems`/`maxItems` apply to arrays; Anthropic rejects them on
+/// `type: "object"` nodes (including `minItems: 0`/`1`).
+fn is_array_node(schema: &Map<String, Value>) -> bool {
+	match schema.get("type") {
+		Some(Value::String(kind)) if kind == "array" => return true,
+		Some(Value::Array(kinds))
+			if type_array_includes(kinds, "array") && !type_array_includes(kinds, "object") =>
+		{
+			return true;
+		},
+		_ => {},
+	}
+	schema.contains_key("items") || schema.get("prefixItems").is_some_and(Value::is_array)
+}
+
+fn is_object_node(schema: &Map<String, Value>) -> bool {
+	if is_array_node(schema) {
+		return false;
+	}
+	match schema.get("type") {
+		Some(Value::String(kind)) if kind == "object" => return true,
+		Some(Value::Array(kinds)) if type_array_includes(kinds, "object") => return true,
+		_ => {},
+	}
+	schema.get("properties").is_some_and(Value::is_object)
+}
+
+/// Principal non-null scalar type steering the per-type keep set; `"null"` is
+/// ignored so nullable variants normalize as their underlying type.
+fn effective_scalar_type(schema: &Map<String, Value>) -> Option<&str> {
+	match schema.get("type") {
+		Some(Value::String(kind)) => return Some(kind),
+		Some(Value::Array(kinds)) => {
+			for kind in kinds {
+				if let Some(name) = kind.as_str()
+					&& name != "null"
+				{
+					return Some(name);
+				}
 			}
-			text.push_str(key);
-			text.push_str(": ");
-			text.push_str(&rendered);
+		},
+		_ => {},
+	}
+	if schema.get("properties").is_some_and(Value::is_object) {
+		return Some("object");
+	}
+	if schema.contains_key("items") || schema.get("prefixItems").is_some_and(Value::is_array) {
+		return Some("array");
+	}
+	None
+}
+
+fn per_type_keep(scalar_type: Option<&str>) -> &'static [&'static str] {
+	match scalar_type {
+		Some("object") => SCHEMA_OBJECT_KEEP,
+		Some("array") => SCHEMA_ARRAY_KEEP,
+		Some("string") => SCHEMA_STRING_KEEP,
+		_ => &[],
+	}
+}
+
+/// Demotes dropped keywords into the node `description` as `{key: value, …}`
+/// so the constraint stays model-visible after the wire schema loses it.
+fn spill_into_description(node: &mut Map<String, Value>, spill: &[(&str, String)]) {
+	if spill.is_empty() {
+		return;
+	}
+	let mut text = String::new();
+	if let Some(existing) = node.get("description").and_then(Value::as_str)
+		&& !existing.is_empty()
+	{
+		text.push_str(existing);
+		text.push_str("\n\n");
+	}
+	text.push('{');
+	for (index, (key, rendered)) in spill.iter().enumerate() {
+		if index > 0 {
+			text.push_str(", ");
+		}
+		text.push_str(key);
+		text.push_str(": ");
+		text.push_str(rendered);
+	}
+	text.push('}');
+	node.insert("description".into(), Value::String(text));
+}
+
+/// Normalizes one JSON Schema node for Anthropic tool `input_schema`.
+///
+/// Keeps universal keys everywhere (root combinators excepted — Anthropic
+/// rejects `anyOf`/`allOf`/`oneOf` at the schema root), keeps per-type keys
+/// additively, and spills everything else into `description`. Object nodes
+/// default to `additionalProperties: false`; explicit open maps are preserved
+/// so the strict pass demotes them to non-strict instead of fabricating a
+/// closed object.
+fn normalize_tool_schema(schema: &Value, is_root: bool) -> Value {
+	let object = match schema {
+		Value::Array(entries) => {
+			return Value::Array(
+				entries
+					.iter()
+					.map(|entry| normalize_tool_schema(entry, false))
+					.collect(),
+			);
+		},
+		Value::Object(object) => object,
+		other => return other.clone(),
+	};
+	let scalar_type = effective_scalar_type(object);
+	let keep = per_type_keep(scalar_type);
+	let mut result = Map::with_capacity(object.len());
+	let mut spill: Vec<(&str, String)> = Vec::new();
+	for (key, value) in object {
+		let root_combinator = is_root && SCHEMA_COMBINATORS.contains(&key.as_str());
+		if !root_combinator
+			&& (SCHEMA_UNIVERSAL_KEEP.contains(&key.as_str()) || keep.contains(&key.as_str()))
+		{
+			result.insert(key.clone(), value.clone());
+		} else if let Ok(rendered) = serde_json::to_string(value) {
+			spill.push((key, rendered));
 		}
 	}
+	match scalar_type {
+		Some("string") => {
+			if result
+				.get("format")
+				.and_then(Value::as_str)
+				.is_some_and(|format| !SCHEMA_STRING_FORMATS.contains(&format))
+				&& let Some(format) = result.remove("format")
+				&& let Ok(rendered) = serde_json::to_string(&format)
+			{
+				spill.push(("format", rendered));
+			}
+		},
+		Some("array") => {
+			if result
+				.get("minItems")
+				.is_some_and(|value| !value.as_f64().is_some_and(|n| n == 0.0 || n == 1.0))
+				&& let Some(min_items) = result.remove("minItems")
+				&& let Ok(rendered) = serde_json::to_string(&min_items)
+			{
+				spill.push(("minItems", rendered));
+			}
+		},
+		Some("object") => {
+			result
+				.entry("additionalProperties")
+				.or_insert(Value::Bool(false));
+		},
+		_ => {},
+	}
+	if let Some(Value::Object(properties)) = result.get_mut("properties") {
+		*properties = properties
+			.iter()
+			.map(|(name, property)| (name.clone(), normalize_tool_schema(property, false)))
+			.collect();
+	}
+	if let Some(additional) = result.get_mut("additionalProperties")
+		&& additional.is_object()
+	{
+		let normalized = normalize_tool_schema(additional, false);
+		*additional = match &normalized {
+			Value::Object(map) if map.is_empty() => Value::Bool(true),
+			_ => normalized,
+		};
+	}
+	if let Some(items) = result.get_mut("items")
+		&& (items.is_array() || items.is_object())
+	{
+		*items = normalize_tool_schema(items, false);
+	}
+	if let Some(prefix_items) = result.get_mut("prefixItems")
+		&& prefix_items.is_array()
+	{
+		*prefix_items = normalize_tool_schema(prefix_items, false);
+	}
+	for key in SCHEMA_COMBINATORS {
+		if let Some(variants) = result.get_mut(*key)
+			&& variants.is_array()
+		{
+			*variants = normalize_tool_schema(variants, false);
+		}
+	}
+	for key in ["$defs", "definitions"] {
+		if let Some(Value::Object(definitions)) = result.get_mut(key) {
+			*definitions = definitions
+				.iter()
+				.map(|(name, definition)| (name.clone(), normalize_tool_schema(definition, false)))
+				.collect();
+		}
+	}
+	spill_into_description(&mut result, &spill);
+	Value::Object(result)
+}
+
+/// Remaining and consumed cross-tool strict-schema allowances.
+struct StrictBudget {
+	optional_remaining: usize,
+	union_remaining:    usize,
+	optional_used:      usize,
+	union_used:         usize,
+}
+
+fn has_union_type(schema: &Map<String, Value>) -> bool {
+	schema.get("type").is_some_and(Value::is_array)
+		|| schema.get("anyOf").is_some_and(Value::is_array)
+}
+
+fn has_null_variant(schema: &Map<String, Value>) -> bool {
+	if let Some(Value::Array(kinds)) = schema.get("type")
+		&& type_array_includes(kinds, "null")
+	{
+		return true;
+	}
+	matches!(
+		schema.get("anyOf"),
+		Some(Value::Array(variants))
+			if variants
+				.iter()
+				.any(|variant| variant.get("type").and_then(Value::as_str) == Some("null"))
+	)
+}
+
+/// Widens a schema to accept `null`, reusing an existing union shape when one
+/// exists and otherwise spending union budget on an `anyOf` wrapper.
+fn make_nullable(schema: Value, budget: &mut StrictBudget) -> Option<Value> {
+	let schema = match schema {
+		Value::Object(mut object) => {
+			if has_null_variant(&object) {
+				return Some(Value::Object(object));
+			}
+			if let Some(Value::Array(variants)) = object.get_mut("anyOf") {
+				variants.push(serde_json::json!({"type": "null"}));
+				return Some(Value::Object(object));
+			}
+			if let Some(Value::Array(kinds)) = object.get_mut("type") {
+				kinds.push(Value::String("null".into()));
+				return Some(Value::Object(object));
+			}
+			Value::Object(object)
+		},
+		other => other,
+	};
+	if budget.union_remaining == 0 {
+		return None;
+	}
+	budget.union_remaining -= 1;
+	budget.union_used += 1;
+	Some(serde_json::json!({"anyOf": [schema, {"type": "null"}]}))
+}
+
+/// Keys marking a node as an actual schema rather than bare annotations.
+const SCHEMA_DEFINING_KEYS: &[&str] = &[
+	"type",
+	"properties",
+	"additionalProperties",
+	"items",
+	"prefixItems",
+	"enum",
+	"const",
+	"$ref",
+	"anyOf",
+	"allOf",
+	"oneOf",
+	"$defs",
+	"definitions",
+];
+
+/// Rewrites one base-normalized node into Anthropic's strict subset, or
+/// returns `None` when it cannot ride a strict declaration (open maps,
+/// annotation-only nodes, exhausted budgets). Optional properties stay
+/// optional while budget lasts, then become required-but-nullable.
+fn normalize_strict_node(schema: &Value, budget: &mut StrictBudget) -> Option<Value> {
+	let object = match schema {
+		Value::Array(entries) => {
+			let mut result = Vec::with_capacity(entries.len());
+			for entry in entries {
+				result.push(normalize_strict_node(entry, budget)?);
+			}
+			return Some(Value::Array(result));
+		},
+		Value::Object(object) => object,
+		other => return Some(other.clone()),
+	};
+	if !SCHEMA_DEFINING_KEYS
+		.iter()
+		.any(|key| object.contains_key(*key))
+	{
+		return None;
+	}
+	// Strict tool use only supports closed objects; open maps stay on the
+	// non-strict plan instead of fabricating a closed object.
+	if is_object_node(object) && object.get("additionalProperties") != Some(&Value::Bool(false)) {
+		return None;
+	}
+	if has_union_type(object) {
+		if budget.union_remaining == 0 {
+			return None;
+		}
+		budget.union_remaining -= 1;
+		budget.union_used += 1;
+	}
+	let mut result = object.clone();
+	if let Some(Value::Object(properties)) = object.get("properties") {
+		let originally_required: Vec<&str> = object
+			.get("required")
+			.and_then(Value::as_array)
+			.map(|entries| entries.iter().filter_map(Value::as_str).collect())
+			.unwrap_or_default();
+		let mut normalized = Map::with_capacity(properties.len());
+		let mut required = Vec::with_capacity(properties.len());
+		for (name, property) in properties {
+			let property = normalize_strict_node(property, budget)?;
+			if originally_required.contains(&name.as_str()) {
+				normalized.insert(name.clone(), property);
+				required.push(Value::String(name.clone()));
+				continue;
+			}
+			if budget.optional_remaining > 0 {
+				budget.optional_remaining -= 1;
+				budget.optional_used += 1;
+				normalized.insert(name.clone(), property);
+				continue;
+			}
+			normalized.insert(name.clone(), make_nullable(property, budget)?);
+			required.push(Value::String(name.clone()));
+		}
+		result.insert("properties".into(), Value::Object(normalized));
+		result.insert("required".into(), Value::Array(required));
+	}
+	if let Some(items) = object.get("items")
+		&& (items.is_array() || items.is_object())
+	{
+		result.insert("items".into(), normalize_strict_node(items, budget)?);
+	}
+	if let Some(prefix_items) = object.get("prefixItems")
+		&& prefix_items.is_array()
+	{
+		result.insert("prefixItems".into(), normalize_strict_node(prefix_items, budget)?);
+	}
+	for key in SCHEMA_COMBINATORS {
+		if let Some(variants) = object.get(*key)
+			&& variants.is_array()
+		{
+			result.insert((*key).into(), normalize_strict_node(variants, budget)?);
+		}
+	}
+	for key in ["$defs", "definitions"] {
+		if let Some(Value::Object(definitions)) = object.get(key) {
+			let mut normalized = Map::with_capacity(definitions.len());
+			for (name, definition) in definitions {
+				normalized.insert(name.clone(), normalize_strict_node(definition, budget)?);
+			}
+			result.insert(key.into(), Value::Object(normalized));
+		}
+	}
+	Some(Value::Object(result))
+}
+
+/// Detects strict-disqualifying keywords anywhere in the raw wire schema; the
+/// base normalizer spills several of them into descriptions, erasing the
+/// evidence, so this runs before normalization.
+fn has_strict_incompatible_keyword(schema: &Value) -> bool {
+	match schema {
+		Value::Array(entries) => entries.iter().any(has_strict_incompatible_keyword),
+		Value::Object(object) => {
+			STRICT_INCOMPATIBLE_KEYWORDS
+				.iter()
+				.any(|key| object.contains_key(*key))
+				|| object.values().any(has_strict_incompatible_keyword)
+		},
+		_ => false,
+	}
+}
+
+/// One planned tool `input_schema` and its strict promotion.
+struct ToolSchemaPlan {
+	input_schema: Value,
+	strict:       bool,
+}
+
+/// Plans every client tool's wire schema: the base whitelist normalization
+/// for all tools, then strict promotion for allowlisted strict-declared tools
+/// whose schemas fit Anthropic's strict subset within cross-tool budgets.
+fn plan_tool_schemas(tools: &[ToolDefinition]) -> Vec<ToolSchemaPlan> {
+	let mut plans: Vec<ToolSchemaPlan> = tools
+		.iter()
+		.map(|tool| ToolSchemaPlan {
+			input_schema: normalize_tool_schema(tool.input.wire_schema().0.as_value(), true),
+			strict:       false,
+		})
+		.collect();
+	let mut strict_tools = 0_usize;
+	let mut optional_used = 0_usize;
+	let mut union_used = 0_usize;
+	for (index, tool) in tools.iter().enumerate() {
+		if strict_tools >= MAX_STRICT_TOOLS {
+			break;
+		}
+		let (parameters, declared_strict) = tool.input.wire_schema();
+		if !declared_strict
+			|| !STRICT_TOOL_ALLOWLIST.contains(&tool.name.as_str())
+			|| has_strict_incompatible_keyword(parameters.as_value())
+		{
+			continue;
+		}
+		let mut budget = StrictBudget {
+			optional_remaining: MAX_STRICT_OPTIONAL_PARAMETERS - optional_used,
+			union_remaining:    MAX_STRICT_UNION_PARAMETERS - union_used,
+			optional_used:      0,
+			union_used:         0,
+		};
+		let Some(normalized @ Value::Object(_)) =
+			normalize_strict_node(&plans[index].input_schema, &mut budget)
+		else {
+			continue;
+		};
+		plans[index] = ToolSchemaPlan { input_schema: normalized, strict: true };
+		strict_tools += 1;
+		optional_used += budget.optional_used;
+		union_used += budget.union_used;
+	}
+	plans
 }
 
 fn lower_count_tokens(
@@ -686,21 +1144,18 @@ fn lower_count_tokens(
 	if claude_code_oauth {
 		prepend_claude_code_identity(&mut body.system);
 	}
-	for tool in request.tools.iter() {
-		let (parameters, strict) = tool.input.wire_schema();
-		let mut input_schema = parameters.as_value().clone();
-		spill_root_combinators(&mut input_schema);
+	for (tool, plan) in request.tools.iter().zip(plan_tool_schemas(&request.tools)) {
 		body.tools.push(Tool::Client(ClientTool {
-			name: if claude_code_oauth {
+			name:                  if claude_code_oauth {
 				claude_code_tool_name(&tool.name)
 			} else {
 				tool.name.clone()
 			},
-			description: tool.description.clone(),
-			input_schema,
-			strict: Some(strict),
+			description:           tool.description.clone(),
+			input_schema:          plan.input_schema,
+			strict:                plan.strict.then_some(true),
 			eager_input_streaming: None,
-			cache_control: None,
+			cache_control:         None,
 		}));
 	}
 	serde_json::to_vec(&body)
@@ -865,17 +1320,14 @@ pub fn lower_chat(
 			Role::Assistant => append_message(&mut body.messages, "assistant", blocks),
 		}
 	}
-	for tool in request.tools.iter() {
-		let (parameters, strict) = tool.input.wire_schema();
-		let mut input_schema = parameters.as_value().clone();
-		spill_root_combinators(&mut input_schema);
+	for (tool, plan) in request.tools.iter().zip(plan_tool_schemas(&request.tools)) {
 		body.tools.push(Tool::Client(ClientTool {
-			name: tool.name.clone(),
-			description: tool.description.clone(),
-			input_schema,
-			strict: Some(strict),
+			name:                  tool.name.clone(),
+			description:           tool.description.clone(),
+			input_schema:          plan.input_schema,
+			strict:                plan.strict.then_some(true),
 			eager_input_streaming: None,
-			cache_control: cache.clone(),
+			cache_control:         cache.clone(),
 		}));
 	}
 	for tool in request.hosted_tools.iter() {
@@ -2968,6 +3420,11 @@ mod tests {
 
 	#[test]
 	fn root_schema_combinators_spill_into_the_description() {
+		// Mirrors the real shell tool schema: root `allOf`, `minLength` on
+		// `command`, and `minimum` on `timeout_ms` — the exact keywords the
+		// live Messages validator rejects with 400s such as
+		// `tools.N.custom: For 'integer' type, property 'minimum' is not
+		// supported`.
 		let request = ChatRequest {
 			tools: Arc::from([ToolDefinition {
 				name:        sf!("shell"),
@@ -2977,6 +3434,8 @@ mod tests {
 						"type": "object",
 						"description": "Complete arguments.",
 						"properties": {
+							"command": {"type": "string", "minLength": 1},
+							"timeout_ms": {"type": "integer", "minimum": 0},
 							"name": {"anyOf": [{"type": "string"}, {"type": "null"}]}
 						},
 						"allOf": [{
@@ -2984,7 +3443,7 @@ mod tests {
 							"then": {"required": ["name"]}
 						}]
 					})),
-					strict:     false,
+					strict:     true,
 				},
 			}]),
 			tool_choice: Setting::Unset,
@@ -3004,8 +3463,151 @@ mod tests {
 		let schema = tool.input_schema.as_object().expect("object schema");
 		assert!(!schema.contains_key("allOf"));
 		let description = schema["description"].as_str().expect("description");
-		assert!(description.starts_with("Complete arguments.\n\nallOf: [{\"if\""));
+		assert!(description.starts_with("Complete arguments.\n\n{allOf: [{\"if\""));
 		assert!(schema["properties"]["name"].get("anyOf").is_some());
+		assert_eq!(schema["additionalProperties"], Value::Bool(false));
+		// Declared strict, but the root `allOf` in the raw schema disqualifies
+		// strict promotion; the flag stays off the wire entirely.
+		assert!(tool.strict.is_none());
+		let serialized = serde_json::to_string(&body.tools[0]).expect("tool serializes");
+		assert!(!serialized.contains(r#""minimum""#));
+		assert!(!serialized.contains(r#""minLength""#));
+		assert!(!serialized.contains(r#""strict""#));
+		assert!(serialized.contains(r#"{minLength: 1}"#));
+		assert!(serialized.contains(r#"{minimum: 0}"#));
+	}
+
+	#[test]
+	fn unsupported_keywords_spill_into_property_descriptions() {
+		// Anthropic 400: `tools.N.custom: For 'integer' type, property
+		// 'minimum' is not supported`. Constraint keywords outside the
+		// whitelist demote into the property description instead of reaching
+		// the wire.
+		let normalized = normalize_tool_schema(
+			&serde_json::json!({
+				"type": "object",
+				"properties": {
+					"limit": {
+						"type": "integer",
+						"minimum": 1,
+						"maximum": 10,
+						"description": "max results"
+					},
+					"pattern": {"type": "string", "pattern": "^x", "format": "regex"},
+					"when": {"type": "string", "format": "date-time"}
+				},
+				"required": ["limit"]
+			}),
+			true,
+		);
+		let limit = &normalized["properties"]["limit"];
+		assert!(limit.get("minimum").is_none());
+		assert!(limit.get("maximum").is_none());
+		assert_eq!(
+			limit["description"].as_str().expect("description"),
+			"max results\n\n{minimum: 1, maximum: 10}"
+		);
+		let pattern = &normalized["properties"]["pattern"];
+		assert!(pattern.get("pattern").is_none());
+		assert_eq!(
+			pattern["description"].as_str().expect("description"),
+			"{pattern: \"^x\", format: \"regex\"}"
+		);
+		assert_eq!(normalized["properties"]["when"]["format"], "date-time");
+		assert_eq!(normalized["additionalProperties"], Value::Bool(false));
+	}
+
+	#[test]
+	fn strict_promotion_is_allowlisted_and_falls_back_on_open_maps() {
+		let closed = OpaqueJson::new(serde_json::json!({
+			"type": "object",
+			"properties": {
+				"command": {"type": "string"},
+				"timeout": {"type": "integer"}
+			},
+			"required": ["command"]
+		}));
+		let tools: Arc<[ToolDefinition]> = Arc::from([
+			ToolDefinition {
+				name:        sf!("bash"),
+				description: None,
+				input:       ToolInputConstraint::JsonSchema {
+					parameters: closed.clone(),
+					strict:     true,
+				},
+			},
+			ToolDefinition {
+				name:        sf!("todo"),
+				description: None,
+				input:       ToolInputConstraint::JsonSchema {
+					parameters: closed.clone(),
+					strict:     true,
+				},
+			},
+			ToolDefinition {
+				name:        sf!("edit"),
+				description: None,
+				input:       ToolInputConstraint::JsonSchema {
+					parameters: OpaqueJson::new(serde_json::json!({
+						"type": "object",
+						"properties": {"data": {"type": "object", "additionalProperties": true}},
+						"required": ["data"]
+					})),
+					strict:     true,
+				},
+			},
+		]);
+		let plans = plan_tool_schemas(&tools);
+		// Allowlisted, closed object: promoted; the optional `timeout`
+		// property stays optional within the optional budget.
+		assert!(plans[0].strict);
+		assert_eq!(plans[0].input_schema["required"], serde_json::json!(["command"]));
+		assert!(
+			plans[0].input_schema["properties"]["timeout"]
+				.get("anyOf")
+				.is_none()
+		);
+		// Not allowlisted: base plan only.
+		assert!(!plans[1].strict);
+		// Explicit open map inside an allowlisted tool demotes to non-strict
+		// instead of fabricating a closed object.
+		assert!(!plans[2].strict);
+		assert_eq!(
+			plans[2].input_schema["properties"]["data"]["additionalProperties"],
+			Value::Bool(true)
+		);
+	}
+
+	#[test]
+	fn strict_optional_budget_exhaustion_makes_remaining_properties_nullable() {
+		let mut properties = Map::new();
+		for index in 0..26 {
+			properties.insert(format!("p{index:02}"), serde_json::json!({"type": "string"}));
+		}
+		let schema = serde_json::json!({"type": "object", "properties": properties});
+		let tools: Arc<[ToolDefinition]> = Arc::from([ToolDefinition {
+			name:        sf!("bash"),
+			description: None,
+			input:       ToolInputConstraint::JsonSchema {
+				parameters: OpaqueJson::new(schema),
+				strict:     true,
+			},
+		}]);
+		let plans = plan_tool_schemas(&tools);
+		assert!(plans[0].strict);
+		let required = plans[0].input_schema["required"]
+			.as_array()
+			.expect("required");
+		assert_eq!(required.len(), 2);
+		assert_eq!(required[0], "p24");
+		let nullable = &plans[0].input_schema["properties"]["p24"];
+		assert!(
+			nullable["anyOf"]
+				.as_array()
+				.expect("anyOf wrapper")
+				.iter()
+				.any(|variant| variant["type"] == "null")
+		);
 	}
 
 	#[test]
