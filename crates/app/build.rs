@@ -9,14 +9,16 @@
 //! can resolve code and data symbols when they are loaded.
 
 use std::{
-	env,
+	env, fs,
 	path::{Path, PathBuf},
+	process::Command,
 };
 
 fn main() {
 	println!("cargo::rerun-if-env-changed=PYO3_CONFIG_FILE");
 
 	let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+	write_changelog(&manifest);
 	let vendor = env::var_os("PYO3_CONFIG_FILE")
 		.map(PathBuf::from)
 		.and_then(|p| {
@@ -59,4 +61,32 @@ fn main() {
 	if let Some(link_arg) = link_arg {
 		println!("cargo::rustc-link-arg={link_arg}");
 	}
+}
+fn write_changelog(manifest: &Path) {
+	let workspace = manifest.join("../..");
+	println!("cargo::rerun-if-changed={}", workspace.join(".git/packed-refs").display());
+	println!("cargo::rerun-if-changed={}", workspace.join(".git/refs/tags").display());
+	let generated = Command::new("git")
+		.arg("-C")
+		.arg(&workspace)
+		.args([
+			"for-each-ref",
+			"--sort=-version:refname",
+			"--format=## %(refname:short) — %(creatordate:short)%0a%0a%(contents:subject)%0a",
+			"refs/tags",
+		])
+		.output()
+		.ok()
+		.filter(|output| output.status.success() && !output.stdout.is_empty())
+		.map(|output| output.stdout)
+		.unwrap_or_else(|| {
+			format!(
+				"## v{}\n\nCurrent release.\n",
+				env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "unknown".to_owned())
+			)
+			.into_bytes()
+		});
+	let output =
+		PathBuf::from(env::var_os("OUT_DIR").expect("Cargo provides OUT_DIR")).join("changelog.md");
+	fs::write(output, generated).expect("write embedded changelog");
 }

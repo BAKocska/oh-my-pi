@@ -8359,6 +8359,7 @@ dependencies = [
  "hmac 0.12.1",
  "omp-core",
  "omp-storage",
+ "parking_lot",
  "pretty_assertions",
  "regex",
  "serde_json",
