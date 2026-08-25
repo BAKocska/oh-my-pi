@@ -241,4 +241,57 @@ describe("working-memory transcript chunk migration", () => {
 		).toBe(first.children);
 		verify.close();
 	});
+
+	it("validates against chunk order even when physical row order is scrambled", () => {
+		const { dbPath, sourceId } = seedDb();
+		const { migrate, validate } = migrationFns();
+		// Replace the parent with a transcript whose SINGLE message must split across several
+		// chunks: intra-message piece order is the only thing `reconstructRetentionChunks`
+		// takes from chunk order, so a multi-chunk message is what makes ordering observable.
+		const oversized = prepareRetentionTranscript(
+			[{ role: "user", content: Array.from({ length: 40 }, (_, i) => `sentence ${i} of the runbook.`).join(" ") }],
+			true,
+		).transcript;
+		if (oversized === null) throw new Error("expected oversized transcript");
+		const seedDbHandle = new Database(dbPath);
+		seedDbHandle.run("UPDATE working_memory SET content = ?, embed_text = ? WHERE id = ?", [
+			oversized,
+			oversized,
+			sourceId,
+		]);
+		seedDbHandle.close();
+		migrate({ dbPath, maxChars: 180 });
+
+		const db = new Database(dbPath);
+		const rows = db
+			.query<Record<string, unknown>, [string]>(
+				"SELECT * FROM working_memory WHERE json_extract(metadata_json,'$.chunk_of') = ? ORDER BY rowid",
+			)
+			.all(sourceId);
+		expect(rows.length).toBeGreaterThan(1);
+		const first = rows[0];
+		if (first === undefined) throw new Error("expected children");
+		const columns = Object.keys(first);
+		db.run("BEGIN");
+		db.run("DELETE FROM working_memory WHERE json_extract(metadata_json,'$.chunk_of') = ?", [sourceId]);
+		for (const row of [...rows].reverse()) {
+			db.run(
+				`INSERT INTO working_memory (${columns.join(", ")}) VALUES (${columns.map(() => "?").join(", ")})`,
+				columns.map(column => row[column] as never),
+			);
+		}
+		db.run("COMMIT");
+		const physical = db
+			.query<{ id: string }, [string]>(
+				"SELECT id FROM working_memory WHERE json_extract(metadata_json,'$.chunk_of') = ? ORDER BY rowid",
+			)
+			.all(sourceId)
+			.map(row => row.id);
+		expect(physical).toEqual(rows.map(row => row.id as string).reverse());
+		db.close();
+
+		const validation = validate(dbPath, sourceId);
+		expect(validation.valid).toBe(true);
+		expect(validation.reconstructedHash).toBe(validation.sourceHash);
+	});
 });

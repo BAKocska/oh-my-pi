@@ -487,6 +487,18 @@ describe("Mnemopi backend lifecycle", () => {
 		expect(state.hasRecalledForFirstTurn).toBe(false);
 	});
 
+	it("passes the configured length normalization and score floor into every scoped recall", async () => {
+		const state = registerMnemopiState(
+			makeMnemopiConfig({ recallLengthNormalization: "log", recallScoreFloor: 0.25 }),
+		);
+		const spy = vi.spyOn(state.getScopedRecallTargets()[0].memory, "recallEnhanced").mockResolvedValue([]);
+
+		await state.collectScopedRecallResults("what changed recently");
+
+		expect(spy).toHaveBeenCalledTimes(1);
+		expect(spy.mock.calls[0]?.[2]).toMatchObject({ lengthNormalization: "log", scoreFloor: 0.25 });
+	});
+
 	it("contains unavailable-bank failures from agent-end retention", async () => {
 		const listeners = new Set<AgentSessionEventListener>();
 		const entries = [{ type: "message", message: { role: "user", content: "turn one" } }];
