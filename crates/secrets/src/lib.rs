@@ -1,7 +1,6 @@
 //! Secret-rule validation and deterministic masking primitives.
-use std::sync::Mutex;
-
 use omp_core::Str;
+use parking_lot::Mutex;
 use thiserror::Error;
 
 /// Streaming placeholder-boundary withholding.
@@ -86,10 +85,7 @@ impl SecretMaskingAuthority {
 		rule: SecretRule,
 	) -> Result<(), SecretMaskingError> {
 		self.validate_owner(owner, generation)?;
-		let mut state = self
-			.state
-			.lock()
-			.map_err(|_| SecretMaskingError::Unavailable)?;
+		let mut state = self.state.lock();
 		if state.sealed {
 			return Err(SecretMaskingError::Sealed);
 		}
@@ -109,10 +105,7 @@ impl SecretMaskingAuthority {
 		text: &str,
 	) -> Result<String, SecretMaskingError> {
 		self.validate_owner(owner, generation)?;
-		let mut state = self
-			.state
-			.lock()
-			.map_err(|_| SecretMaskingError::Unavailable)?;
+		let mut state = self.state.lock();
 		if !state.sealed {
 			let rules = mem::take(&mut state.rules);
 			state.transform = Some(SecretObfuscator::new(rules, self.key.clone()));
@@ -126,12 +119,8 @@ impl SecretMaskingAuthority {
 	}
 
 	/// Returns whether this activation's declarations are immutable.
-	pub fn is_sealed(&self) -> Result<bool, SecretMaskingError> {
-		Ok(self
-			.state
-			.lock()
-			.map_err(|_| SecretMaskingError::Unavailable)?
-			.sealed)
+	pub fn is_sealed(&self) -> bool {
+		self.state.lock().sealed
 	}
 
 	fn validate_owner(&self, owner: &str, generation: u64) -> Result<(), SecretMaskingError> {
@@ -171,7 +160,4 @@ pub enum SecretMaskingError {
 	/// The activation exceeded its bounded declaration budget.
 	#[error("secret declaration limit exceeded")]
 	TooManyRules,
-	/// The masking state lock was poisoned.
-	#[error("secret masking authority is unavailable")]
-	Unavailable,
 }
