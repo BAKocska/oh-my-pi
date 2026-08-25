@@ -20,11 +20,10 @@ function voiceHit(memoryId: string, voice: "vector" | "graph" | "fact" | "tempor
 }
 
 describe("injectable voice weights", () => {
-	test("default engine keeps the measured Phase-1 literal", () => {
+	test("default engine keeps the holdout-adopted round-3 weights", () => {
 		const engine = makeEngine();
-		expect(engine.voiceWeights).toEqual({ vector: 0.15, graph: 0.55, fact: 0.2, temporal: 0.1 });
+		expect(engine.voiceWeights).toEqual({ vector: 0.2, graph: 0.4, fact: 0.4, temporal: 0 });
 	});
-
 	test("injected weights flip fusion order between single-voice candidates", () => {
 		const vectorHeavy = makeEngine({ vector: 0.9, graph: 0.05, fact: 0.03, temporal: 0.02 });
 		const combinedVector = vectorHeavy.combineVoices(voiceHit("row-vec", "vector"), voiceHit("row-graph", "graph"));

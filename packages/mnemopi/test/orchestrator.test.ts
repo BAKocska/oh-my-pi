@@ -126,7 +126,7 @@ describe("orchestrateRecall", () => {
 			expect(beam.enhancedCalls).toBe(0);
 			expect(results[0]?.id).toBe("m-poly");
 			// Weighted RRF: graph contributes voiceWeights.graph / (RRF_K + rank).
-			expect(results[0]?.voice_scores).toEqual({ graph: 0.55 / 61 });
+			expect(results[0]?.voice_scores).toEqual({ graph: 0.4 / 61 });
 		} finally {
 			closeQuietly(beam.db);
 		}

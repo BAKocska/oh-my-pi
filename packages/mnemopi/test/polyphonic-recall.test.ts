@@ -111,9 +111,9 @@ describe("PolyphonicRecallEngine", () => {
 			expect(results.map(result => result.id).sort()).toEqual(["m1", "m2", "m3"]);
 			const byId = new Map(results.map(result => [result.id, result]));
 			// Weighted RRF: contribution is voiceWeights[voice] / (RRF_K + rank).
-			expect(byId.get("m2")?.voice_scores).toEqual({ vector: 0.15 / 61, graph: 0.55 / 61 });
-			expect(byId.get("m1")?.voice_scores).toEqual({ vector: 0.15 / 62, fact: 0.2 / 61 });
-			expect(byId.get("m3")?.voice_scores).toEqual({ temporal: 0.1 / 61 });
+			expect(byId.get("m2")?.voice_scores).toEqual({ vector: 0.2 / 61, graph: 0.4 / 61 });
+			expect(byId.get("m1")?.voice_scores).toEqual({ vector: 0.2 / 62, fact: 0.4 / 61 });
+			expect(byId.get("m3")?.voice_scores).toEqual({ temporal: 0 / 61 });
 			// MMR seeds from the highest-RRF candidate, so the top-scored memory still leads.
 			expect(results[0]?.id).toBe("m2");
 			expect(byId.get("m2")?.score).toBeGreaterThan(byId.get("m1")?.score ?? 0);
@@ -343,7 +343,7 @@ describe("PolyphonicRecallEngine", () => {
 			process.env.MNEMOPI_VOICE_TEMPORAL = "0";
 			const results = engine.recall("Alice recent", [1, 0], 10);
 			expect(results.map(result => result.id)).toEqual(["m1"]);
-			expect(results[0]?.voice_scores).toEqual({ fact: 0.2 / 61 });
+			expect(results[0]?.voice_scores).toEqual({ fact: 0.4 / 61 });
 		} finally {
 			closeQuietly(beam.db);
 		}

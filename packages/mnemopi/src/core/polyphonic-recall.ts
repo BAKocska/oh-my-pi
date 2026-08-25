@@ -52,12 +52,22 @@ export interface PolyphonicRecallEngineOptions {
 	readonly scoreFloor?: number;
 }
 
-/** Measured production default; see the field doc on {@link PolyphonicRecallEngine.voiceWeights}. */
+/**
+ * Measured production default; see the field doc on {@link PolyphonicRecallEngine.voiceWeights}.
+ *
+ * Round-3 adoption (2026-08-25): `.2/.4/.4/0` replaced the Phase-1 `.15/.55/.2/.1` after a
+ * pre-registered paired holdout evaluation on a 443-case labelled benchmark (165 never-tuned
+ * holdout cases, both configs through this exact production path): aggregate nDCG@8
+ * .3943 → .4044 (+1.01pts, paired mean +0.64 ± 0.42 SE), every per-class R@8 delta within
+ * the frozen −5pt bound (worst: graph −1.87pts), negative FPR unchanged. Selection rule:
+ * validation-argmax among configs improving BOTH dev and validation splits. Receipts:
+ * work/r3-holdout-verdict.json, work/r3-weight-receipt.json, work/r3-paired-bundle.json.
+ */
 const DEFAULT_VOICE_WEIGHTS: Readonly<Record<PolyphonicVoice, number>> = Object.freeze({
-	vector: 0.15,
-	graph: 0.55,
-	fact: 0.2,
-	temporal: 0.1,
+	vector: 0.2,
+	graph: 0.4,
+	fact: 0.4,
+	temporal: 0,
 });
 
 interface PolyphonicEngineOptions {
