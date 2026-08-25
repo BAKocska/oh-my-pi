@@ -451,6 +451,25 @@ impl AgentRegistry {
 		})
 	}
 
+	/// Removes one record by id, freeing its display alias for a successor.
+	///
+	/// Returns whether a record existed. Live routing state is separate and is
+	/// removed through [`Broker::unregister`].
+	pub fn remove(&self, id: &str) -> bool {
+		let removed = {
+			let mut records = self.inner.records.lock();
+			let key = records
+				.keys()
+				.find(|key| key.as_str().eq_ignore_ascii_case(id))
+				.cloned();
+			key.is_some_and(|key| records.remove(&key).is_some())
+		};
+		if removed {
+			self.bump_generation();
+		}
+		removed
+	}
+
 	/// Replaces durable transcript, model, task, and historical result facts.
 	pub fn set_history(
 		&self,
@@ -949,11 +968,23 @@ impl Broker {
 	}
 
 	/// Registers a messageable live node and returns its bounded inbox.
+	///
+	/// A main-kind node supersedes any previous main incarnation holding the
+	/// same display alias: the retired record and its routing entry are
+	/// removed so session switches (`/new`, resume) re-register cleanly.
 	pub fn register(
 		&self,
 		node: &AgentNode,
 		mailbox: MailboxSender,
 	) -> Result<BrokerInbox, RegistryError> {
+		if node.kind == AgentKind::Main
+			&& let Some((previous, _)) = self.inner.registry.record(node.name.as_str())
+			&& previous.kind == AgentKind::Main
+			&& !previous.id.as_str().eq_ignore_ascii_case(node.id.as_str())
+		{
+			self.unregister(previous.id.as_str());
+			self.inner.registry.remove(previous.id.as_str());
+		}
 		self
 			.inner
 			.registry
@@ -1872,6 +1903,60 @@ mod tests {
 				.id,
 			node.id
 		);
+	}
+
+	#[test]
+	fn main_succession_reclaims_alias_and_routing() {
+		let registry = AgentRegistry::new();
+		let broker = Broker::with_registry("project".into(), registry.clone());
+		let tree = AgentTree::standard(2);
+		let first = tree
+			.register(
+				"session-a".into(),
+				"Main".into(),
+				AgentKind::Main,
+				None,
+				"session-a".into(),
+				Budget::default(),
+			)
+			.expect("first main");
+		let first_mailbox = Mailbox::new();
+		let first_inbox = broker
+			.register(&first, first_mailbox.sender())
+			.expect("register first main");
+		let second = tree
+			.register(
+				"session-b".into(),
+				"Main".into(),
+				AgentKind::Main,
+				None,
+				"session-b".into(),
+				Budget::default(),
+			)
+			.expect("second main");
+		let second_mailbox = Mailbox::new();
+		let second_inbox = broker
+			.register(&second, second_mailbox.sender())
+			.expect("superseding main reclaims the alias");
+		assert!(registry.record("session-a").is_none());
+		assert_eq!(
+			registry
+				.record("Main")
+				.expect("alias follows successor")
+				.0
+				.id
+				.as_str(),
+			"session-b"
+		);
+		assert_eq!(
+			broker
+				.send(message("peer", "Main", 0))
+				.expect("route")
+				.as_slice(),
+			[Receipt::Woken]
+		);
+		assert_eq!(second_inbox.unread_count(), 1);
+		assert_eq!(first_inbox.unread_count(), 0);
 	}
 
 	#[test]
