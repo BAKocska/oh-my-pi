@@ -609,15 +609,24 @@ function ftsRows(
 ): Row[] {
 	if (!tableExists(beam, table)) return [];
 	try {
+		// Superseded rows stay in the FTS mirrors (their content never changed) but must not
+		// occupy LIMIT slots — visibility filtering would drop them AFTER they displaced live rows.
 		if (table === "fts_working") {
-			return queryAll(beam, "SELECT id, rank FROM fts_working WHERE fts_working MATCH ? ORDER BY rank, id LIMIT ?", [
-				ftsQuery(query, useSynonyms),
-				limit,
-			]);
+			return queryAll(
+				beam,
+				`SELECT id, rank FROM fts_working
+				 WHERE fts_working MATCH ?
+				   AND id IN (SELECT id FROM working_memory WHERE superseded_by IS NULL)
+				 ORDER BY rank, id LIMIT ?`,
+				[ftsQuery(query, useSynonyms), limit],
+			);
 		}
 		return queryAll(
 			beam,
-			"SELECT rowid, rank FROM fts_episodes WHERE fts_episodes MATCH ? ORDER BY rank, rowid LIMIT ?",
+			`SELECT rowid, rank FROM fts_episodes
+			 WHERE fts_episodes MATCH ?
+			   AND rowid IN (SELECT rowid FROM episodic_memory WHERE superseded_by IS NULL)
+			 ORDER BY rank, rowid LIMIT ?`,
 			[ftsQuery(query, useSynonyms), limit],
 		);
 	} catch {
