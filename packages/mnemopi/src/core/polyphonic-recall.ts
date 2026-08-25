@@ -52,6 +52,14 @@ export interface PolyphonicRecallEngineOptions {
 	readonly scoreFloor?: number;
 }
 
+/** Measured production default; see the field doc on {@link PolyphonicRecallEngine.voiceWeights}. */
+const DEFAULT_VOICE_WEIGHTS: Readonly<Record<PolyphonicVoice, number>> = Object.freeze({
+	vector: 0.15,
+	graph: 0.55,
+	fact: 0.2,
+	temporal: 0.1,
+});
+
 interface PolyphonicEngineOptions {
 	readonly dbPath?: DatabasePath;
 	readonly db?: Database;
@@ -59,6 +67,13 @@ interface PolyphonicEngineOptions {
 	readonly consolidator?: VeracityConsolidator;
 	readonly sessionId?: string | null;
 	readonly channelId?: string | null;
+	/**
+	 * Per-voice RRF weight override for A/B evaluation harnesses, so a CHALLENGER weight
+	 * config runs through the exact production path (combineVoices + diversityRerank +
+	 * hydration) instead of a re-implementation. Absent = the measured production default;
+	 * production callers never pass this.
+	 */
+	readonly voiceWeights?: Readonly<Record<PolyphonicVoice, number>>;
 }
 
 interface MemoryHydrationRow {
@@ -970,13 +985,11 @@ export class PolyphonicRecallEngine {
 	 * toward the vector voice hurts exactly the queries that need the graph voice's breadth.
 	 * These weights scored best in that sweep (multi-topic P@20 0.805, nDCG 0.819) while
 	 * leaving single-topic results unchanged.
+	 *
+	 * Overridable ONLY via {@link PolyphonicEngineOptions.voiceWeights} (A/B evaluation
+	 * harnesses); every production construction path leaves it at this default.
 	 */
-	readonly voiceWeights: Readonly<Record<PolyphonicVoice, number>> = Object.freeze({
-		vector: 0.15,
-		graph: 0.55,
-		fact: 0.2,
-		temporal: 0.1,
-	});
+	readonly voiceWeights: Readonly<Record<PolyphonicVoice, number>>;
 	/** Memoised subject dictionary. See {@link subjectDictionary} and {@link invalidateDictionary}. */
 	#dictionary: readonly string[] | null = null;
 	#dictionaryStamp = "";
@@ -1009,6 +1022,17 @@ export class PolyphonicRecallEngine {
 		this.consolidator = options.consolidator ?? new VeracityConsolidator(this.dbPath, this.db);
 		this.sessionId = options.sessionId ?? "default";
 		this.channelId = options.channelId ?? null;
+		if (options.voiceWeights !== undefined) {
+			for (const voice of ["vector", "graph", "fact", "temporal"] as const) {
+				const weight = options.voiceWeights[voice];
+				if (typeof weight !== "number" || !Number.isFinite(weight) || weight < 0) {
+					throw new Error(`voiceWeights.${voice} must be a finite non-negative number, got ${String(weight)}`);
+				}
+			}
+			this.voiceWeights = Object.freeze({ ...options.voiceWeights });
+		} else {
+			this.voiceWeights = DEFAULT_VOICE_WEIGHTS;
+		}
 	}
 
 	/**
