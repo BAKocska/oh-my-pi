@@ -6018,15 +6018,28 @@ impl EnvServer {
 			.await;
 			return;
 		}
-		if connection.invocation_ids.contains_key(&invocation_id) {
-			send_error(
-				responses,
-				request_id,
-				pb::ProtocolErrorCode::AlreadyExists,
-				"invocation_id is already open on this connection",
-			)
-			.await;
-			return;
+		if let Some(open_request) = connection.invocation_ids.get(&invocation_id).copied() {
+			// A terminal invocation only awaits its `Finished` sweep; its id is
+			// free for a replacement open (the client observed the terminal
+			// verdict before reopening).
+			let live = match connection.requests.get(&open_request) {
+				None | Some(RequestState::InvocationFinishing) => false,
+				Some(RequestState::Invocation(InvocationState::Native { lifecycle, .. })) => {
+					!lifecycle.is_terminal()
+				},
+				Some(_) => true,
+			};
+			if live {
+				send_error(
+					responses,
+					request_id,
+					pb::ProtocolErrorCode::AlreadyExists,
+					"invocation_id is already open on this connection",
+				)
+				.await;
+				return;
+			}
+			connection.invocation_ids.remove(&invocation_id);
 		}
 		let registry = self.registry();
 		let Some((_, revision)) = registry.live_identity(&request.name) else {
