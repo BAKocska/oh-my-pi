@@ -193,7 +193,7 @@ pub use regime::{
 	RegimeStepResult, RegimeWhen, Resource, ResourceDecl, ResourceRegistry, RevivalReport,
 	ScopedSetting, SettingSlot, StartError, StartOptions, StartReceipt, StopError,
 	SubagentYieldRegime, WaitError, WaitSet, WaitTicket, autoresearch_regime_spec, core_regime,
-	goal_regime_spec, plan_regime_spec, vibe_regime_spec,
+	goal_regime_spec, plan_regime_spec, prewalk_regime_spec, vibe_regime_spec,
 };
 pub use revival::{RevivalError, RevivedSession, revive, revive_existing};
 pub use schedule::{

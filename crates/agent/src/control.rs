@@ -7,6 +7,7 @@
 
 use std::{
 	collections::{BTreeMap, VecDeque},
+	path::PathBuf,
 	sync::{
 		Arc,
 		atomic::{AtomicU64, Ordering},
@@ -29,7 +30,7 @@ use crate::{
 	AgentHostControl, ArbiterError, core_regime,
 	journal::{
 		Journal, JournalCustomEntry, JournalError, JournalQuery, JournalReply, JournalRequest,
-		SessionStateValue, SessionStateWatchEvent,
+		SessionStateValue, SessionStateWatchEvent, WorkspaceRoots,
 	},
 	journal_kinds::EntryKindDecl,
 	r#loop,
@@ -341,6 +342,41 @@ impl ControlSender {
 		self
 			.commands
 			.send(ControlCommand::ModelOverride { ts, model, reply })
+			.map_err(|_| ControlError::Closed)?;
+		response
+			.recv_async()
+			.await
+			.map_err(|_| ControlError::Closed)?
+			.map_err(ControlError::from)
+	}
+
+	/// Reads the durable effective workspace-root projection from the journal
+	/// owner.
+	///
+	/// # Errors
+	/// Returns a closed-owner or typed journal query failure.
+	pub async fn workspace_roots(&self) -> Result<WorkspaceRoots, ControlError> {
+		let (reply, response) = flume::bounded(1);
+		self
+			.commands
+			.send(ControlCommand::WorkspaceRoots { reply })
+			.map_err(|_| ControlError::Closed)?;
+		response
+			.recv_async()
+			.await
+			.map_err(|_| ControlError::Closed)?
+			.map_err(ControlError::from)
+	}
+
+	/// Appends a future primary workspace-root change through the journal owner.
+	///
+	/// # Errors
+	/// Returns a closed-owner or typed journal transition failure.
+	pub async fn move_workspace_root(&self, ts: u64, root: PathBuf) -> Result<u64, ControlError> {
+		let (reply, response) = flume::bounded(1);
+		self
+			.commands
+			.send(ControlCommand::MoveWorkspaceRoot { ts, root, reply })
 			.map_err(|_| ControlError::Closed)?;
 		response
 			.recv_async()
@@ -782,6 +818,14 @@ pub(crate) enum ControlCommand {
 		model: ModelChange,
 		reply: flume::Sender<JournalReplyResult<u64>>,
 	},
+	WorkspaceRoots {
+		reply: flume::Sender<JournalReplyResult<WorkspaceRoots>>,
+	},
+	MoveWorkspaceRoot {
+		ts:    u64,
+		root:  PathBuf,
+		reply: flume::Sender<JournalReplyResult<u64>>,
+	},
 	SetTitle {
 		ts:     u64,
 		title:  Str,
@@ -865,6 +909,17 @@ fn handle_command(
 		},
 		ControlCommand::ModelOverride { ts, model, reply } => {
 			let _ = reply.send(journal.model_override(ts, model));
+		},
+		ControlCommand::WorkspaceRoots { reply } => {
+			let result = journal.load().and_then(|view| {
+				let primary = view.header().cwd.clone();
+				drop(view);
+				journal.workspace_roots(&primary)
+			});
+			let _ = reply.send(result);
+		},
+		ControlCommand::MoveWorkspaceRoot { ts, root, reply } => {
+			let _ = reply.send(journal.move_workspace_root(ts, root));
 		},
 		ControlCommand::SetTitle { ts, title, source, reply } => {
 			let _ = reply.send(journal.append_title(ts, title, source));
@@ -979,4 +1034,50 @@ fn handle_command(
 		},
 	}
 	ControlMailboxEvent::JournalHandled
+}
+#[cfg(test)]
+mod tests {
+	use omp_storage::transcript::{Header, SessionId};
+
+	use super::*;
+
+	#[tokio::test]
+	async fn workspace_root_commands_run_on_the_journal_owner_and_persist() {
+		let temp = tempfile::tempdir().unwrap();
+		let primary = temp.path().join("primary");
+		let moved = temp.path().join("moved");
+		std::fs::create_dir(&primary).unwrap();
+		std::fs::create_dir(&moved).unwrap();
+		let path = temp.path().join("session.jsonl");
+		let mut journal = Journal::create(&path, &Header {
+			v:       4,
+			id:      SessionId(Str::new_static("workspace-control-test")),
+			created: 1,
+			cwd:     primary.clone(),
+		})
+		.unwrap();
+		let (sender, mailbox) = channel();
+
+		let requester = async {
+			sender.move_workspace_root(2, moved.clone()).await.unwrap();
+			sender.workspace_roots().await.unwrap()
+		};
+		let owner = async {
+			assert!(matches!(
+				mailbox.handle_next(&mut journal).await,
+				ControlMailboxEvent::JournalHandled
+			));
+			assert!(matches!(
+				mailbox.handle_next(&mut journal).await,
+				ControlMailboxEvent::JournalHandled
+			));
+		};
+		let (roots, ()) = tokio::join!(requester, owner);
+		assert_eq!(roots.primary(), moved);
+		assert_eq!(roots.secondary(), &[primary.clone()]);
+
+		drop(journal);
+		let reopened = Journal::open(&path).unwrap();
+		assert_eq!(reopened.workspace_roots(&primary).unwrap().primary(), moved);
+	}
 }

@@ -414,6 +414,16 @@ pub fn vibe_regime_spec() -> RegimeSpec {
 	regime_spec("vibe", [Resource::Mode, Resource::Director])
 }
 
+/// Returns the one-shot cheap-model prewalk declaration.
+pub fn prewalk_regime_spec() -> RegimeSpec {
+	let mut spec = regime_spec("prewalk", [Resource::Mode]);
+	spec.sets = Arc::from([
+		ScopedSetting { slot: SettingSlot::PromptSlot, value: Str::new_static("prewalk") },
+		ScopedSetting { slot: SettingSlot::ModelRoute, value: Str::new_static("smol") },
+	]);
+	spec
+}
+
 /// Returns the core goal regime declaration.
 pub fn goal_regime_spec() -> RegimeSpec {
 	let mut spec = regime_spec("goal", [Resource::Mode]);
@@ -579,6 +589,7 @@ pub fn core_regime(id: &str) -> Option<(Arc<RegimeSpec>, Box<dyn Regime>)> {
 	let (spec, machine): (RegimeSpec, Box<dyn Regime>) = match id {
 		"plan" => (plan_regime_spec(), Box::new(BuiltinRegime)),
 		"vibe" => (vibe_regime_spec(), Box::new(BuiltinRegime)),
+		"prewalk" => (prewalk_regime_spec(), Box::new(BuiltinRegime)),
 		"goal" => (goal_regime_spec(), Box::new(GoalRegime::default())),
 		"autoresearch" => (autoresearch_regime_spec(), Box::new(BuiltinRegime)),
 		_ => return None,
@@ -1922,6 +1933,23 @@ mod builtin_tests {
 			RegimeContext { point, facts, activation: "test", committed_steps: 0, effects };
 		regime.apply(&mut context, Next { control }).unwrap();
 		draft
+	}
+
+	#[test]
+	fn prewalk_scopes_cheap_model_and_prompt_until_mutation() {
+		let spec = prewalk_regime_spec();
+		assert_eq!(spec.owns.as_ref(), &[Resource::Mode]);
+		assert!(
+			spec.sets.iter().any(|setting| {
+				setting.slot == SettingSlot::PromptSlot && setting.value == "prewalk"
+			})
+		);
+		assert!(
+			spec
+				.sets
+				.iter()
+				.any(|setting| { setting.slot == SettingSlot::ModelRoute && setting.value == "smol" })
+		);
 	}
 
 	#[test]

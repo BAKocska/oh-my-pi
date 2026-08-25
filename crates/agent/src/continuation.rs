@@ -130,6 +130,9 @@ impl LoopSignal {
 pub trait ContinuationSource: Send + Sync {
 	/// Returns a candidate and its owner policy from Core loop evidence.
 	fn decide(&self, signal: &LoopSignal, now_ms: u64) -> (Continuation, ContinuationPolicy);
+	/// Refreshes application projections after an automatic core regime
+	/// transition.
+	fn sync_regimes(&self, _regimes: &crate::RegimeSet) {}
 }
 /// Built-in participant lanes evaluated by the SETTLE arbiter.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

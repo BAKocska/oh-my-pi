@@ -250,8 +250,8 @@ pub(crate) use crate::arbiter::context::{ActiveCheckpoint, CheckpointState, Comp
 use crate::{
 	AgentSettled, AgentSnapshot, ArbiterError, AutolearnController, AutolearnSettings,
 	CaptureDecision, CommittedCall, ControlError, Interrupt, InterruptClass, InterruptSource,
-	ProviderErrorEvent, Regime, RegimeSpec, RevivalReport, ScopedSetting, SettingSlot, StartOptions,
-	StartReceipt, TurnOptions, TurnReceipt, WaitError, WaitSet,
+	ProviderErrorEvent, Regime, RegimeSpec, Resource, RevivalReport, ScopedSetting, SettingSlot,
+	StartOptions, StartReceipt, TurnOptions, TurnReceipt, WaitError, WaitSet,
 	arbiter::ResolvedEvent,
 	attachments, batch, capture_interrupt, demote_interrupted_reasoning, effects_mutate_environment,
 	execute_snapcompact, hook_event_mask, inject_first_turn_metadata, is_capture_item,
@@ -722,23 +722,44 @@ impl<C: TurnClient + Clone> Agent<C> {
 			.current(&SettingSlot::PromptSlot)
 	}
 
-	fn invocation_mode_props(arbiter: &mut Arbiter, effects: &omp_tool::Effects) -> pb::ValueMap {
-		let mode = arbiter
+	fn invocation_mode_props(
+		&mut self,
+		effects: &omp_tool::Effects,
+	) -> Result<pb::ValueMap, AgentError> {
+		let mode = self
+			.arbiter
 			.regimes()
 			.resources()
 			.current(&SettingSlot::PromptSlot)
 			.map(Str::new);
+		let mut prewalk_activation = None;
 		if effects_mutate_environment(effects)
 			&& mode
 				.as_ref()
 				.is_some_and(|mode| matches!(mode.as_str(), "plan-yolo" | "prewalk"))
 		{
-			arbiter
-				.regimes_mut()
-				.resources_mut()
-				.pop(&SettingSlot::PromptSlot);
+			if mode.as_deref() == Some("prewalk") {
+				prewalk_activation = self
+					.arbiter
+					.regimes()
+					.resources()
+					.owner(&Resource::Mode)
+					.map(Str::new);
+			} else {
+				self
+					.arbiter
+					.regimes_mut()
+					.resources_mut()
+					.pop(&SettingSlot::PromptSlot);
+			}
 		}
-		batch::invocation_mode_props(mode.as_deref(), effects)
+		if let Some(activation) = prewalk_activation {
+			self.stop_regime(activation.as_str(), now_ms())?;
+			if let Some(source) = self.continuation_source.as_ref() {
+				source.sync_regimes(self.arbiter.regimes());
+			}
+		}
+		Ok(batch::invocation_mode_props(mode.as_deref(), effects))
 	}
 
 	/// Installs one application-owned autonomous-mode continuation source.
@@ -2163,7 +2184,8 @@ impl<C: TurnClient + Clone> Agent<C> {
 			policy = ContinuationPolicy::default();
 		}
 		if self.loop_signal.no_progress_turns >= 3
-			&& let Continuation::Continue { item, .. } = &mut candidate
+			&& let Continuation::Continue { owner, item, .. } = &mut candidate
+			&& owner != "loop"
 		{
 			*item = recovery_prompt_item(PromptAssetId::ThinkingLoopRedirect);
 		}
@@ -2171,6 +2193,9 @@ impl<C: TurnClient + Clone> Agent<C> {
 			&& let Some(owner_policy) = self.continuation_policies.get(owner)
 		{
 			policy = *owner_policy;
+		}
+		if matches!(&candidate, Continuation::Continue { owner, .. } if owner == "loop") {
+			self.continuations.reset_for_user();
 		}
 		match self
 			.continuations
@@ -3007,13 +3032,16 @@ impl<C: TurnClient + Clone> Agent<C> {
 						.wait_empty(self.abort_rx.clone())
 						.await
 						.map_err(|_| TurnError::Protocol("regime admission wait did not resolve"))?;
+					let invocation_props = self
+						.invocation_mode_props(&maximum_effects)
+						.map_err(|_| TurnError::Protocol("prewalk transition could not be recorded"))?;
 					let opened = SpeculativeCall::open_with_props(
 						&self.env,
 						&self.events,
 						call_id.clone(),
 						ToolIdentity { name: name.clone(), rev: rev.clone() },
 						runtime_duration(TOOL_DEADLINE),
-						Self::invocation_mode_props(&mut self.arbiter, &maximum_effects),
+						invocation_props,
 					)
 					.await
 					.map_err(|_| TurnError::Protocol("failed to open speculative tool"))?;
@@ -3117,13 +3145,14 @@ impl<C: TurnClient + Clone> Agent<C> {
 				.effects(&call.name)
 				.map_err(|_| AgentError::Protocol("committed tool effects missing"))?
 				.clone();
+			let invocation_props = self.invocation_mode_props(&maximum_effects)?;
 			let mut opened = SpeculativeCall::open_with_props(
 				&self.env,
 				&self.events,
 				call.id.as_str().to_str(),
 				ToolIdentity { name: name.clone(), rev: rev.clone() },
 				runtime_duration(TOOL_DEADLINE),
-				Self::invocation_mode_props(&mut self.arbiter, &maximum_effects),
+				invocation_props,
 			)
 			.await?;
 			opened.attach_runtime(
