@@ -1833,9 +1833,12 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 				max_output_tokens: Some(remaining),
 				..Budget::default()
 			});
-		let node = tree
-			.register(id.clone(), sf!("Main"), AgentKind::Main, None, id.clone(), root_budget)
-			.map_err(|error| DriverChatError::EvalBridge(Str::from(error.to_string())))?;
+		let node = match tree.node(id.as_str()) {
+			Some(node) => node,
+			None => tree
+				.register(id.clone(), sf!("Main"), AgentKind::Main, None, id.clone(), root_budget)
+				.map_err(|error| DriverChatError::EvalBridge(Str::from(error.to_string())))?,
+		};
 		node.set_status(AgentStatus::Running);
 		let broker = parent.broker();
 		let inbox = broker
@@ -1915,6 +1918,7 @@ async fn run_ui<C: TurnClient + Clone + Send + Sync + 'static>(
 			Some(collab),
 			modes,
 			auth.as_ref().map(|worker| worker.ui().clone()),
+			auth_control.clone(),
 			data_dir.clone(),
 			Arc::clone(&settings_manager),
 			Arc::clone(&telemetry_index),

@@ -368,12 +368,7 @@ impl GitModel {
 		} else if binary {
 			(Str::new_static(""), Str::new_static(""), None, None)
 		} else {
-			(
-				decode_utf8(&old.bytes).to_str(),
-				decode_utf8(&new.bytes).to_str(),
-				None,
-				None,
-			)
+			(decode_utf8(&old.bytes).to_str(), decode_utf8(&new.bytes).to_str(), None, None)
 		};
 		Ok(GitFileContents { old_text, new_text, binary, too_large, old_bytes, new_bytes, media })
 	}
@@ -447,10 +442,7 @@ impl GitModel {
 		let length = file
 			.metadata()
 			.await
-			.map_err(|source| GitModelError::WorktreeIo {
-				path: full_path.clone(),
-				source,
-			})?
+			.map_err(|source| GitModelError::WorktreeIo { path: full_path.clone(), source })?
 			.len();
 		if length > MAX_FILE_BYTES {
 			return Ok(StreamedSide { bytes: Bytes::new(), too_large: true });
@@ -465,10 +457,7 @@ impl GitModel {
 			let read = file
 				.read(&mut buffer)
 				.await
-				.map_err(|source| GitModelError::WorktreeIo {
-					path: full_path.clone(),
-					source,
-				})?;
+				.map_err(|source| GitModelError::WorktreeIo { path: full_path.clone(), source })?;
 			if read == 0 {
 				break;
 			}
@@ -751,9 +740,9 @@ impl SideStream {
 		let header = &self.undecided[..self.undecided.len().min(BINARY_SNIFF_BYTES)];
 		let text = self.undecided.is_empty()
 			|| (!path_looks_like_media(path)
-			&& !could_be_lfs_pointer(header)
-			&& !looks_like_svg(header)
-			&& !is_binary(header));
+				&& !could_be_lfs_pointer(header)
+				&& !looks_like_svg(header)
+				&& !is_binary(header));
 		self.text = Some(text);
 		if text {
 			self.lines.extend(self.splitter.push(&self.undecided));
@@ -1211,10 +1200,10 @@ mod tests {
 	fn complete_line_splitter_preserves_boundaries_crlf_and_lossy_utf8() {
 		let mut splitter = CompleteLineSplitter::default();
 		assert!(splitter.push(b"prefix \xf0\x9f").is_empty());
-		assert_eq!(
-			splitter.push(b"\x98\x80\r\nnext\n"),
-			vec![Str::new_static("prefix 😀\r"), Str::new_static("next")]
-		);
+		assert_eq!(splitter.push(b"\x98\x80\r\nnext\n"), vec![
+			Str::new_static("prefix 😀\r"),
+			Str::new_static("next")
+		]);
 		assert!(splitter.push(b"trail").is_empty());
 		assert_eq!(splitter.finish(), vec![Str::new_static("trail")]);
 

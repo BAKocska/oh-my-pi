@@ -174,10 +174,7 @@ impl HighlightStream {
 			for (offset, operation) in operations {
 				let end = offset.min(content_len);
 				if end > previous {
-					out.run(
-						styles.at(scope_color_index(&self.scope_stack)),
-						&raw_line[previous..end],
-					);
+					out.run(styles.at(scope_color_index(&self.scope_stack)), &raw_line[previous..end]);
 				}
 				previous = end;
 				apply_scope_op(&mut self.scope_stack, operation);

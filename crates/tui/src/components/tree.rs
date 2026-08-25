@@ -81,6 +81,7 @@ impl TreeNode {
 	pub fn annotation(self, annotation: impl IntoStr) -> Self {
 		self.with(Prop::Annotation, annotation.into_str())
 	}
+
 	/// Appends an independently colored right-aligned annotation.
 	pub fn annotate(mut self, annotation: TreeAnnotation) -> Self {
 		self.annotations.push(annotation);
@@ -133,23 +134,23 @@ struct TreeState {
 
 #[derive(Clone, Debug)]
 struct TreeRow {
-	node:             Slot,
-	depth:            u16,
-	key:              Str,
-	label:            Str,
-	prefix:           Str,
-	annotations:      SmallVec<TreeAnnotation, 2>,
-	action:           Str,
-	icon:             Str,
-	badge:            Str,
-	lead_color:       Option<PropValue>,
-		action_color:     Option<PropValue>,
-	bold:             bool,
-	dim:              bool,
-	has_children:     bool,
+	node:         Slot,
+	depth:        u16,
+	key:          Str,
+	label:        Str,
+	prefix:       Str,
+	annotations:  SmallVec<TreeAnnotation, 2>,
+	action:       Str,
+	icon:         Str,
+	badge:        Str,
+	lead_color:   Option<PropValue>,
+	action_color: Option<PropValue>,
+	bold:         bool,
+	dim:          bool,
+	has_children: bool,
 	/// Continuation bits for ancestor levels below the root.
-	gutters:          SmallVec<bool, 8>,
-	last:             bool,
+	gutters:      SmallVec<bool, 8>,
+	last:         bool,
 }
 
 /// A virtualized, selectable hierarchy backing the `<tree>` markup tag.
@@ -191,10 +192,12 @@ impl Tree {
 	pub const fn scroll_top(&self) -> usize {
 		self.state.scroll_top
 	}
+
 	/// Selects the flattened row with `key`, returning whether it exists.
 	///
 	/// This restores application-owned selection after rebuilding a tree with
-	/// fresh nodes; [`Self::set_scroll_top`] can restore its viewport separately.
+	/// fresh nodes; [`Self::set_scroll_top`] can restore its viewport
+	/// separately.
 	pub fn select_key(&mut self, key: &str) -> bool {
 		self.rebuild_rows();
 		let Some(cursor) = self.rows.iter().position(|row| row.key == key) else {
@@ -370,7 +373,10 @@ impl Component for Tree {
 		let bottom = rect.y.saturating_add(rect.height).min(pc.clip);
 		let visible = usize::from(bottom.saturating_sub(rect.y));
 		self.last_painted = 0;
-		for (screen_row, index) in (self.state.scroll_top..self.rows.len()).take(visible).enumerate() {
+		for (screen_row, index) in (self.state.scroll_top..self.rows.len())
+			.take(visible)
+			.enumerate()
+		{
 			let row = &self.rows[index];
 			let y = rect.y.saturating_add(screen_row as u16);
 			let selected = index == self.state.cursor;
@@ -383,13 +389,18 @@ impl Component for Tree {
 				None
 			};
 			if let Some(bg) = background {
-				pc.frame.fill(Rect::new(rect.x, y, rect.width, 1), Style::new().bg(bg));
+				pc.frame
+					.fill(Rect::new(rect.x, y, rect.width, 1), Style::new().bg(bg));
 			}
 			let tint = |style: Style| background.map_or(style, |bg| style.bg(bg));
 			let mut x = pc.frame.put(
 				rect.x,
 				y,
-				if selected { pc.ctx.charset.rail() } else { "  " },
+				if selected {
+					pc.ctx.charset.rail()
+				} else {
+					"  "
+				},
 				tint(Style::new().fg(pc.ctx.theme.accent)),
 			);
 			if let Some(family) = self.props.guides() {
@@ -399,7 +410,9 @@ impl Component for Tree {
 					x = pc.frame.put(x, y, if more { cont } else { "  " }, guide);
 				}
 				if row.depth > 0 {
-					x = pc.frame.put(x, y, if row.last { last } else { branch }, guide);
+					x = pc
+						.frame
+						.put(x, y, if row.last { last } else { branch }, guide);
 					x = pc.frame.put(x, y, " ", guide);
 				}
 			} else {
@@ -412,17 +425,21 @@ impl Component for Tree {
 			} else {
 				"  "
 			};
-			x = pc.frame.put(x, y, expander, tint(Style::new().fg(pc.ctx.theme.muted)));
+			x = pc
+				.frame
+				.put(x, y, expander, tint(Style::new().fg(pc.ctx.theme.muted)));
 			let lead = if !row.icon.is_empty() {
 				pc.ctx.charset.icon_named(&row.icon).unwrap_or(&row.icon)
 			} else {
 				&row.badge
 			};
 			if !lead.is_empty() {
-				let color = resolve_color(row.lead_color.as_ref(), &pc.ctx.theme)
-					.unwrap_or(pc.ctx.theme.accent);
+				let color =
+					resolve_color(row.lead_color.as_ref(), &pc.ctx.theme).unwrap_or(pc.ctx.theme.accent);
 				x = pc.frame.put(x, y, lead, tint(Style::new().fg(color)));
-				x = pc.frame.put(x, y, " ", tint(Style::new().fg(pc.ctx.theme.fg)));
+				x = pc
+					.frame
+					.put(x, y, " ", tint(Style::new().fg(pc.ctx.theme.fg)));
 			}
 
 			let right = rect.x.saturating_add(rect.width);
@@ -445,8 +462,9 @@ impl Component for Tree {
 					}
 					let color = resolve_color(annotation.color.as_ref(), &pc.ctx.theme)
 						.unwrap_or(pc.ctx.theme.muted);
-					tail_x =
-						pc.frame.put(tail_x, y, &annotation.text, tint(Style::new().fg(color)));
+					tail_x = pc
+						.frame
+						.put(tail_x, y, &annotation.text, tint(Style::new().fg(color)));
 				}
 			}
 			pc.hits.push(Hit {
@@ -459,9 +477,11 @@ impl Component for Tree {
 				let color = resolve_color(row.action_color.as_ref(), &pc.ctx.theme)
 					.unwrap_or(pc.ctx.theme.accent);
 				let chip = tint(
-					Style::new()
-						.fg(color)
-						.bg(pc.ctx.theme.tint_bg(color, if hovered { 0.28 } else { 0.18 })),
+					Style::new().fg(color).bg(
+						pc.ctx
+							.theme
+							.tint_bg(color, if hovered { 0.28 } else { 0.18 }),
+					),
 				);
 				tail_x = pc.frame.put(tail_x, y, " ", chip);
 				tail_x = pc.frame.put(tail_x, y, &row.action, chip.bold());
@@ -514,7 +534,9 @@ impl Component for Tree {
 			},
 			Key::Home | Key::Char('g') => self.move_to(0, ec.view_rows),
 			Key::End | Key::Char('G') => self.move_to(self.rows.len() - 1, ec.view_rows),
-			Key::PageUp => self.move_to(current.saturating_sub(usize::from(ec.view_rows.max(1))), ec.view_rows),
+			Key::PageUp => {
+				self.move_to(current.saturating_sub(usize::from(ec.view_rows.max(1))), ec.view_rows)
+			},
 			Key::PageDown => self.move_to(
 				current
 					.saturating_add(usize::from(ec.view_rows.max(1)))
@@ -528,7 +550,11 @@ impl Component for Tree {
 				return self.toggled(&row, Some(expanded));
 			},
 			Key::Right | Key::Char('l') if row.has_children => {
-				if self.rows.get(current + 1).is_some_and(|child| child.depth == row.depth + 1) {
+				if self
+					.rows
+					.get(current + 1)
+					.is_some_and(|child| child.depth == row.depth + 1)
+				{
 					self.move_to(current + 1, ec.view_rows);
 				} else {
 					return Flow::Skip;
@@ -623,9 +649,11 @@ impl Component for Tree {
 		let Some(id) = self.props.id() else {
 			return;
 		};
-		let value = self.state.selected.as_ref().map_or(serde_json::Value::Null, |key| {
-			serde_json::Value::String(key.to_string())
-		});
+		let value = self
+			.state
+			.selected
+			.as_ref()
+			.map_or(serde_json::Value::Null, |key| serde_json::Value::String(key.to_string()));
 		out.insert(id.to_string(), value);
 	}
 }
@@ -658,7 +686,11 @@ fn walk_rows(
 			.unwrap_or_else(|| path.clone());
 		let has_children = !node.children.is_empty();
 		let last = index + 1 == count;
-		let gutters = if depth > 1 { trail[1..].into() } else { SmallVec::new() };
+		let gutters = if depth > 1 {
+			trail[1..].into()
+		} else {
+			SmallVec::new()
+		};
 		let mut annotations = node.annotations.clone();
 		if let Some(text) = node.props.str_of(Prop::Annotation) {
 			annotations.push(TreeAnnotation {
@@ -677,7 +709,7 @@ fn walk_rows(
 			icon: node.props.str_of(Prop::Icon).cloned().unwrap_or_default(),
 			badge: node.props.str_of(Prop::Badge).cloned().unwrap_or_default(),
 			lead_color: node.props.get(Prop::Color),
-						action_color: node.props.get(Prop::ActionColor),
+			action_color: node.props.get(Prop::ActionColor),
 			bold: node.props.flag(Prop::Bold),
 			dim: node.props.flag(Prop::Dim),
 			has_children,
@@ -777,7 +809,7 @@ fn paint_label(
 		let ellipsis_x = x.saturating_add(truncated.width.saturating_sub(1));
 		pc.frame.put(ellipsis_x, y, "…", tint(base));
 	}
-	}
+}
 
 fn truncate_start(text: &str, width: u16) -> (&str, bool) {
 	let natural = cell_width(text);
@@ -816,12 +848,11 @@ fn append(target: &mut Str, suffix: Str) {
 mod tests {
 	use omp_core::sf;
 
+	use super::*;
 	use crate::{
 		Frame, Size,
 		test_support::{frame_cell_style, frame_row_text},
 	};
-
-	use super::*;
 
 	fn event_ctx(ctx: &UiContext, rows: u16) -> EventCtx<'_> {
 		EventCtx::new(ctx, 40, rows)
@@ -848,16 +879,19 @@ mod tests {
 				.node(TreeNode::new().key("leaf-key").label("leaf")),
 		);
 		let mut ec = event_ctx(&ctx, 4);
-		assert_eq!(tree.key(&mut ec, Key::Right), Flow::Event(UiEvent::TreeToggled {
-			id: "tree-id".into(),
-			key: "root-key".into(),
-			expanded: Some(true),
-		}));
+		assert_eq!(
+			tree.key(&mut ec, Key::Right),
+			Flow::Event(UiEvent::TreeToggled {
+				id:       "tree-id".into(),
+				key:      "root-key".into(),
+				expanded: Some(true),
+			})
+		);
 		assert_eq!(tree.key(&mut ec, Key::Right), Flow::Consumed);
-		assert_eq!(tree.key(&mut ec, Key::Enter), Flow::Event(UiEvent::TreeActivated {
-			id: "tree-id".into(),
-			key: "leaf-key".into(),
-		}));
+		assert_eq!(
+			tree.key(&mut ec, Key::Enter),
+			Flow::Event(UiEvent::TreeActivated { id: "tree-id".into(), key: "leaf-key".into() })
+		);
 		let mut values = serde_json::Map::new();
 		tree.value(&mut values);
 		assert_eq!(values["tree-id"], serde_json::json!("leaf-key"));
@@ -878,8 +912,14 @@ mod tests {
 		assert_eq!(tree.key(&mut ec, Key::Char('j')), Flow::Consumed);
 		assert_eq!(tree.key(&mut ec, Key::Char('h')), Flow::Consumed);
 		assert_eq!(tree.state.cursor, 0);
-		assert!(matches!(tree.key(&mut ec, Key::Char('h')), Flow::Event(UiEvent::TreeToggled { expanded: Some(false), .. })));
-		assert!(matches!(tree.key(&mut ec, Key::Char('l')), Flow::Event(UiEvent::TreeToggled { expanded: Some(true), .. })));
+		assert!(matches!(
+			tree.key(&mut ec, Key::Char('h')),
+			Flow::Event(UiEvent::TreeToggled { expanded: Some(false), .. })
+		));
+		assert!(matches!(
+			tree.key(&mut ec, Key::Char('l')),
+			Flow::Event(UiEvent::TreeToggled { expanded: Some(true), .. })
+		));
 		assert_eq!(tree.key(&mut ec, Key::Char('l')), Flow::Consumed);
 		assert_eq!(tree.state.cursor, 1);
 		assert_eq!(tree.key(&mut ec, Key::End), Flow::Consumed);
@@ -896,18 +936,37 @@ mod tests {
 		let ctx = UiContext::default();
 		let mut tree = Tree::new();
 		for index in 0..10_000 {
-			tree = tree.node(TreeNode::new().key(sf!("node-{index}")).label(sf!("row {index}")));
+			tree = tree.node(
+				TreeNode::new()
+					.key(sf!("node-{index}"))
+					.label(sf!("row {index}")),
+			);
 		}
 		let (frame, hits) = paint(&mut tree, &ctx, 24, 4);
 		assert_eq!(tree.painted_rows_len(), 4);
-		assert_eq!(hits.iter().filter(|hit| matches!(hit.tag, HitTag::TreeRow(_))).count(), 4);
+		assert_eq!(
+			hits
+				.iter()
+				.filter(|hit| matches!(hit.tag, HitTag::TreeRow(_)))
+				.count(),
+			4
+		);
 		assert!(frame_row_text(&frame, 3).contains("row 3"));
 		let mut ec = event_ctx(&ctx, 4);
 		assert_eq!(tree.key(&mut ec, Key::End), Flow::Consumed);
 		assert_eq!(tree.scroll_top(), 9_996);
 		let (frame, _) = paint(&mut tree, &ctx, 24, 4);
 		assert!(frame_row_text(&frame, 3).contains("row 9999"));
-		assert_eq!(tree.mouse(&mut ec, HitTag::TreeRow(9_999), (0, 0), Rect::new(0, 0, 24, 4), Mouse::WheelUp), Flow::Consumed);
+		assert_eq!(
+			tree.mouse(
+				&mut ec,
+				HitTag::TreeRow(9_999),
+				(0, 0),
+				Rect::new(0, 0, 24, 4),
+				Mouse::WheelUp
+			),
+			Flow::Consumed
+		);
 		assert_eq!(tree.scroll_top(), 9_993);
 	}
 	#[test]
@@ -957,13 +1016,19 @@ mod tests {
 		assert_eq!(frame_cell_style(&frame, 18, 0).foreground_color(), Color::Rgb(4, 5, 6));
 		assert_eq!(frame_cell_style(&frame, 21, 0).foreground_color(), Color::Rgb(10, 11, 12));
 		assert_eq!(frame_cell_style(&frame, 24, 0).foreground_color(), Color::Rgb(7, 8, 9));
-		let action = hits.iter().find(|hit| matches!(hit.tag, HitTag::TreeAction(0))).expect("action hit");
+		let action = hits
+			.iter()
+			.find(|hit| matches!(hit.tag, HitTag::TreeAction(0)))
+			.expect("action hit");
 		let mut ec = event_ctx(&ctx, 1);
-		assert_eq!(tree.mouse(&mut ec, action.tag, (action.rect.x, 0), Rect::new(0, 0, 28, 1), Mouse::Click), Flow::Event(UiEvent::TreeAction {
-			id: "files".into(),
-			key: "leaf".into(),
-			action: "Run".into(),
-		}));
+		assert_eq!(
+			tree.mouse(&mut ec, action.tag, (action.rect.x, 0), Rect::new(0, 0, 28, 1), Mouse::Click),
+			Flow::Event(UiEvent::TreeAction {
+				id:     "files".into(),
+				key:    "leaf".into(),
+				action: "Run".into(),
+			})
+		);
 		let mut long = Tree::new().node(TreeNode::new().label("label-that-does-not-fit"));
 		let (frame, _) = paint(&mut long, &ctx, 12, 1);
 		assert!(frame_row_text(&frame, 0).contains('…'), "long labels end-truncate");

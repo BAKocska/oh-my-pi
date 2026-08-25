@@ -23,10 +23,10 @@ use crate::{
 	context::UiContext,
 	frame::{Color, Rect, Style},
 	imagefmt::ImageDimensions,
-	markdown::highlight::{HighlightStream, HighlightStyles},
-	rich::RichText,
 	input::{Key, Mouse, UiEvent},
+	markdown::highlight::{HighlightStream, HighlightStyles},
 	props::{Prop, PropValue, Props},
+	rich::RichText,
 };
 
 /// How a [`DiffPane`] presents its document.
@@ -206,18 +206,18 @@ impl SyntaxHighlights {
 		let language = document.language.clone()?;
 		Some(Self {
 			old: HighlightSide {
-				runs: vec![None; document.old_lines.len()],
-				offset: 0,
-				stream: None,
+				runs:    vec![None; document.old_lines.len()],
+				offset:  0,
+				stream:  None,
 				scratch: StrMut::new(""),
-				rich: RichText::default(),
+				rich:    RichText::default(),
 			},
 			new: HighlightSide {
-				runs: vec![None; document.new_lines.len()],
-				offset: 0,
-				stream: None,
+				runs:    vec![None; document.new_lines.len()],
+				offset:  0,
+				stream:  None,
 				scratch: StrMut::new(""),
-				rich: RichText::default(),
+				rich:    RichText::default(),
 			},
 			language,
 			initialized: false,
@@ -744,9 +744,7 @@ impl DiffPane {
 					.layout
 					.visuals
 					.iter()
-					.position(|visual| {
-						matches!(visual, Visual::Split { row, .. } if *row >= first_row)
-					})
+					.position(|visual| matches!(visual, Visual::Split { row, .. } if *row >= first_row))
 					.unwrap_or(self.layout.visuals.len());
 				self.layout.visuals.truncate(keep);
 				let text_width = self.split_text_width(width);
@@ -770,9 +768,7 @@ impl DiffPane {
 					.layout
 					.visuals
 					.iter()
-					.position(|visual| {
-						matches!(visual, Visual::Line { row, .. } if *row >= first_row)
-					})
+					.position(|visual| matches!(visual, Visual::Line { row, .. } if *row >= first_row))
 					.unwrap_or(self.layout.visuals.len());
 				self.layout.visuals.truncate(keep);
 				Self::push_inline_rows(
@@ -789,9 +785,9 @@ impl DiffPane {
 					.layout
 					.visuals
 					.iter()
-					.position(|visual| {
-						matches!(visual, Visual::File { line, .. } if *line >= first_new_line)
-					})
+					.position(
+						|visual| matches!(visual, Visual::File { line, .. } if *line >= first_new_line),
+					)
 					.unwrap_or(self.layout.visuals.len());
 				self.layout.visuals.truncate(keep);
 				let text_width = self.file_text_width(width);
@@ -1069,10 +1065,13 @@ impl DiffPane {
 		number: u32,
 		fallback: &'a [DiffStyleRun],
 	) -> &'a [DiffStyleRun] {
-		let side = self
-			.highlights
-			.as_ref()
-			.map(|highlights| if old { &highlights.old } else { &highlights.new });
+		let side = self.highlights.as_ref().map(|highlights| {
+			if old {
+				&highlights.old
+			} else {
+				&highlights.new
+			}
+		});
 		side
 			.and_then(|side| side.runs.get(number.saturating_sub(1) as usize))
 			.and_then(Option::as_deref)
@@ -1735,9 +1734,7 @@ fn highlight_side(side: &mut HighlightSide, lines: &[Str], styles: &HighlightSty
 		let mut column = 0u16;
 		let mut runs: SmallVec<DiffStyleRun, 8> = SmallVec::new();
 		for (style, text) in side.rich.row_runs(row as u16) {
-			let end = column.saturating_add(
-				u16::try_from(text.visible_width()).unwrap_or(u16::MAX),
-			);
+			let end = column.saturating_add(u16::try_from(text.visible_width()).unwrap_or(u16::MAX));
 			if end > column {
 				runs.push(DiffStyleRun { start: column, end, style });
 			}
@@ -2173,10 +2170,7 @@ mod tests {
 		let highlights = pane.highlights.as_ref().unwrap();
 		assert_eq!(highlights.old.offset, HIGHLIGHT_BATCH_LINES * 2);
 		let comment = highlights.old.runs[32].as_deref().unwrap();
-		assert_eq!(
-			comment.first().unwrap().style.foreground_color(),
-			Theme::default().muted
-		);
+		assert_eq!(comment.first().unwrap().style.foreground_color(), Theme::default().muted);
 		paint(&mut pane, 80, 4);
 		let highlights = pane.highlights.as_ref().unwrap();
 		assert_eq!(highlights.old.offset, 70);
@@ -2223,10 +2217,7 @@ mod tests {
 		pane.cursor = 2;
 		pane.anchor = Some(2);
 
-		pane.push_stream(
-			&[Str::new("f"), Str::new("g")],
-			&[Str::new("f"), Str::new("G")],
-		);
+		pane.push_stream(&[Str::new("f"), Str::new("g")], &[Str::new("f"), Str::new("G")]);
 		assert_eq!(pane.document.as_ref().unwrap().rows.len(), 7);
 		assert_eq!(pane.scroll_top, 2);
 		assert_eq!(pane.cursor, 2);
@@ -2246,8 +2237,7 @@ mod tests {
 		pane.cursor = 1;
 		pane.anchor = Some(1);
 
-		let final_document =
-			DiffDocument::build("a\nb", "a\nB", "stream.txt", &Default::default());
+		let final_document = DiffDocument::build("a\nb", "a\nB", "stream.txt", &Default::default());
 		pane.finish_stream(final_document);
 		assert!(!pane.streaming);
 		assert_eq!(pane.scroll_top, 1);

@@ -124,24 +124,24 @@ pub struct DiffBuildOptions {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DiffDocument {
 	/// Display path associated with the source.
-	pub path:            Str,
+	pub path:             Str,
 	/// Full-file aligned rows.
-	pub rows:            Vec<DiffRow>,
+	pub rows:             Vec<DiffRow>,
 	/// Tight changed regions.
-	pub hunks:           Vec<DiffHunk>,
+	pub hunks:            Vec<DiffHunk>,
 	/// New-side source lines for file view.
-	pub file_lines:      Vec<DiffFileLine>,
+	pub file_lines:       Vec<DiffFileLine>,
 	/// Number of added source lines.
-	pub additions:       u32,
+	pub additions:        u32,
 	/// Number of deleted source lines.
-	pub deletions:       u32,
+	pub deletions:        u32,
 	/// Width reserved for one line-number gutter.
-	pub gutter_width:    u16,
+	pub gutter_width:     u16,
 	/// Widest source line in display cells.
-	pub max_line_width:  u16,
+	pub max_line_width:   u16,
 	/// Global aligned row for each one-based new-side line; index zero is
 	/// unused.
-	pub row_by_new_line: Vec<Option<usize>>,
+	pub row_by_new_line:  Vec<Option<usize>>,
 	/// Tab-expanded old-side source retained for progressive highlighting.
 	pub(crate) old_lines: Vec<Str>,
 	/// Tab-expanded new-side source retained for progressive highlighting.
@@ -178,18 +178,8 @@ impl DiffDocument {
 					for offset in 0..len {
 						rows.push(make_row(
 							DiffRowKind::Context,
-							Some(side(
-								old_index + offset,
-								&old_display,
-								None,
-								gutter_width,
-							)),
-							Some(side(
-								new_index + offset,
-								&new_display,
-								None,
-								gutter_width,
-							)),
+							Some(side(old_index + offset, &old_display, None, gutter_width)),
+							Some(side(new_index + offset, &new_display, None, gutter_width)),
 						));
 					}
 				},
@@ -197,12 +187,7 @@ impl DiffDocument {
 					for offset in 0..old_len {
 						rows.push(make_row(
 							DiffRowKind::Del,
-							Some(side(
-								old_index + offset,
-								&old_display,
-								None,
-								gutter_width,
-							)),
+							Some(side(old_index + offset, &old_display, None, gutter_width)),
 							None,
 						));
 					}
@@ -212,12 +197,7 @@ impl DiffDocument {
 						rows.push(make_row(
 							DiffRowKind::Add,
 							None,
-							Some(side(
-								new_index + offset,
-								&new_display,
-								None,
-								gutter_width,
-							)),
+							Some(side(new_index + offset, &new_display, None, gutter_width)),
 						));
 					}
 				},
@@ -237,12 +217,7 @@ impl DiffDocument {
 					for offset in paired..old_len {
 						rows.push(make_row(
 							DiffRowKind::Del,
-							Some(side(
-								old_index + offset,
-								&old_display,
-								None,
-								gutter_width,
-							)),
+							Some(side(old_index + offset, &old_display, None, gutter_width)),
 							None,
 						));
 					}
@@ -250,12 +225,7 @@ impl DiffDocument {
 						rows.push(make_row(
 							DiffRowKind::Add,
 							None,
-							Some(side(
-								new_index + offset,
-								&new_display,
-								None,
-								gutter_width,
-							)),
+							Some(side(new_index + offset, &new_display, None, gutter_width)),
 						));
 					}
 				},
@@ -338,20 +308,20 @@ impl DiffDocument {
 
 	/// Appends complete source lines and returns the first rebuilt row and new
 	/// file line.
-	pub(crate) fn push_stream(
-		&mut self,
-		old_lines: &[Str],
-		new_lines: &[Str],
-	) -> (usize, usize) {
+	pub(crate) fn push_stream(&mut self, old_lines: &[Str], new_lines: &[Str]) -> (usize, usize) {
 		let old_start = self.old_lines.len();
 		let new_start = self.new_lines.len();
 		let stable = old_start.min(new_start);
-		self
-			.old_lines
-			.extend(old_lines.iter().map(|line| expand_tabs(line.as_str().strip_suffix('\r').unwrap_or(line))));
-		self
-			.new_lines
-			.extend(new_lines.iter().map(|line| expand_tabs(line.as_str().strip_suffix('\r').unwrap_or(line))));
+		self.old_lines.extend(
+			old_lines
+				.iter()
+				.map(|line| expand_tabs(line.as_str().strip_suffix('\r').unwrap_or(line))),
+		);
+		self.new_lines.extend(
+			new_lines
+				.iter()
+				.map(|line| expand_tabs(line.as_str().strip_suffix('\r').unwrap_or(line))),
+		);
 
 		for row in &self.rows[stable..] {
 			self.additions = self
@@ -427,7 +397,9 @@ impl DiffDocument {
 			self.max_line_width = self.max_line_width.max(cell_width(text));
 		}
 
-		self.row_by_new_line.truncate(self.new_lines.len().saturating_add(1));
+		self
+			.row_by_new_line
+			.truncate(self.new_lines.len().saturating_add(1));
 		self
 			.row_by_new_line
 			.resize(self.new_lines.len().saturating_add(1), None);

@@ -196,7 +196,13 @@ const fn field_caps(charset: Charset) -> (char, char) {
 const fn accent_rail(charset: Charset, focused: bool) -> char {
 	match charset {
 		Charset::Ascii => '|',
-		Charset::Unicode | Charset::NerdFont => if focused { '▎' } else { '▏' },
+		Charset::Unicode | Charset::NerdFont => {
+			if focused {
+				'▎'
+			} else {
+				'▏'
+			}
+		},
 	}
 }
 
@@ -385,8 +391,11 @@ impl EditInput {
 		if prop == Prop::Rail
 			&& let PropValue::Bool(enabled) = &value
 		{
-			self.style =
-				if *enabled { ComposerStyle::Rail } else { ComposerStyle::default() };
+			self.style = if *enabled {
+				ComposerStyle::Rail
+			} else {
+				ComposerStyle::default()
+			};
 		}
 		self.props.set(prop, value);
 		self
@@ -1783,7 +1792,10 @@ impl EditorPane {
 	/// Sets one editor-shell property.
 	pub fn with(mut self, prop: Prop, value: impl Into<PropValue>) -> Self {
 		let value = value.into();
-		if matches!(prop, Prop::Id | Prop::Value | Prop::Submit | Prop::Placeholder | Prop::MaxRows | Prop::Rail) {
+		if matches!(
+			prop,
+			Prop::Id | Prop::Value | Prop::Submit | Prop::Placeholder | Prop::MaxRows | Prop::Rail
+		) {
 			self.children[0]
 				.comp_mut()
 				.props_mut()

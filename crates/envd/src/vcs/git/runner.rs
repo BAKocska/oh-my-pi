@@ -421,6 +421,7 @@ impl CappedOutput {
 		self.bytes.extend_from_slice(TRUNCATION_MARKER);
 		self.truncated = true;
 	}
+
 	fn remaining(&self) -> usize {
 		if self.truncated {
 			0

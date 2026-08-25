@@ -11,7 +11,6 @@ use std::{
 
 use diff::{DIFF_ID, VIEW_ID};
 use omp_core::{IntoStr, Str, sf};
-use strum::EnumProperty as _;
 use omp_tui::{
 	DiffActionKind, DiffBuildOptions, DiffDocument, DiffPane, DiffPaneState, DiffPatchTarget,
 	DiffTarget, DiffWhitespaceMode, Dim, Key, Layer, Mouse, OverlayOptions, Prop, Size, Ui,
@@ -22,6 +21,7 @@ use sidebar::{
 	AMEND_ID, COMMIT_ID, DESCRIPTION_ID, DESCRIPTION_PANE_ID, SIDEBAR_ID, SUMMARY_ID, SidebarRow,
 	SidebarTarget, VIEW_STYLE_ID, sidebar_rows,
 };
+use strum::EnumProperty as _;
 
 /// Kind of change reported for one Git path.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, strum::IntoStaticStr)]
@@ -234,10 +234,12 @@ const SIDEBAR_MIN: u16 = 30;
 const SIDEBAR_MAX: u16 = 48;
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, strum::EnumProperty)]
 pub(super) enum Focus {
-	#[strum(props(Hint = "alt+↓/↑ hunk · ]/[ file · shift+↑/↓ select · s/u stage · x discard · v view · c commit · q quit"))]
+	#[strum(props(Hint = "alt+↓/↑ hunk · ]/[ file · shift+↑/↓ select · s/u stage · x discard · \
+	                      v view · c commit · q quit"))]
 	Diff,
 	#[default]
-	#[strum(props(Hint = "↑/↓ move · ←/→ fold · space stage · enter open · alt+↓/↑ hunk · c commit · t tree · q quit"))]
+	#[strum(props(Hint = "↑/↓ move · ←/→ fold · space stage · enter open · alt+↓/↑ hunk · c \
+	                      commit · t tree · q quit"))]
 	Sidebar,
 }
 
@@ -486,10 +488,13 @@ impl GitWorkbench {
 	) -> GitWorkbenchEvent {
 		let sidebar_width = (viewport.width * 3 / 10).clamp(SIDEBAR_MIN, SIDEBAR_MAX);
 		let in_content = row >= 2;
-		let in_sidebar =
-			in_content && col >= viewport.width.saturating_sub(sidebar_width);
+		let in_sidebar = in_content && col >= viewport.width.saturating_sub(sidebar_width);
 		if in_content && matches!(kind, Mouse::Click | Mouse::RightClick) {
-			self.focus = if in_sidebar { Focus::Sidebar } else { Focus::Diff };
+			self.focus = if in_sidebar {
+				Focus::Sidebar
+			} else {
+				Focus::Diff
+			};
 			if self.focus == Focus::Sidebar && kind == Mouse::Click {
 				self.select_sidebar_form_at(row.saturating_sub(2), viewport.height.saturating_sub(2));
 			}
@@ -612,7 +617,9 @@ impl GitWorkbench {
 			return self.handle_editor_key(key);
 		}
 		if matches!(key, Key::Space | Key::Char('s') | Key::Char('u'))
-			&& self.current_sidebar_target().is_some_and(SidebarTarget::is_tree_node)
+			&& self
+				.current_sidebar_target()
+				.is_some_and(SidebarTarget::is_tree_node)
 			&& let Some(selected) = self.tree_selected_key()
 		{
 			self.set_sidebar_index_for_key(selected.as_str());
@@ -1070,9 +1077,7 @@ impl GitWorkbench {
 		let event = self.ui.handle_key(key);
 		let tree_event = matches!(
 			event,
-			UiEvent::TreeActivated { .. }
-				| UiEvent::TreeToggled { .. }
-				| UiEvent::TreeAction { .. }
+			UiEvent::TreeActivated { .. } | UiEvent::TreeToggled { .. } | UiEvent::TreeAction { .. }
 		);
 		self.sync_control_values();
 		let routed = self.route_ui(event);
@@ -1081,9 +1086,9 @@ impl GitWorkbench {
 		}
 		let after = self.tree_selected_key();
 		if after != before {
-			return after.as_deref().map_or(GitWorkbenchEvent::Consumed, |selected| {
-				self.select_tree_key(selected)
-			});
+			return after
+				.as_deref()
+				.map_or(GitWorkbenchEvent::Consumed, |selected| self.select_tree_key(selected));
 		}
 		match (previous, key) {
 			(Some(SidebarTarget::ViewStyle), Key::Down) => self.focus_tree(),
@@ -1195,7 +1200,9 @@ impl GitWorkbench {
 	fn editor_on_last_line(&mut self) -> bool {
 		self
 			.ui
-			.with_component_mut::<EditorPane, _>(DESCRIPTION_PANE_ID, |editor| editor.cursor_on_last_line())
+			.with_component_mut::<EditorPane, _>(DESCRIPTION_PANE_ID, |editor| {
+				editor.cursor_on_last_line()
+			})
 			.unwrap_or(true)
 	}
 
@@ -1224,6 +1231,7 @@ impl GitWorkbench {
 			self.select_target_kind(target);
 		}
 	}
+
 	fn clear_diff_selection(&mut self) -> bool {
 		self
 			.ui
@@ -1460,11 +1468,7 @@ impl GitWorkbench {
 			.filter(|target| target.is_tree_node())
 			.map(SidebarTarget::key);
 		let tree_selected = fallback.or_else(|| {
-			tree_selected.filter(|key| {
-				self.sidebar_rows
-					.iter()
-					.any(|row| row.target.key() == *key)
-			})
+			tree_selected.filter(|key| self.sidebar_rows.iter().any(|row| row.target.key() == *key))
 		});
 		let content_rows = self.height.saturating_sub(2).max(1);
 		let sidebar_width = (self.width * 3 / 10).clamp(SIDEBAR_MIN, SIDEBAR_MAX);
@@ -1557,11 +1561,7 @@ impl GitWorkbench {
 	}
 }
 
-fn nearest_survivor(
-	previous: &[SidebarRow],
-	current: &[SidebarRow],
-	missing: &Str,
-) -> Option<Str> {
+fn nearest_survivor(previous: &[SidebarRow], current: &[SidebarRow], missing: &Str) -> Option<Str> {
 	let index = previous
 		.iter()
 		.position(|row| row.target.key() == *missing)?;
@@ -1637,15 +1637,14 @@ mod tests {
 	use omp_core::{Str, sf};
 	use omp_tui::{
 		Component as _, DiffActionKind, DiffTarget, Key, Mouse, Size, UiContext, ViewMode,
-		components::Tree,
-		test_support::frame_row_text,
+		components::Tree, test_support::frame_row_text,
 	};
 
 	use super::{
 		Focus, GitArea, GitChangeKind, GitCommitInfo, GitFileContents, GitFileRow, GitIntent,
 		GitPatchOp, GitSnapshot, GitUpdate, GitWorkbench, GitWorkbenchEvent, SidebarTarget,
+		commit_view::identicon_lines,
 	};
-	use super::commit_view::identicon_lines;
 
 	fn file(path: &'static str, area: GitArea) -> GitFileRow {
 		GitFileRow {
@@ -1731,10 +1730,7 @@ mod tests {
 			}),
 			None
 		);
-		let _ = streamed.apply(GitUpdate::Contents {
-			seq,
-			contents: final_contents.clone(),
-		});
+		let _ = streamed.apply(GitUpdate::Contents { seq, contents: final_contents.clone() });
 		assert!(!streamed.streaming);
 		let streamed_document = pane_document(&mut streamed);
 
@@ -1761,7 +1757,7 @@ mod tests {
 		};
 		assert_eq!(
 			workbench.apply(GitUpdate::ContentsChunk {
-				seq: seq.wrapping_add(1),
+				seq:       seq.wrapping_add(1),
 				old_lines: vec![Str::new_static("stale")],
 				new_lines: vec![Str::new_static("stale")],
 			}),
@@ -1785,10 +1781,7 @@ mod tests {
 		workbench.focus = Focus::Diff;
 		let _ = workbench.route_diff_navigation(Key::SelectDown);
 		assert_eq!(workbench.handle_key(Key::Char('s')), GitWorkbenchEvent::Consumed);
-		let _ = workbench.apply(GitUpdate::Contents {
-			seq,
-			contents: contents("old\n", "new\n"),
-		});
+		let _ = workbench.apply(GitUpdate::Contents { seq, contents: contents("old\n", "new\n") });
 		let _ = workbench.route_diff_navigation(Key::SelectDown);
 		assert!(matches!(
 			workbench.handle_key(Key::Char('s')),
@@ -1884,12 +1877,12 @@ mod tests {
 	fn sidebar_tree_chases_selection_inside_its_visible_window() {
 		let mut snapshot = dirty();
 		snapshot.unstaged.extend((0..40).map(|index| GitFileRow {
-			path:       sf!("bulk/file-{index:02}.rs"),
-			orig_path:  None,
-			kind:       GitChangeKind::Modified,
-			area:       GitArea::Unstaged,
-			additions:  Some(2),
-			deletions:  Some(1),
+			path:      sf!("bulk/file-{index:02}.rs"),
+			orig_path: None,
+			kind:      GitChangeKind::Modified,
+			area:      GitArea::Unstaged,
+			additions: Some(2),
+			deletions: Some(1),
 		}));
 		let mut workbench = GitWorkbench::open(snapshot, &UiContext::default());
 		let _ = workbench.layer(Size::new(80, 12));
@@ -1908,19 +1901,23 @@ mod tests {
 		assert_eq!(workbench.handle_key(Key::Down), GitWorkbenchEvent::Consumed);
 		assert!(matches!(workbench.current_sidebar_target(), Some(SidebarTarget::Amend)));
 		assert_eq!(workbench.handle_key(Key::Up), GitWorkbenchEvent::Consumed);
-		assert!(workbench.current_sidebar_target().is_some_and(SidebarTarget::is_tree_node));
+		assert!(
+			workbench
+				.current_sidebar_target()
+				.is_some_and(SidebarTarget::is_tree_node)
+		);
 	}
 
 	#[test]
 	fn sidebar_wheel_scroll_does_not_flip_diff_focus() {
 		let mut snapshot = dirty();
 		snapshot.unstaged.extend((0..40).map(|index| GitFileRow {
-			path:       sf!("bulk/file-{index:02}.rs"),
-			orig_path:  None,
-			kind:       GitChangeKind::Modified,
-			area:       GitArea::Unstaged,
-			additions:  Some(2),
-			deletions:  Some(1),
+			path:      sf!("bulk/file-{index:02}.rs"),
+			orig_path: None,
+			kind:      GitChangeKind::Modified,
+			area:      GitArea::Unstaged,
+			additions: Some(2),
+			deletions: Some(1),
 		}));
 		let mut workbench = GitWorkbench::open(snapshot, &UiContext::default());
 		let viewport = Size::new(80, 12);
@@ -1953,10 +1950,7 @@ mod tests {
 		let ctx = UiContext::default();
 		let snapshot = GitSnapshot {
 			branch:   Some(Str::new_static("main")),
-			unstaged: vec![file(
-				"very/long/directory/prefix/important.rs",
-				GitArea::Unstaged,
-			)],
+			unstaged: vec![file("very/long/directory/prefix/important.rs", GitArea::Unstaged)],
 			staged:   Vec::new(),
 			head:     Some(head()),
 			pinned:   false,
@@ -2000,7 +1994,9 @@ mod tests {
 	#[test]
 	fn commit_composer_keys_do_not_leak_staging_actions() {
 		let mut snapshot = dirty();
-		snapshot.unstaged.insert(0, file("logo.png", GitArea::Unstaged));
+		snapshot
+			.unstaged
+			.insert(0, file("logo.png", GitArea::Unstaged));
 		let mut workbench = GitWorkbench::open(snapshot.clone(), &UiContext::default());
 		let mut events = Vec::new();
 		for key in [Key::Down, Key::Down, Key::Enter, Key::Tab, Key::Space] {
@@ -2041,9 +2037,7 @@ mod tests {
 			.filter(|event| {
 				matches!(
 					event,
-					GitWorkbenchEvent::Intent(
-						GitIntent::StageFile(_) | GitIntent::ApplyLines { .. }
-					)
+					GitWorkbenchEvent::Intent(GitIntent::StageFile(_) | GitIntent::ApplyLines { .. })
 				)
 			})
 			.count();

@@ -250,7 +250,11 @@ impl Component for Input {
 		let content_x = pc.frame.put(rect.x, rect.y, prefix, prefix_style);
 		// Rail inputs align content with the editor's `▎ text` column so
 		// stacked rail fields share one text column.
-		let content_x = if rail { content_x.saturating_add(1) } else { content_x };
+		let content_x = if rail {
+			content_x.saturating_add(1)
+		} else {
+			content_x
+		};
 		let right = rect.x.saturating_add(rect.width);
 		let counter_width = cell_width(&self.state.counter).min(rect.width);
 		let counter_start = byte_at_column(

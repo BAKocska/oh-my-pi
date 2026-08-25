@@ -66,10 +66,7 @@ impl SidebarTarget {
 	}
 
 	pub(super) const fn is_tree_node(&self) -> bool {
-		matches!(
-			self,
-			Self::StageAll | Self::UnstageAll | Self::Directory { .. } | Self::File { .. }
-		)
+		matches!(self, Self::StageAll | Self::UnstageAll | Self::Directory { .. } | Self::File { .. })
 	}
 
 	pub(super) const fn is_file_or_directory(&self) -> bool {
@@ -114,8 +111,7 @@ impl GitWorkbench {
 				content_rows.saturating_sub(metadata_rows).max(1)
 			})
 		} else {
-			let description_rows =
-				u16::try_from(description.lines().count().clamp(1, 5)).unwrap_or(5);
+			let description_rows = u16::try_from(description.lines().count().clamp(1, 5)).unwrap_or(5);
 			content_rows
 				.saturating_sub(7_u16.saturating_add(description_rows))
 				.max(1)
@@ -144,16 +140,14 @@ impl GitWorkbench {
 		let commit_label = self.commit_button_label();
 		let commit_text =
 			sf!("{} {commit_label}", self.ctx.charset.icon_named("commit-node").unwrap_or(""));
-		let description_editor = EditorPane::new()
-			.with(Prop::Id, DESCRIPTION_PANE_ID)
-			.input(
-				EditInput::new()
-					.with(Prop::Id, DESCRIPTION_ID)
-					.with(Prop::Value, description)
-					.with(Prop::Rail, true)
-					.with(Prop::Placeholder, "Description")
-					.with(Prop::MaxRows, 5_u16),
-			);
+		let description_editor = EditorPane::new().with(Prop::Id, DESCRIPTION_PANE_ID).input(
+			EditInput::new()
+				.with(Prop::Id, DESCRIPTION_ID)
+				.with(Prop::Value, description)
+				.with(Prop::Rail, true)
+				.with(Prop::Placeholder, "Description")
+				.with(Prop::MaxRows, 5_u16),
+		);
 		dom! {
 			<col w={width}>
 				<row h=1 gap=1>
@@ -206,10 +200,8 @@ pub(super) fn sidebar_rows(snapshot: &GitSnapshot, tree: bool, ctx: &UiContext) 
 		.map(|file| (GitArea::Unstaged, file))
 		.collect::<Vec<_>>();
 	append_files(&mut rows, &unstaged, tree, ctx);
-	rows.push(action_row(
-		SidebarTarget::UnstageAll,
-		sf!("Staged Files ({})", snapshot.staged.len()),
-	));
+	rows
+		.push(action_row(SidebarTarget::UnstageAll, sf!("Staged Files ({})", snapshot.staged.len())));
 	let staged = snapshot
 		.staged
 		.iter()
@@ -290,13 +282,13 @@ fn append_tree(
 			.first()
 			.map_or_else(|| subtree_area(current).unwrap_or(GitArea::Unstaged), |(area, _)| *area);
 		rows.push(SidebarRow {
-			target: SidebarTarget::Directory { area, path: path.clone(), depth },
-			status: None,
+			target:       SidebarTarget::Directory { area, path: path.clone(), depth },
+			status:       None,
 			status_color: ctx.theme.muted,
-			directory: Str::default(),
-			basename: sf!("{compressed}/"),
-			additions: None,
-			deletions: None,
+			directory:    Str::default(),
+			basename:     sf!("{compressed}/"),
+			additions:    None,
+			deletions:    None,
 		});
 		append_tree(rows, current, path.as_str(), depth + 1, ctx);
 	}
@@ -333,7 +325,11 @@ fn file_sidebar_row(
 		target: SidebarTarget::File { area, path: file.path.clone(), depth },
 		status: Some(status.to_str()),
 		status_color,
-		directory: if tree { Str::default() } else { directory.to_str() },
+		directory: if tree {
+			Str::default()
+		} else {
+			directory.to_str()
+		},
 		basename: basename.to_str(),
 		additions: file.additions.filter(|count| *count != 0),
 		deletions: file.deletions.filter(|count| *count != 0),
@@ -421,7 +417,9 @@ fn row_node(row: &SidebarRow, collapsed: &BTreeSet<Str>) -> TreeNode {
 		},
 		SidebarTarget::File { .. } => {
 			if let Some(status) = &row.status {
-				node = node.badge(status.clone()).with(Prop::Color, row.status_color);
+				node = node
+					.badge(status.clone())
+					.with(Prop::Color, row.status_color);
 			}
 			if !row.directory.is_empty() {
 				node = node.prefix(row.directory.clone());

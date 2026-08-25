@@ -97,6 +97,7 @@ impl GitQuery {
 	) -> Result<Bytes, CommandError> {
 		self.bytes(cwd, &["show", spec], cancel).await
 	}
+
 	/// Streams exact blob stdout frames from one `git show` object spec.
 	///
 	/// `on_stdout` observes bounded chunks as they arrive. The returned bytes

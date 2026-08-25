@@ -6,8 +6,7 @@ pub mod model;
 use std::{
 	path::Path,
 	sync::{
-		Arc,
-		Mutex as StdMutex,
+		Arc, Mutex as StdMutex,
 		atomic::{AtomicBool, Ordering},
 	},
 };
@@ -34,10 +33,10 @@ pub struct GitIntentResult {
 /// Cloneable controller shared by refresh and interaction tasks.
 #[derive(Clone)]
 pub struct GitSession {
-	model:  Arc<Mutex<GitModel>>,
-	avatar: Option<AvatarLoader>,
-	busy:   Arc<AtomicBool>,
-	cancel: CancellationToken,
+	model:       Arc<Mutex<GitModel>>,
+	avatar:      Option<AvatarLoader>,
+	busy:        Arc<AtomicBool>,
+	cancel:      CancellationToken,
 	load_cancel: Arc<StdMutex<CancellationToken>>,
 }
 
@@ -276,9 +275,6 @@ mod tests {
 			})
 			.await;
 		assert!(first.await.unwrap().updates.is_empty());
-		assert!(matches!(
-			second.updates.as_slice(),
-			[GitUpdate::Contents { seq: 2, .. }]
-		));
+		assert!(matches!(second.updates.as_slice(), [GitUpdate::Contents { seq: 2, .. }]));
 	}
 }
