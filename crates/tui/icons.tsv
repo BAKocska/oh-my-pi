@@ -194,7 +194,9 @@ config	file.config	[cfg]	⚙	
 confirm	action.confirm	[ok]	✓	
 conflict	status.conflict	[!]	⚡	
 context	icon.context	ctx:	◫	
+context-compaction	context.compaction	|	┃	󰁨
 context-file	icon.extensionContextFile	CF	📎	
+context-speculation	context.speculation	:	╎	󰕝
 context-tab	tab.context	[X]	📋	󰘸
 cooked-rice	object.cookedRice	rice	🍚	󰟪
 cookie	object.cookie	cookie	🍪	
@@ -296,6 +298,7 @@ exa	tool.exa	exa	🔭	
 exclamation-question	status.exclamationQuestion	!?	⁉	
 exit	nav.exit	exit	🚪	
 expand	action.expand	<>	↔	
+export	cmd.export	exp	📤	
 extension-command	cmd.extension	EX	🧩	
 external	nav.external	ext	↗	
 eye	object.eye	eye	👁	
@@ -343,7 +346,10 @@ foggy-weather	object.foggyWeather	fog	🌁	
 folded-hands-praying	object.foldedHandsPraying	pray	🙏	
 folder	icon.folder	[D]	📁	
 folder-closed	file.folderClosed	[D]	📁	
+folder-minus	cmd.folderMinus	dir-	📁	󰉘
+folder-move	cmd.folderMove	dir>	📂	󰉒
 folder-open	file.folderOpen	[O]	📂	
+folder-plus	cmd.folderPlus	dir+	📁	󰉗
 food-pot	object.foodPot	pot	🍲	󰋥
 footprints	object.footprints	steps	👣	
 fork	git.fork	fork	⑂	
@@ -395,6 +401,7 @@ hamsa	object.hamsa	hamsa	🪬	
 hand-lizard	object.handLizard	lizard	🦎	
 hand-over-mouth	action.handOverMouth	shh	🤭	
 handbag	object.handbag	bag	👜	󰸐
+handoff	cmd.handoff	->>	➦	
 handshake	object.handshake	shake	🤝	
 head-bandage	object.headBandage	bandg	🤕	
 headphones	object.headphones	phones	🎧	
@@ -923,6 +930,7 @@ sunrise	object.sunrise	rise	🌅	
 sunset	object.sunset	sunset	🌇	
 sushi	object.sushi	sushi	🍣	
 suspension-railway	object.suspensionRailway	rail	🚟	
+swap	cmd.swap	<->	⇄	󰓡
 swift	lang.swift	swift	🕊	
 symlink	file.symlink	[link]	🔗	
 synagogue	object.synagogue	synag	🕍	
@@ -1023,6 +1031,7 @@ usb	device.usb	usb	🔌	
 user-add	user.add	+usr	👤	
 user-remove	user.remove	-usr	👤	
 vertical-traffic-light	object.verticalTrafficLight	light	🚦	
+vibrate	cmd.vibrate	vib	📳	󰕦
 video	comm.video	cam	📹	
 video-file	file.video	[vid]	🎥	
 videocassette	device.videocassette	VHS	📼	󰨛
@@ -1044,6 +1053,7 @@ watch	device.watch	watch	⌚	󰖉
 water-pistol	object.waterPistol	squirt	🔫	󰜃
 water-wave	object.waterWave	wave	🌊	󰼮
 watermelon	object.watermelon	melon	🍉	󱁇
+wave	cmd.wave	~	∿	󰥛
 waving-hand	action.wavingHand	wave	👋	󱠡
 wavy-dash-cod	object.wavyDashCod	~	〰	
 waxing-crescent-moon	object.waxingCrescentMoon	moon	🌒	󰽧

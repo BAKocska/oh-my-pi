@@ -127,6 +127,8 @@ pub struct CommandDeclaration {
 	pub order:           u16,
 	/// Canonical spelling without `/`.
 	pub name:            Str,
+	/// Semantic completion icon for compiled commands.
+	pub icon:            omp_tui::Icon,
 	/// Alternate spellings without `/`.
 	pub aliases:         Arc<[Str]>,
 	/// One-line help and completion text.
@@ -215,19 +217,13 @@ pub struct CommandRoster {
 	commands:  Arc<[CommandDeclaration]>,
 	spellings: Arc<HashMap<Str, usize>>,
 }
+
 fn completion_icon(declaration: &CommandDeclaration) -> omp_tui::Icon {
 	match declaration.provenance.kind {
+		CommandSourceKind::Builtin => declaration.icon,
 		CommandSourceKind::Skill => omp_tui::Icon::Skill,
 		CommandSourceKind::Extension => omp_tui::Icon::ExtensionCommand,
 		CommandSourceKind::Custom | CommandSourceKind::Markdown => omp_tui::Icon::Prompt,
-		CommandSourceKind::Builtin if declaration.name == "mcp" => omp_tui::Icon::McpExtension,
-		CommandSourceKind::Builtin if declaration.name == "pin" => omp_tui::Icon::Pin,
-		CommandSourceKind::Builtin
-			if matches!(declaration.name.as_str(), "resume" | "new" | "clear") =>
-		{
-			omp_tui::Icon::Session
-		},
-		CommandSourceKind::Builtin => omp_tui::Icon::SlashCommand,
 	}
 }
 
@@ -475,5 +471,79 @@ impl CommandRoster {
 			};
 			Ok(DispatchResult::Handled(result))
 		})
+	}
+}
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn completion_items_use_builtin_icons_and_source_kind_overrides() {
+		let provenance = CommandProvenance {
+			source:     sf!("test:notes"),
+			label:      sf!("Test Markdown"),
+			kind:       CommandSourceKind::Markdown,
+			generation: 1,
+		};
+		let markdown = CommandDeclaration {
+			order:           0,
+			name:            sf!("notes"),
+			icon:            omp_tui::Icon::Model,
+			aliases:         Arc::from([]),
+			description:     sf!("Run the Markdown prompt"),
+			argument_hint:   None,
+			hints:           Arc::from([]),
+			capabilities:    Arc::from([]),
+			surfaces:        Arc::from([CommandSurface::Tui]),
+			guest_visible:   false,
+			acp_description: None,
+			provenance:      provenance.clone(),
+			implementation:  CommandImplementation::Prompt(sf!("Review the notes")),
+		};
+		let roster = CommandRoster::with_contributions(
+			[CommandGeneration { provenance, declarations: Arc::from([markdown]) }],
+			&ShadowPolicy::default(),
+		);
+		let completions = roster.completions();
+		let icon = |name: &str| {
+			completions
+				.iter()
+				.find(|command| command.name() == name)
+				.and_then(omp_tui::Command::icon)
+				.unwrap_or_else(|| panic!("missing completion icon for /{name}"))
+		};
+
+		assert_eq!(icon("model"), omp_tui::Icon::Model);
+		assert_eq!(icon("quit"), omp_tui::Icon::Power);
+		assert_eq!(icon("mcp"), omp_tui::Icon::Mcp);
+		assert_eq!(icon("notes"), omp_tui::Icon::Prompt);
+
+		for command in &completions {
+			let icon = command
+				.icon()
+				.unwrap_or_else(|| panic!("missing completion icon for /{}", command.name()));
+			assert_ne!(
+				icon,
+				omp_tui::Icon::SlashCommand,
+				"/{} retained the generic slash-command icon",
+				command.name()
+			);
+			for charset in
+				[omp_tui::Charset::Ascii, omp_tui::Charset::Unicode, omp_tui::Charset::NerdFont]
+			{
+				assert!(!charset.icon(icon).is_empty(), "/{} has an empty icon", command.name());
+			}
+		}
+
+		for (icon, glyphs) in [
+			(omp_tui::Icon::Model, ["[M]", "⬢", ""]),
+			(omp_tui::Icon::Power, ["PWR", "⏻", ""]),
+			(omp_tui::Icon::Mcp, ["<>", "🔌", ""]),
+			(omp_tui::Icon::Prompt, ["PR", "✎", ""]),
+		] {
+			assert_eq!(omp_tui::Charset::Ascii.icon(icon), glyphs[0]);
+			assert_eq!(omp_tui::Charset::Unicode.icon(icon), glyphs[1]);
+			assert_eq!(omp_tui::Charset::NerdFont.icon(icon), glyphs[2]);
+		}
 	}
 }

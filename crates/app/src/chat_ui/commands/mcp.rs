@@ -2,7 +2,7 @@ use omp_core::Str;
 
 use super::{ConfigScope, McpRequest, command};
 
-command!(mcp, 620, "mcp", [], "Manage Environment MCP servers", [Workspace, Owner], false, typed("list|add|remove|enable|disable|test|reconnect|reauth|unauth|help", ["list", "add", "remove", "enable", "disable", "test", "reconnect", "reauth", "unauth", "help"], parse_mcp) => |host, request| host.mcp(request));
+command!(mcp, 620, "mcp", icon: Mcp, [], "Manage Environment MCP servers", [Workspace, Owner], false, typed("list|add|remove|enable|disable|test|reconnect|reauth|unauth|help", ["list", "add", "remove", "enable", "disable", "test", "reconnect", "reauth", "unauth", "help"], parse_mcp) => |host, request| host.mcp(request));
 
 fn parse_mcp(raw: &str) -> miette::Result<McpRequest> {
 	let raw = raw.trim();

@@ -7,7 +7,7 @@ use omp_core::Str;
 
 use super::command;
 
-command!(context, 400, "context", [], "Show anchored context usage", [Context], true, none => |host| host.context());
+command!(context, 400, "context", icon: Context, [], "Show anchored context usage", [Context], true, none => |host| host.context());
 
 /// Renders only fields from an already anchored snapshot; this function never
 /// re-tokenizes or consults mutable chat state.

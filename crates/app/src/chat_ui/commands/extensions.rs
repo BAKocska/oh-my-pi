@@ -6,10 +6,10 @@ pub(crate) use inspector_model::{build_inspector_snapshot_from_declarations, sna
 
 use super::{ConfigScope, ExtensionRequest, MarketplaceRequest, PluginRequest, command};
 
-command!(extensions, 630, "extensions", [], "Inspect discovered extensions and live MCP catalogs", [Workspace, Owner], false, typed("", [], parse_extensions) => |host, _parsed| host.extensions(ExtensionRequest::Inspect));
-command!(marketplace, 640, "marketplace", [], "Manage signed extension indexes and packages", [Workspace, Owner], false, typed("[add|remove|update|list|discover|install|uninstall|installed|upgrade|help]", ["add", "remove", "update", "list", "discover", "install", "uninstall", "installed", "upgrade", "help", "--force", "--scope"], parse_marketplace) => |host, request| host.extensions(ExtensionRequest::Marketplace(request)));
-command!(plugins, 650, "plugins", [], "List, enable, or disable native extensions", [Workspace, Owner], false, typed("[list|enable|disable]", ["list", "enable", "disable"], parse_plugins) => |host, request| host.extensions(ExtensionRequest::Plugins(request)));
-command!(reload_plugins, 660, "reload-plugins", [], "Rediscover and reload native extensions", [Workspace, Owner], false, none => |host| host.extensions(ExtensionRequest::Reload));
+command!(extensions, 132, "extensions", icon: ExtensionCommand, ["status"], "Inspect discovered extensions and live MCP catalogs", [Workspace, Owner], false, typed("", [], parse_extensions) => |host, _parsed| host.extensions(ExtensionRequest::Inspect));
+command!(marketplace, 640, "marketplace", icon: Cart, [], "Manage marketplace plugin sources and installed plugins", [Workspace, Owner], false, typed("<subcommand>", ["add", "remove", "update", "list", "discover", "install", "uninstall", "installed", "upgrade", "help", "--force", "--scope"], parse_marketplace) => |host, request| host.extensions(ExtensionRequest::Marketplace(request)));
+command!(plugins, 650, "plugins", icon: Package, [], "View and manage installed native plugins", [Workspace, Owner], false, typed("[list|enable|disable]", ["list", "enable", "disable", "--scope"], parse_plugins) => |host, request| host.extensions(ExtensionRequest::Plugins(request)));
+command!(reload_plugins, 660, "reload-plugins", icon: Refresh, [], "Reload all native plugins, commands, skills, tools, and agents", [Workspace, Owner], false, none => |host| host.extensions(ExtensionRequest::Reload));
 
 pub(super) fn parse_extensions(raw: &str) -> miette::Result<()> {
 	if raw.trim().is_empty() {
@@ -27,7 +27,7 @@ fn parse_marketplace(raw: &str) -> miette::Result<MarketplaceRequest> {
 		"installed" => none(words, MarketplaceRequest::Installed),
 		"help" => none(words, MarketplaceRequest::Help),
 		"add" => one(words, MarketplaceRequest::Add),
-		"remove" => one(words, MarketplaceRequest::Remove),
+		"remove" | "rm" => one(words, MarketplaceRequest::Remove),
 		"update" => optional_one(words, MarketplaceRequest::Update),
 		"discover" => optional_one(words, MarketplaceRequest::Discover),
 		"install" => parse_package(words, true, |spec, scope, force| MarketplaceRequest::Install {
@@ -47,10 +47,48 @@ fn parse_plugins(raw: &str) -> miette::Result<PluginRequest> {
 	let mut words = raw.split_whitespace();
 	match words.next().unwrap_or("list") {
 		"list" if words.next().is_none() => Ok(PluginRequest::List),
-		"enable" => one(words, PluginRequest::Enable),
-		"disable" => one(words, PluginRequest::Disable),
-		_ => Err(miette::miette!("usage: /plugins [list|enable <name>|disable <name>]")),
+		"enable" => parse_plugin_toggle(words, true),
+		"disable" => parse_plugin_toggle(words, false),
+		_ => Err(plugin_usage()),
 	}
+}
+
+fn parse_plugin_toggle<'a>(
+	words: impl Iterator<Item = &'a str>,
+	enabled: bool,
+) -> miette::Result<PluginRequest> {
+	let mut scope = ConfigScope::User;
+	let mut id = None;
+	let mut words = words.peekable();
+	while let Some(word) = words.next() {
+		match word {
+			"--scope" => {
+				scope = match words.next() {
+					Some("user") => ConfigScope::User,
+					Some("project") => ConfigScope::Project,
+					_ => return Err(miette::miette!("--scope must be `user` or `project`")),
+				};
+			},
+			value if value.starts_with("--") => {
+				return Err(miette::miette!("unknown plugin option `{value}`"));
+			},
+			value if id.is_none() => id = Some(Str::new(value)),
+			_ => return Err(plugin_usage()),
+		}
+	}
+	let id = id.ok_or_else(plugin_usage)?;
+	Ok(if enabled {
+		PluginRequest::Enable { id, scope }
+	} else {
+		PluginRequest::Disable { id, scope }
+	})
+}
+
+fn plugin_usage() -> miette::Report {
+	miette::miette!(
+		"usage: /plugins [list|enable [--scope user|project] <name>|disable [--scope user|project] \
+		 <name>]"
+	)
 }
 
 fn parse_package<'a>(
@@ -160,5 +198,42 @@ mod tests {
 		assert!(parse_extensions("  \t").is_ok());
 		assert!(parse_extensions("list").is_err());
 		assert!(parse_extensions("--json").is_err());
+	}
+	#[test]
+	fn marketplace_install_accepts_force_and_scope_in_any_order() {
+		assert_eq!(
+			parse_marketplace("install --scope project package@index --force").unwrap(),
+			MarketplaceRequest::Install {
+				spec:  Str::new_static("package@index"),
+				scope: ConfigScope::Project,
+				force: true,
+			}
+		);
+		assert_eq!(
+			parse_marketplace("install --force package@index --scope user").unwrap(),
+			MarketplaceRequest::Install {
+				spec:  Str::new_static("package@index"),
+				scope: ConfigScope::User,
+				force: true,
+			}
+		);
+	}
+
+	#[test]
+	fn plugin_toggle_accepts_scoped_identity() {
+		assert_eq!(
+			parse_plugins("disable package@index --scope project").unwrap(),
+			PluginRequest::Disable {
+				id:    Str::new_static("package@index"),
+				scope: ConfigScope::Project,
+			}
+		);
+		assert_eq!(
+			parse_plugins("enable --scope user package@index").unwrap(),
+			PluginRequest::Enable {
+				id:    Str::new_static("package@index"),
+				scope: ConfigScope::User,
+			}
+		);
 	}
 }

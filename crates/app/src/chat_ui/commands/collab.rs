@@ -7,9 +7,9 @@ use omp_driver::{
 
 use super::{CollabRequest, ParsedFlags, command, parse_flags};
 
-command!(collab, 700, "collab", [], "Host or inspect live collaboration", [Session], true, typed("[start|view|status|stop] [--relay URL] [--web-url URL]", ["start", "view", "status", "stop", "--relay", "--web-url"], parse_collab) => |host, request| host.collab(request));
-command!(join, 710, "join", [], "Join a live collaboration", [Session], true, required("<link>") => |host, link| host.join_collab(link));
-command!(leave, 720, "leave", [], "Leave the active collaboration", [Session], true, none => |host| host.leave_collab());
+command!(collab, 700, "collab", icon: Broadcast, [], "Host or inspect live collaboration", [Session], true, typed("[start|view|status|stop] [--relay URL] [--web-url URL]", ["start", "view", "status", "stop", "--relay", "--web-url"], parse_collab) => |host, request| host.collab(request));
+command!(join, 710, "join", icon: Input, [], "Join a live collaboration", [Session], true, required("<link>") => |host, link| host.join_collab(link));
+command!(leave, 720, "leave", icon: Output, [], "Leave the active collaboration", [Session], true, none => |host| host.leave_collab());
 
 fn parse_collab(raw: &str) -> miette::Result<CollabRequest> {
 	let raw = raw.trim();

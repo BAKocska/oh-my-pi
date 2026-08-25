@@ -26,6 +26,6 @@ fn parse(args: &str) -> miette::Result<SecurityRequest> {
 	Ok(SecurityRequest::Review((!path.is_empty()).then(|| Str::new(path))))
 }
 
-command!(security, 760, "security", [], "Run a findings-first local security review", [
+command!(security, 760, "security", icon: Shield, [], "Run a findings-first local security review", [
 	Workspace, Execution, Owner
 ], false, typed("review [relative-path]", ["review"], parse) => |host, request| host.security(request));

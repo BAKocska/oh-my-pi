@@ -1,10 +1,15 @@
 //! Structural slash-command router and capability-scoped host contracts.
 
 mod advisor;
+pub(super) mod asides;
 pub(crate) mod collab;
 mod config;
+mod diagnostics;
+pub(crate) use diagnostics::{render_debug, run_cleanse};
 pub mod context;
 mod export;
+#[path = "extensions/runtime.rs"]
+pub(crate) mod extension_runtime;
 mod extensions;
 pub(crate) use extensions::{build_inspector_snapshot_from_declarations, snapshot_live_mcp};
 mod flow;
@@ -13,14 +18,16 @@ mod green;
 mod mcp;
 mod memory;
 mod model;
+pub(crate) use model::resolve_extended_context;
 pub mod registry;
 pub mod result;
 mod review;
 mod security;
 mod session;
 mod share;
-mod ssh;
-mod utility;
+pub(crate) mod ssh;
+pub(crate) mod utility;
+pub(crate) mod workspace;
 
 use std::{future::Future, path::PathBuf, pin::Pin, sync::Arc};
 
@@ -127,8 +134,6 @@ pub enum UtilityRequest {
 	Changelog(ChangelogRequest),
 	/// List active and disabled tools.
 	Tools,
-	/// Open the native extension dashboard.
-	Extensions,
 	/// Control desktop automation.
 	Computer(ComputerRequest),
 	/// Control image-tool delegation.
@@ -243,6 +248,12 @@ pub trait ModelCommandHost {
 	fn model(&mut self, selector: Option<Str>) -> CommandFuture<'_>;
 	/// Set a resume-stable session override, or request interactive selection.
 	fn switch(&mut self, selector: Option<Str>) -> CommandFuture<'_>;
+	/// Toggle or inspect the current model's catalog-backed extended context
+	/// selection.
+	fn extended_context(&mut self, action: Str) -> CommandFuture<'_> {
+		let _ = action;
+		Box::pin(async { Err(miette::miette!("extended context control is unavailable")) })
+	}
 }
 
 /// Configuration/credential-scoped command capabilities.
@@ -250,7 +261,7 @@ pub trait ConfigCommandHost {
 	/// Open settings.
 	fn settings(&mut self) -> CommandFuture<'_>;
 	/// Open provider setup.
-	fn setup(&mut self) -> CommandFuture<'_>;
+	fn setup(&mut self, section: Option<Str>) -> CommandFuture<'_>;
 	/// Show configured providers.
 	fn providers(&mut self) -> CommandFuture<'_>;
 	/// Start a guarded provider login.
@@ -368,9 +379,19 @@ pub enum PluginRequest {
 	/// List effective extensions and shadowing state.
 	List,
 	/// Enable one extension.
-	Enable(Str),
+	Enable {
+		/// Extension identifier.
+		id:    Str,
+		/// Configuration scope receiving the enablement.
+		scope: ConfigScope,
+	},
 	/// Disable one extension.
-	Disable(Str),
+	Disable {
+		/// Extension identifier.
+		id:    Str,
+		/// Configuration scope receiving the disablement.
+		scope: ConfigScope,
+	},
 }
 /// Parsed local security workflow operation.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -520,6 +541,11 @@ pub trait FlowCommandHost {
 			}))
 		})
 	}
+	/// Run the project diagnostic cleanse workflow.
+	fn cleanse(&mut self, args: omp_driver::cleanse::CleanseArgs) -> CommandFuture<'_> {
+		let _ = args;
+		Box::pin(async { Err(miette::miette!("project cleansing is unavailable")) })
+	}
 }
 
 /// Complete command host assembled from capability-scoped interfaces.
@@ -546,6 +572,7 @@ impl<T> CommandHost for T where
 pub(super) fn declaration(
 	order: u16,
 	name: &'static str,
+	icon: omp_tui::Icon,
 	aliases: &'static [&'static str],
 	description: &'static str,
 	argument_hint: &'static str,
@@ -557,6 +584,7 @@ pub(super) fn declaration(
 	CommandDeclaration {
 		order,
 		name: sf!(name),
+		icon,
 		aliases: aliases.iter().copied().map(Str::new).collect(),
 		description: sf!(description),
 		argument_hint: (!argument_hint.is_empty()).then(|| sf!(argument_hint)),
@@ -630,8 +658,17 @@ pub(super) fn parse_flags(args: &str) -> miette::Result<ParsedFlags> {
 	Ok(ParsedFlags(parsed))
 }
 
+macro_rules! command_icon {
+	() => {
+		omp_tui::Icon::SlashCommand
+	};
+	($icon:ident) => {
+		omp_tui::Icon::$icon
+	};
+}
+
 macro_rules! command_common {
-	($module:ident, $order:literal, $name:literal, [$($alias:literal),* $(,)?], $description:literal,
+	($module:ident, $order:literal, $name:literal, $(icon: $icon:ident,)? [$($alias:literal),* $(,)?], $description:literal,
 	 $hint:literal, [$($candidate:literal),* $(,)?], [$($capability:ident),* $(,)?], $guest:literal,
 		$parse:expr, |$host:ident, $args:ident| $body:expr) => {
 		mod $module {
@@ -650,7 +687,13 @@ macro_rules! command_common {
 			}
 			fn build() -> $crate::chat_ui::commands::CommandDeclaration {
 				$crate::chat_ui::commands::declaration(
-					$order, $name, &[$($alias),*], $description, $hint, &[$($candidate),*],
+					$order,
+					$name,
+					$crate::chat_ui::commands::command_icon!($($icon)?),
+					&[$($alias),*],
+					$description,
+					$hint,
+					&[$($candidate),*],
 					&[$($crate::chat_ui::commands::CommandCapability::$capability),*],
 					$guest,
 					handle,
@@ -664,52 +707,53 @@ macro_rules! command_common {
 }
 
 macro_rules! command {
-	($module:ident, $order:literal, $name:literal, [$($alias:literal),* $(,)?], $description:literal,
+	($module:ident, $order:literal, $name:literal, $(icon: $icon:ident,)? [$($alias:literal),* $(,)?], $description:literal,
 	 [$($capability:ident),* $(,)?], $guest:literal, none => |$host:ident| $body:expr) => {
-		$crate::chat_ui::commands::command_common!($module, $order, $name, [$($alias),*], $description, "", [],
+		$crate::chat_ui::commands::command_common!($module, $order, $name, $(icon: $icon,)? [$($alias),*], $description, "", [],
 			[$($capability),*], $guest,
 			|raw| $crate::chat_ui::commands::parse_none(raw, concat!("/", $name)),
 			|$host, _args| $body);
 	};
-	($module:ident, $order:literal, $name:literal, [$($alias:literal),* $(,)?], $description:literal,
+	($module:ident, $order:literal, $name:literal, $(icon: $icon:ident,)? [$($alias:literal),* $(,)?], $description:literal,
 	 [$($capability:ident),* $(,)?], $guest:literal, required($hint:literal) => |$host:ident, $arg:ident| $body:expr) => {
-		$crate::chat_ui::commands::command_common!($module, $order, $name, [$($alias),*], $description, $hint, [],
+		$crate::chat_ui::commands::command_common!($module, $order, $name, $(icon: $icon,)? [$($alias),*], $description, $hint, [],
 			[$($capability),*], $guest,
 			|raw| $crate::chat_ui::commands::parse_required(
 				raw, concat!("/", $name, " ", $hint)
 			),
 			|$host, $arg| $body);
 	};
-	($module:ident, $order:literal, $name:literal, [$($alias:literal),* $(,)?], $description:literal,
+	($module:ident, $order:literal, $name:literal, $(icon: $icon:ident,)? [$($alias:literal),* $(,)?], $description:literal,
 	 [$($capability:ident),* $(,)?], $guest:literal, optional($hint:literal) => |$host:ident, $arg:ident| $body:expr) => {
-		$crate::chat_ui::commands::command_common!($module, $order, $name, [$($alias),*], $description, $hint, [],
+		$crate::chat_ui::commands::command_common!($module, $order, $name, $(icon: $icon,)? [$($alias),*], $description, $hint, [],
 			[$($capability),*], $guest,
 			$crate::chat_ui::commands::parse_optional, |$host, $arg| $body);
 	};
-	($module:ident, $order:literal, $name:literal, [$($alias:literal),* $(,)?], $description:literal,
+	($module:ident, $order:literal, $name:literal, $(icon: $icon:ident,)? [$($alias:literal),* $(,)?], $description:literal,
 	 [$($capability:ident),* $(,)?], $guest:literal, selector($hint:literal) => |$host:ident, $arg:ident| $body:expr) => {
-		$crate::chat_ui::commands::command_common!($module, $order, $name, [$($alias),*], $description, $hint, [],
+		$crate::chat_ui::commands::command_common!($module, $order, $name, $(icon: $icon,)? [$($alias),*], $description, $hint, [],
 			[$($capability),*], $guest, $crate::chat_ui::commands::parse_selector,
 			|$host, $arg| $body);
 	};
-	($module:ident, $order:literal, $name:literal, [$($alias:literal),* $(,)?], $description:literal,
+	($module:ident, $order:literal, $name:literal, $(icon: $icon:ident,)? [$($alias:literal),* $(,)?], $description:literal,
 	 [$($capability:ident),* $(,)?], $guest:literal, raw($hint:literal, [$($candidate:literal),* $(,)?]) => |$host:ident, $arg:ident| $body:expr) => {
-		$crate::chat_ui::commands::command_common!($module, $order, $name, [$($alias),*], $description, $hint,
+		$crate::chat_ui::commands::command_common!($module, $order, $name, $(icon: $icon,)? [$($alias),*], $description, $hint,
 			[$($candidate),*], [$($capability),*], $guest,
 			$crate::chat_ui::commands::parse_raw, |$host, $arg| $body);
 	};
-	($module:ident, $order:literal, $name:literal, [$($alias:literal),* $(,)?], $description:literal,
+	($module:ident, $order:literal, $name:literal, $(icon: $icon:ident,)? [$($alias:literal),* $(,)?], $description:literal,
 	 [$($capability:ident),* $(,)?], $guest:literal, flags($hint:literal, [$($candidate:literal),* $(,)?]) => |$host:ident, $arg:ident| $body:expr) => {
-		$crate::chat_ui::commands::command_common!($module, $order, $name, [$($alias),*], $description, $hint,
+		$crate::chat_ui::commands::command_common!($module, $order, $name, $(icon: $icon,)? [$($alias),*], $description, $hint,
 			[$($candidate),*], [$($capability),*], $guest,
 			$crate::chat_ui::commands::parse_flags, |$host, $arg| $body);
 	};
-	($module:ident, $order:literal, $name:literal, [$($alias:literal),* $(,)?], $description:literal,
+	($module:ident, $order:literal, $name:literal, $(icon: $icon:ident,)? [$($alias:literal),* $(,)?], $description:literal,
 	 [$($capability:ident),* $(,)?], $guest:literal, typed($hint:literal, [$($candidate:literal),* $(,)?], $parse:path) => |$host:ident, $arg:ident| $body:expr) => {
-		$crate::chat_ui::commands::command_common!($module, $order, $name, [$($alias),*], $description, $hint,
+		$crate::chat_ui::commands::command_common!($module, $order, $name, $(icon: $icon,)? [$($alias),*], $description, $hint,
 			[$($candidate),*], [$($capability),*], $guest, $parse, |$host, $arg| $body);
 	};
 }
 
 pub(super) use command;
 pub(crate) use command_common;
+pub(crate) use command_icon;

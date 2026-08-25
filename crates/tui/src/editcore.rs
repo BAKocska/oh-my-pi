@@ -2242,6 +2242,11 @@ impl Command {
 		&self.name
 	}
 
+	/// Semantic type-indicator icon resolved by the active charset.
+	pub const fn icon(&self) -> Option<Icon> {
+		self.icon
+	}
+
 	/// The one-line blurb shown beside the command name.
 	pub fn description(&self) -> &str {
 		&self.description

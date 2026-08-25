@@ -4,7 +4,7 @@ use omp_core::Str;
 
 use super::{AdvisorRequest, command};
 
-command!(advisor, 570, "advisor", [], "Control the advisor watchdog", [Execution, Session], false, typed("[toggle|on|off|status|dump|configure <settings>]", ["toggle", "on", "off", "status", "dump", "configure"], parse_advisor) => |host, request| host.advisor(request));
+command!(advisor, 570, "advisor", icon: Advisor, [], "Control the advisor watchdog", [Execution, Session], false, typed("[toggle|on|off|status|dump|configure <settings>]", ["toggle", "on", "off", "status", "dump", "configure"], parse_advisor) => |host, request| host.advisor(request));
 
 fn parse_advisor(raw: &str) -> miette::Result<AdvisorRequest> {
 	let (operation, rest) = raw
