@@ -13,6 +13,7 @@ import type { BeamMemoryState } from "@oh-my-pi/pi-mnemopi/core/beam";
 import { ftsSearch, ftsSearchWorking } from "@oh-my-pi/pi-mnemopi/core/beam/helpers";
 import { recall } from "@oh-my-pi/pi-mnemopi/core/beam/recall";
 import { initBeam } from "@oh-my-pi/pi-mnemopi/core/beam/schema";
+import { PolyphonicRecallEngine, type PolyphonicResult } from "@oh-my-pi/pi-mnemopi/core/polyphonic-recall";
 
 function makeBeam(db: Database): BeamMemoryState {
 	return {
@@ -133,6 +134,34 @@ describe("cjk fallback excludes superseded rows", () => {
 		db.run("UPDATE working_memory SET superseded_by = 'live0000000000aa' WHERE id = 'dead0000000000bb'");
 
 		expect(ftsSearchWorking(db, "部署手册说明", 1).map(hit => hit.id)).toEqual(["live0000000000aa"]);
+		db.close();
+	});
+});
+
+describe("polyphonic diversity window excludes invisible candidates", () => {
+	test("a flood of superseded high-scorers cannot evict a live candidate from the window", () => {
+		const db = new Database(":memory:");
+		initBeam(db);
+		const engine = new PolyphonicRecallEngine({ db, sessionId: "bank-a", channelId: "bank-a" });
+		seedWorking(db, "live0000000000aa", "vindral deployment runbook lives here");
+		const combined = new Map<string, PolyphonicResult>();
+		// Enough invisible high-scorers to fill the whole window (limit*OVERFETCH and the
+		// minimum window are both far below 80) ahead of the live row.
+		for (let index = 0; index < 80; index++) {
+			const id = `ghost${String(index).padStart(11, "0")}`;
+			seedWorking(db, id, `ghost row ${index} vindral deployment`);
+			db.run("UPDATE working_memory SET superseded_by = 'live0000000000aa' WHERE id = ?", [id]);
+			combined.set(id, { memoryId: id, combinedScore: 1 - index * 0.001, voiceScores: { graph: 1 }, metadata: {} });
+		}
+		combined.set("live0000000000aa", {
+			memoryId: "live0000000000aa",
+			combinedScore: 0.01,
+			voiceScores: { vector: 0.01 },
+			metadata: {},
+		});
+
+		const picked = engine.diversityRerank(combined, 1);
+		expect(picked.map(result => result.memoryId)).toEqual(["live0000000000aa"]);
 		db.close();
 	});
 });

@@ -914,6 +914,44 @@ function candidateContents(db: Database, ids: readonly string[], sessionId: stri
 	return contents;
 }
 
+/**
+ * Id-only variant of {@link candidateContents}' visibility predicate, for filtering a
+ * candidate pool BEFORE the diversity window is cut: an invisible candidate (superseded,
+ * expired, out of session scope) must never occupy a window slot, or a flood of dead
+ * high-scorers evicts live rows from selection entirely (measured on post-chunk-migration
+ * banks, where every migrated parent is a broad-matching dead candidate). Chunked so a
+ * graph-walk-sized pool can never exceed SQLite's bound-variable limit.
+ */
+function visibleCandidateIds(db: Database, ids: readonly string[], sessionId: string, now: string): Set<string> {
+	const visible = new Set<string>();
+	for (let offset = 0; offset < ids.length; offset += 900) {
+		const chunk = ids.slice(offset, offset + 900);
+		const placeholders = chunk.map(() => "?").join(",");
+		try {
+			const rows = db
+				.query(`
+					SELECT id FROM working_memory
+					WHERE id IN (${placeholders})
+						AND superseded_by IS NULL
+						AND (valid_until IS NULL OR valid_until > ?)
+						AND (session_id = ? OR scope = 'global')
+					UNION
+					SELECT id FROM episodic_memory
+					WHERE id IN (${placeholders})
+						AND superseded_by IS NULL
+						AND (valid_until IS NULL OR valid_until > ?)
+						AND (session_id = ? OR scope = 'global')
+				`)
+				.all(...chunk, now, sessionId, ...chunk, now, sessionId) as Array<{ id: string }>;
+			for (const row of rows) visible.add(row.id);
+		} catch {
+			// A failed chunk keeps its candidates OUT of the visible set: fail toward fewer
+			// candidates, never toward letting an unverified id occupy a slot.
+		}
+	}
+	return visible;
+}
+
 export class PolyphonicRecallEngine {
 	readonly dbPath: DatabasePath;
 	readonly db: Database;
@@ -1529,8 +1567,19 @@ export class PolyphonicRecallEngine {
 		);
 		// The voices can nominate far more candidates than `topK` (the graph voice walks
 		// `ctx` edges depth-2 and is not intrinsically bounded), so bound the pool that
-		// gets a content lookup and an MMR pass.
-		const window = ranked.slice(0, Math.max(limit * DIVERSITY_OVERFETCH, DIVERSITY_MIN_WINDOW));
+		// gets a content lookup and an MMR pass. Visibility is applied BEFORE the window is
+		// cut: an invisible candidate (superseded/expired/out-of-scope) must never occupy a
+		// window slot, or dead high-scorers evict live rows from selection entirely.
+		const nowIso = new Date().toISOString();
+		const visibleIds = visibleCandidateIds(
+			this.db,
+			ranked.map(candidate => candidate.memoryId),
+			this.sessionId,
+			nowIso,
+		);
+		const window = ranked
+			.filter(candidate => visibleIds.has(candidate.memoryId))
+			.slice(0, Math.max(limit * DIVERSITY_OVERFETCH, DIVERSITY_MIN_WINDOW));
 		const contents = candidateContents(
 			this.db,
 			window.map(candidate => candidate.memoryId),
