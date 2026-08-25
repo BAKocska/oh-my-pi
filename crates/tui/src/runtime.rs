@@ -1025,9 +1025,7 @@ fn route_key_event(
 		UiEvent::Cancel if quit_on_cancel => Routed::Stop,
 		UiEvent::Submit => Routed::Event(AppEvent::Submitted),
 		UiEvent::Pressed(id) => Routed::Event(AppEvent::Pressed(id)),
-		UiEvent::TreeActivated { id, key } => {
-			Routed::Event(AppEvent::TreeActivated { id, key })
-		},
+		UiEvent::TreeActivated { id, key } => Routed::Event(AppEvent::TreeActivated { id, key }),
 		UiEvent::TreeToggled { id, key, expanded } => {
 			Routed::Event(AppEvent::TreeToggled { id, key, expanded })
 		},

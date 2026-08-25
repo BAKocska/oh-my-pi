@@ -1542,7 +1542,7 @@ impl ExtHostSupervisor {
 				extension.key.clone(),
 				(commands.clone(), Arc::clone(&host_generation), config.session_generation),
 			);
-			control_actors.push(HostActor { commands, actor });
+			control_actors.push(HostActor { commands, actor, reloadable: false });
 			control_hosts.push(running);
 		}
 		let mut service_broker = ServiceBroker::new(config.session_generation);
@@ -1709,7 +1709,7 @@ impl ExtHostSupervisor {
 				Arc::clone(&service_router),
 			));
 			senders.insert(process_id, (commands.clone(), host_generation, session_generation));
-			actors.push(HostActor { commands, actor });
+			actors.push(HostActor { commands, actor, reloadable: true });
 		}
 		actors.extend(control_actors);
 		let routes = routes
@@ -2084,6 +2084,26 @@ impl ExtHostSupervisor {
 		})
 	}
 
+	/// Drains idle process hosts and replaces each with a hot-reload generation.
+	pub async fn reload(&self) -> Result<Vec<u64>, WorkerError> {
+		let mut generations = Vec::new();
+		for host in self.actors.iter().filter(|host| host.reloadable) {
+			let (reply, response) = flume::bounded(1);
+			host
+				.commands
+				.send_async(SupervisorCommand::Reload { reply })
+				.await
+				.map_err(|_| WorkerError::Unavailable)?;
+			generations.push(
+				response
+					.recv_async()
+					.await
+					.map_err(|_| WorkerError::Unavailable)??,
+			);
+		}
+		Ok(generations)
+	}
+
 	/// Stops every active host and waits for its process group to exit.
 	pub async fn shutdown(self) {
 		for host in &self.actors {
@@ -2170,8 +2190,9 @@ struct HostRoute {
 }
 
 struct HostActor {
-	commands: flume::Sender<SupervisorCommand>,
-	actor:    JoinHandle<()>,
+	commands:   flume::Sender<SupervisorCommand>,
+	actor:      JoinHandle<()>,
+	reloadable: bool,
 }
 
 /// Failure while composing or starting a dedicated CONTROL connection.
@@ -2326,6 +2347,9 @@ enum SupervisorCommand {
 	Interrupt {
 		id:    u64,
 		frame: Interrupt,
+	},
+	Reload {
+		reply: flume::Sender<Result<u64, WorkerError>>,
 	},
 	Shutdown,
 }
@@ -4749,6 +4773,9 @@ async fn run_control_supervisor(
 			SupervisorCommand::ServiceDispatch { reply, .. } => {
 				let _ = reply.send(Err(WorkerError::Unavailable));
 			},
+			SupervisorCommand::Reload { reply } => {
+				let _ = reply.send(Err(WorkerError::Unavailable));
+			},
 			SupervisorCommand::Shutdown => break,
 			SupervisorCommand::Open { events, call, .. } => {
 				let _ = events.send(WorkerEvent::Aborted(WorkerAbort {
@@ -4873,6 +4900,32 @@ async fn run_supervisor(
 					}
 					.await;
 					let _ = reply.send(result);
+				},
+				Ok(SupervisorCommand::Reload { reply }) => {
+					process.terminate(config.interrupt_grace).await;
+					process = respawn(
+						&config,
+						&expected_registrations,
+						&mut generation,
+						&mut backoff,
+						RestartReason::HotReload,
+					)
+					.await;
+					host_generation.store(generation, Ordering::Release);
+					let mut broker = service_router.broker.lock();
+					for owner in config.manifests.keys() {
+						broker.deactivate_provider(owner, "provider process hot-reloaded");
+						let declarations = process
+							.service_registrations
+							.get(owner)
+							.into_iter()
+							.flat_map(|services| services.iter().cloned());
+						let _ =
+							broker.activate_provider_declarations(owner, generation, declarations);
+					}
+					drop(broker);
+					healthy_since = Instant::now();
+					let _ = reply.send(Ok(generation));
 				},
 				Ok(SupervisorCommand::Shutdown) => {
 					process.terminate(config.interrupt_grace).await;
@@ -5623,6 +5676,12 @@ fn stage_pending(pending: &mut VecDeque<PendingInvocation>, command: SupervisorC
 			))));
 			return;
 		},
+		SupervisorCommand::Reload { reply } => {
+			let _ = reply.send(Err(WorkerError::Protocol(sf!(
+				"extension worker is busy; retry reload after the active invocation drains",
+			))));
+			return;
+		},
 		command => command,
 	};
 	let id = match &command {
@@ -5633,6 +5692,7 @@ fn stage_pending(pending: &mut VecDeque<PendingInvocation>, command: SupervisorC
 		| SupervisorCommand::Interrupt { id, .. } => *id,
 		SupervisorCommand::Open { .. }
 		| SupervisorCommand::ServiceDispatch { .. }
+		| SupervisorCommand::Reload { .. }
 		| SupervisorCommand::Shutdown => return,
 	};
 	let Some(index) = pending.iter().position(|invocation| invocation.id == id) else {
@@ -5696,6 +5756,7 @@ fn stage_pending(pending: &mut VecDeque<PendingInvocation>, command: SupervisorC
 		SupervisorCommand::Open { .. }
 		| SupervisorCommand::ServiceDispatch { .. }
 		| SupervisorCommand::Cancel { .. }
+		| SupervisorCommand::Reload { .. }
 		| SupervisorCommand::Shutdown => {},
 	}
 }

@@ -1,5 +1,6 @@
 //! `omp ext` command parsing and extension-backend dispatch.
 pub mod materialize;
+pub(crate) mod service;
 
 use std::{
 	fs,
@@ -570,9 +571,10 @@ pub struct ExtWhereArgs {
 
 /// Dispatches a parsed extension command to its dedicated backend seam.
 pub async fn run(args: ExtArgs) -> miette::Result<()> {
-	let ExtArgs { data_dir, project, command, .. } = args;
+	let ExtArgs { data_dir, project, scope, command, .. } = args;
 	let data_dir = omp_core::dirs::data_dir(data_dir).into_diagnostic()?;
 	let state = StatePaths::new(&data_dir, &project);
+	let scoped_state = state.scoped(scope);
 	let settings = omp_driver::settings::current(&data_dir).map_err(|error| miette!("{error}"))?;
 	let _environment = ExtensionEnvironment::from_environment();
 	settings
@@ -581,17 +583,17 @@ pub async fn run(args: ExtArgs) -> miette::Result<()> {
 	match command {
 		ExtCommand::List(args) => list(&state, args),
 		ExtCommand::Info(args) => info(&state, args),
-		ExtCommand::Install(args) => install(&state, args).await,
-		ExtCommand::Uninstall(args) => uninstall(&state, args),
-		ExtCommand::Link(args) => link(&state, args),
-		ExtCommand::Unlink { id } => unlink(&state, &id),
-		ExtCommand::Enable { id } => enable(&state, &id, true),
-		ExtCommand::Disable { id } => enable(&state, &id, false),
+		ExtCommand::Install(args) => install(&scoped_state, args).await,
+		ExtCommand::Uninstall(args) => uninstall(&scoped_state, args),
+		ExtCommand::Link(args) => link(&scoped_state, args),
+		ExtCommand::Unlink { id } => unlink(&scoped_state, &id),
+		ExtCommand::Enable { id } => enable(&scoped_state, &id, true),
+		ExtCommand::Disable { id } => enable(&scoped_state, &id, false),
 		ExtCommand::Features(args) => features(&state, args),
 		ExtCommand::Lock(args) => lock(&state, args),
 		ExtCommand::Resolve(args) => resolve(args).await,
 		ExtCommand::Sync(args) => sync(&state, args).await,
-		ExtCommand::Upgrade(args) => upgrade(&state, args).await,
+		ExtCommand::Upgrade(args) => upgrade(&scoped_state, args).await,
 		ExtCommand::Pin { id, version } => pin(&state, id, version),
 		ExtCommand::Unpin { id } => unpin(&state, &id),
 		ExtCommand::Gc(args) => gc(&state, args),
@@ -606,12 +608,24 @@ pub async fn run(args: ExtArgs) -> miette::Result<()> {
 	}
 }
 
-fn list(state: &StatePaths, _args: ExtListArgs) -> miette::Result<()> {
-	let client =
-		InstalledRecord::read(&state.client_installed).map_err(|error| miette!("{error}"))?;
-	let workspace =
-		InstalledRecord::read(&state.workspace_installed).map_err(|error| miette!("{error}"))?;
-	println!("{} extensions", client.extensions.len() + workspace.extensions.len());
+fn list(state: &StatePaths, args: ExtListArgs) -> miette::Result<()> {
+	let entries = service::installed_views(state)?;
+	let entries = entries
+		.into_iter()
+		.filter(|entry| !args.enabled || entry.enabled)
+		.filter(|entry| !args.disabled || !entry.enabled)
+		.collect::<Vec<_>>();
+	println!("{} extensions", entries.len());
+	for entry in entries {
+		let scope = match entry.scope {
+			Scope::User => "user",
+			Scope::Project => "project",
+		};
+		let version = entry.version.as_ref().map_or("?", Str::as_str);
+		let status = if entry.enabled { "enabled" } else { "disabled" };
+		let shadowed = if entry.shadowed { " shadowed" } else { "" };
+		println!("{} {} {} {}{}", entry.id, version, scope, status, shadowed);
+	}
 	Ok(())
 }
 
@@ -643,7 +657,21 @@ async fn install(state: &StatePaths, args: ExtInstallArgs) -> miette::Result<()>
 	let mut installed =
 		InstalledRecord::read(&state.client_installed).map_err(|error| miette!("{error}"))?;
 	for spec in &args.specs {
-		match SourceSpec::parse(spec).map_err(|error| miette!("{error}"))? {
+		let source = SourceSpec::parse(spec).map_err(|error| miette!("{error}"))?;
+		let existing_id = match &source {
+			SourceSpec::Index { distribution, .. } => distribution.rsplit_once('@').map(|(id, _)| id),
+			SourceSpec::Path(path) => path.file_name().and_then(|name| name.to_str()),
+			_ => None,
+		};
+		if !args.force
+			&& existing_id.is_some_and(|id| installed.extensions.iter().any(|entry| entry.id == id))
+		{
+			return Err(miette!(
+				"extension {} is already installed; pass --force to reinstall",
+				existing_id.unwrap_or_default()
+			));
+		}
+		match source {
 			SourceSpec::Path(path) => {
 				let path = path.canonicalize().into_diagnostic()?;
 				let id = path
@@ -674,7 +702,7 @@ async fn install(state: &StatePaths, args: ExtInstallArgs) -> miette::Result<()>
 fn uninstall(state: &StatePaths, args: ExtUninstallArgs) -> miette::Result<()> {
 	let mut installed =
 		InstalledRecord::read(&state.client_installed).map_err(|error| miette!("{error}"))?;
-	let mut lock = read_lock_or_empty(&state.client_lock, BackendLayer::Client)?;
+	let mut lock = read_lock_or_empty(&state.client_lock, state.layer)?;
 	let plan = plan_uninstall(&installed, &lock, args.ids, args.keep_lock);
 	println!("remove {} installed and {} locked entries", plan.installed.len(), plan.locked.len());
 	if args.dry_run {
@@ -775,7 +803,7 @@ async fn resolve(args: ExtResolveArgs) -> miette::Result<()> {
 async fn upgrade(state: &StatePaths, args: ExtUpgradeArgs) -> miette::Result<()> {
 	if let Some(generation) = args.rollback {
 		let previous =
-			omp_ext::upgrade::load_generation(&state.generations, &generation, BackendLayer::Client)
+			omp_ext::upgrade::load_generation(&state.generations, &generation, state.layer)
 				.map_err(|error| miette!("{error}"))?;
 		if args.dry_run {
 			println!("would roll back to {generation}");
@@ -805,7 +833,7 @@ async fn upgrade(state: &StatePaths, args: ExtUpgradeArgs) -> miette::Result<()>
 	let key = fs::read_to_string(&state.index_key).into_diagnostic()?;
 	let catalog =
 		SignedIndex::read(&state.index_snapshot, key.trim()).map_err(|error| miette!("{error}"))?;
-	let lock = read_lock_or_empty(&state.client_lock, BackendLayer::Client)?;
+	let lock = read_lock_or_empty(&state.client_lock, state.layer)?;
 	for id in ids {
 		let extension = catalog
 			.extensions
@@ -824,7 +852,11 @@ async fn upgrade(state: &StatePaths, args: ExtUpgradeArgs) -> miette::Result<()>
 				.find(|release| !release.yanked),
 		}
 		.ok_or_else(|| miette!("no eligible release for {id}"))?;
-		if let Some(previous) = lock.extensions.iter().find(|locked| locked.id == id)
+		let previous = lock.extensions.iter().find(|locked| locked.id == id);
+		if previous.is_some_and(|previous| previous.version == release.version) {
+			continue;
+		}
+		if let Some(previous) = previous
 			&& previous.capability_digest != release.capability_digest
 			&& !args.allow_capability_widening
 		{
@@ -1008,34 +1040,44 @@ struct IndexConfigEntry {
 	url:  String,
 }
 
-fn index(state: &StatePaths, args: ExtIndexArgs) -> miette::Result<()> {
-	let mut config = if state.indexes.exists() {
+fn read_index_config(state: &StatePaths) -> miette::Result<IndexConfig> {
+	if state.indexes.exists() {
 		toml::from_str::<IndexConfig>(&fs::read_to_string(&state.indexes).into_diagnostic()?)
-			.into_diagnostic()?
+			.into_diagnostic()
 	} else {
-		IndexConfig::default()
-	};
+		Ok(IndexConfig::default())
+	}
+}
+
+fn upsert_index(state: &StatePaths, entry: IndexConfigEntry, first: bool) -> miette::Result<()> {
+	let mut config = read_index_config(state)?;
+	config.entries.retain(|current| current.name != entry.name);
+	if first {
+		config.entries.insert(0, entry);
+	} else {
+		config.entries.push(entry);
+	}
+	write_toml(&state.indexes, &config)
+}
+
+fn remove_index(state: &StatePaths, name: &str) -> miette::Result<()> {
+	let mut config = read_index_config(state)?;
+	let before = config.entries.len();
+	config.entries.retain(|entry| entry.name != name);
+	if before == config.entries.len() {
+		return Err(miette!("index {name} is unknown"));
+	}
+	write_toml(&state.indexes, &config)
+}
+
+fn index(state: &StatePaths, args: ExtIndexArgs) -> miette::Result<()> {
 	match args.command {
 		ExtIndexCommand::Add { name, url, first } => {
-			config.entries.retain(|entry| entry.name != name);
-			let entry = IndexConfigEntry { name, url: url.to_string() };
-			if first {
-				config.entries.insert(0, entry);
-			} else {
-				config.entries.push(entry);
-			}
-			write_toml(&state.indexes, &config)?;
+			upsert_index(state, IndexConfigEntry { name, url: url.to_string() }, first)?;
 		},
-		ExtIndexCommand::Remove { name } => {
-			let before = config.entries.len();
-			config.entries.retain(|entry| entry.name != name);
-			if before == config.entries.len() {
-				return Err(miette!("index {name} is unknown"));
-			}
-			write_toml(&state.indexes, &config)?;
-		},
+		ExtIndexCommand::Remove { name } => remove_index(state, name.as_str())?,
 		ExtIndexCommand::List => {
-			for entry in config.entries {
+			for entry in read_index_config(state)?.entries {
 				println!("{} {}", entry.name, entry.url);
 			}
 		},
@@ -1044,14 +1086,14 @@ fn index(state: &StatePaths, args: ExtIndexArgs) -> miette::Result<()> {
 }
 
 fn search(state: &StatePaths, args: ExtSearchArgs) -> miette::Result<()> {
-	let key = fs::read_to_string(&state.index_key).into_diagnostic()?;
-	let index =
-		SignedIndex::read(&state.index_snapshot, key.trim()).map_err(|error| miette!("{error}"))?;
-	for (extension, release) in index
-		.search(&args.query, args.capability.as_deref(), args.attested)
-		.take(args.limit)
-	{
-		println!("{} {} {}", extension.id, release.version, extension.description);
+	for package in service::catalog_packages(
+		state,
+		args.query.as_str(),
+		args.capability.as_deref(),
+		args.attested,
+		args.limit,
+	)? {
+		println!("{} {} {}", package.id, package.version, package.description);
 	}
 	Ok(())
 }
@@ -1067,10 +1109,12 @@ fn where_paths(state: &StatePaths, args: ExtWhereArgs) -> miette::Result<()> {
 	Ok(())
 }
 
+#[derive(Clone)]
 struct StatePaths {
 	client_installed:    PathBuf,
 	workspace_installed: PathBuf,
 	client_lock:         PathBuf,
+	workspace_lock:      PathBuf,
 	grants:              PathBuf,
 	keys:                PathBuf,
 	pins:                PathBuf,
@@ -1081,6 +1125,7 @@ struct StatePaths {
 	indexes:             PathBuf,
 	index_snapshot:      PathBuf,
 	index_key:           PathBuf,
+	layer:               BackendLayer,
 }
 
 impl StatePaths {
@@ -1090,6 +1135,7 @@ impl StatePaths {
 			client_installed:    data_dir.join("ext/installed.toml"),
 			workspace_installed: workspace.join("installed.toml"),
 			client_lock:         data_dir.join("ext/omp.lock"),
+			workspace_lock:      workspace.join("omp.lock"),
 			grants:              data_dir.join("ext/grants.toml"),
 			keys:                data_dir.join("ext/keys.toml"),
 			pins:                data_dir.join("ext/pins.toml"),
@@ -1100,6 +1146,27 @@ impl StatePaths {
 			indexes:             data_dir.join("ext/indexes.toml"),
 			index_snapshot:      data_dir.join("ext/index.json"),
 			index_key:           data_dir.join("ext/index.key"),
+			layer:               BackendLayer::Client,
+		}
+	}
+
+	fn scoped(&self, scope: Scope) -> Self {
+		match scope {
+			Scope::User => self.clone(),
+			Scope::Project => {
+				let mut state = self.clone();
+				state
+					.client_installed
+					.clone_from(&state.workspace_installed);
+				state.client_lock.clone_from(&state.workspace_lock);
+				state.generations = state
+					.workspace_installed
+					.parent()
+					.unwrap_or_else(|| Path::new("."))
+					.join("ext/generations");
+				state.layer = BackendLayer::Workspace;
+				state
+			},
 		}
 	}
 }
@@ -1194,7 +1261,7 @@ fn install_index_source(
 		)
 		.map_err(|error| miette!("{error}"))?;
 
-	let mut lock = read_lock_or_empty(&state.client_lock, BackendLayer::Client)?;
+	let mut lock = read_lock_or_empty(&state.client_lock, state.layer)?;
 	lock.indexes = vec![if index.is_empty() {
 		catalog.name.to_string()
 	} else {
