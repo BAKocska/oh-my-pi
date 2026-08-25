@@ -136,6 +136,7 @@ function makeMnemopiConfig(
 		enhancedRecall: false,
 		proactiveLinking: false,
 		retainEveryNTurns: 3,
+		retentionChunkMaxChars: 0,
 		consolidateEveryNTurns: 0,
 		recallLimit: 10,
 		recallContextTurns: 1,
@@ -663,6 +664,48 @@ describe("Mnemopi backend lifecycle", () => {
 		expect(options.embedText).toContain("I never use semicolons");
 		expect(options.embedText).not.toContain("[role:");
 		expect(options.embedText).not.toContain(":end]");
+	});
+
+	it("stores bounded transcript chunks with per-chunk crash-safe cursor metadata", async () => {
+		const maxChars = 190;
+		const state = registerMnemopiState(makeMnemopiConfig({ retentionChunkMaxChars: maxChars }), {
+			cwd: "/work/project-alpha",
+		});
+		const rememberSpy = vi.spyOn(state, "rememberInScope").mockReturnValue("memory-id");
+		const messages = [
+			{ role: "user", content: `third question ${"a".repeat(55)}` },
+			{ role: "assistant", content: `third answer ${"b".repeat(55)}` },
+			{ role: "user", content: `fourth question ${"c".repeat(55)}` },
+			{ role: "assistant", content: `fourth answer ${"d".repeat(55)}` },
+		];
+
+		await state.retainMessages(messages, "source-chunk", { retainedThroughUserTurn: 4 });
+
+		expect(rememberSpy).toHaveBeenCalledTimes(2);
+		const calls = rememberSpy.mock.calls;
+		expect(
+			calls.every(
+				([transcript]) => (typeof transcript === "string" ? transcript : transcript.content).length <= maxChars,
+			),
+		).toBe(true);
+		expect(
+			calls.map(([, options]) => ((options?.metadata ?? {}) as Record<string, unknown>).retained_through_user_turn),
+		).toEqual([3, 4]);
+		expect(calls.map(([, options]) => ((options?.metadata ?? {}) as Record<string, unknown>).chunk_index)).toEqual([
+			0, 1,
+		]);
+		expect(calls.map(([, options]) => ((options?.metadata ?? {}) as Record<string, unknown>).chunk_count)).toEqual([
+			2, 2,
+		]);
+		expect(calls.map(([, options]) => ((options?.metadata ?? {}) as Record<string, unknown>).chunk_of)).toEqual([
+			"source-chunk",
+			"source-chunk",
+		]);
+		for (const [transcript, options] of calls) {
+			expect(transcript).toContain("[role:");
+			expect(options?.embedText).not.toContain("[role:");
+			expect(options?.extractText).not.toContain("[role: assistant]");
+		}
 	});
 
 	it("registers subagent aliases from parent Mnemopi state without Hindsight", async () => {

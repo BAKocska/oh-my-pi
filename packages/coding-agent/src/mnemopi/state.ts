@@ -6,11 +6,13 @@ import type * as MnemopiCoreNs from "@oh-my-pi/pi-mnemopi/core";
 import type { LocalModelInitializer } from "@oh-my-pi/pi-mnemopi/core";
 import { logger, toError } from "@oh-my-pi/pi-utils";
 import {
+	chunkRetentionMessages,
 	composeRecallQuery,
 	formatCurrentTime,
 	prepareEmbeddableRetentionTranscript,
 	prepareRetentionTranscript,
 	prepareUserRetentionTranscript,
+	type RetentionChunkRange,
 	stripRetentionProtocolMarkers,
 	truncateRecallQuery,
 } from "../hindsight/content";
@@ -18,6 +20,20 @@ import { extractMessages } from "../hindsight/transcript";
 import type { AgentSession, AgentSessionEvent } from "../session/agent-session";
 import type { MnemopiBackendConfig, MnemopiScoping } from "./config";
 import { mnemopiEmbedClient } from "./embed-client";
+
+/**
+ * Re-exported so `migrateWorkingMemoryChunks`/`validateWorkingMemoryChunkMigration` share one
+ * public entry point with the rest of the Mnemopi session-state API; the implementation
+ * lives in `./chunk-migration` since it operates on a caller-supplied `dbPath` directly via
+ * SQLite rather than through a session's own `Mnemopi` instance.
+ */
+export {
+	type ChunkMigrationValidation,
+	type MigrateWorkingMemoryChunksOptions,
+	type MigrationReceipt,
+	migrateWorkingMemoryChunks,
+	validateWorkingMemoryChunkMigration,
+} from "./chunk-migration";
 
 // The mnemopi package pulls the embeddings stack; keep it off the CLI startup
 // module graph by loading it lazily at the async boundaries that need it.
@@ -203,6 +219,24 @@ function sliceUnretainedMessages(
 		if (userTurns > lastRetainedTurn) return messages.slice(index);
 	}
 	return [];
+}
+
+/**
+ * Recover the TRUE per-piece role for every range a chunk covers, by slicing the matching
+ * original message's own content. A chunk's stored `messages` may frame several original
+ * messages under one synthetic role to fit a tight `retentionChunkMaxChars` cap — extraction
+ * and embedding must see the real roles so an assistant reply chunked alongside a user
+ * question is never mistaken for user-authored text, and a chunked user question is never
+ * dropped from extraction.
+ */
+function resolveChunkSourceMessages(
+	messages: readonly MnemopiRetentionMessage[],
+	ranges: readonly RetentionChunkRange[],
+): MnemopiRetentionMessage[] {
+	return ranges.map(range => {
+		const source = messages[range.messageIndex];
+		return { role: range.role, content: source === undefined ? "" : source.content.slice(range.start, range.end) };
+	});
 }
 
 export function getMnemopiSessionState(session: AgentSession | undefined): MnemopiSessionState | undefined {
@@ -576,11 +610,62 @@ export class MnemopiSessionState {
 		sourceId: string,
 		options: { extract?: boolean; retainedThroughUserTurn?: number } = {},
 	): Promise<void> {
-		const { transcript, messageCount } = prepareRetentionTranscript(messages, true);
+		const maxChars = this.config.retentionChunkMaxChars;
+		if (maxChars <= 0) {
+			this.#rememberTranscriptRow(messages, messages, sourceId, options.retainedThroughUserTurn, options.extract);
+			return;
+		}
+		const chunks = chunkRetentionMessages(messages, maxChars);
+		if (chunks.length === 0) return;
+		const totalUserTurns = messages.filter(message => message.role === "user").length;
+		const chunkCount = chunks.length;
+		chunks.forEach((chunk, chunkIndex) => {
+			// Crash-safe per-chunk cursor: the final input cursor minus the turns this whole
+			// call covers, plus however many of them THIS chunk has fully persisted so far.
+			// Non-final pieces of a still-splitting oversized turn report the PRIOR turn's
+			// count (chunk.completedUserTurns doesn't advance until that turn's last piece),
+			// so a crash mid-turn never leaves the restored cursor past an unfinished turn.
+			const retainedThroughUserTurn =
+				options.retainedThroughUserTurn === undefined
+					? undefined
+					: options.retainedThroughUserTurn - totalUserTurns + chunk.completedUserTurns;
+			this.#rememberTranscriptRow(
+				chunk.messages,
+				resolveChunkSourceMessages(messages, chunk.ranges),
+				sourceId,
+				retainedThroughUserTurn,
+				options.extract,
+				{ chunkOf: sourceId, chunkIndex, chunkCount, ranges: chunk.ranges },
+			);
+		});
+	}
+
+	/**
+	 * Remember one retention row. `transcriptMessages` frames the stored transcript and must
+	 * already fit any active `retentionChunkMaxChars` cap (a chunk that merges several
+	 * messages to fit frames them under one synthetic role). `extractSourceMessages` is the
+	 * same content with every piece's TRUE role restored, so user-only extraction and the
+	 * embedding projection never mistake a chunked assistant reply for user-authored text and
+	 * never drop a chunked user question.
+	 */
+	#rememberTranscriptRow(
+		transcriptMessages: MnemopiRetentionMessage[],
+		extractSourceMessages: MnemopiRetentionMessage[],
+		sourceId: string,
+		retainedThroughUserTurn: number | undefined,
+		shouldExtractOption: boolean | undefined,
+		chunkMeta?: {
+			chunkOf: string;
+			chunkIndex: number;
+			chunkCount: number;
+			ranges: readonly RetentionChunkRange[];
+		},
+	): void {
+		const { transcript, messageCount } = prepareRetentionTranscript(transcriptMessages, true);
 		if (!transcript) return;
-		const { transcript: extractText } = prepareUserRetentionTranscript(messages);
-		const { transcript: embedText } = prepareEmbeddableRetentionTranscript(messages);
-		const shouldExtract = options.extract !== false && extractText !== null;
+		const { transcript: extractText } = prepareUserRetentionTranscript(extractSourceMessages);
+		const { transcript: embedText } = prepareEmbeddableRetentionTranscript(extractSourceMessages);
+		const shouldExtract = shouldExtractOption !== false && extractText !== null;
 		this.rememberInScope(transcript, {
 			source: "coding-agent-transcript",
 			importance: 0.65,
@@ -588,9 +673,20 @@ export class MnemopiSessionState {
 				session_id: this.sessionId,
 				source_id: sourceId,
 				message_count: messageCount,
-				...(options.retainedThroughUserTurn === undefined
+				...(retainedThroughUserTurn === undefined ? {} : { retained_through_user_turn: retainedThroughUserTurn }),
+				...(chunkMeta === undefined
 					? {}
-					: { retained_through_user_turn: options.retainedThroughUserTurn }),
+					: {
+							chunk_of: chunkMeta.chunkOf,
+							chunk_index: chunkMeta.chunkIndex,
+							chunk_count: chunkMeta.chunkCount,
+							ranges: chunkMeta.ranges.map(range => ({
+								messageIndex: range.messageIndex,
+								start: range.start,
+								end: range.end,
+								role: range.role,
+							})),
+						}),
 				cwd: this.session.sessionManager.getCwd(),
 			},
 			scope: "bank",

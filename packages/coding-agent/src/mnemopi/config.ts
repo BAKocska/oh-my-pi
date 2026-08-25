@@ -28,6 +28,7 @@ export interface MnemopiBackendConfig {
 	enhancedRecall: boolean;
 	proactiveLinking: boolean;
 	retainEveryNTurns: number;
+	retentionChunkMaxChars: number;
 	consolidateEveryNTurns: number;
 	recallLimit: number;
 	recallContextTurns: number;
@@ -77,6 +78,9 @@ export function loadMnemopiConfig(settings: Settings, agentDir: string): Mnemopi
 		enhancedRecall: settings.get("mnemopi.enhancedRecall"),
 		proactiveLinking: settings.get("mnemopi.proactiveLinking"),
 		retainEveryNTurns: Math.max(1, Math.floor(settings.get("mnemopi.retainEveryNTurns"))),
+		// Disabled (Phase-1 single-row retain behavior) at 0; negative input clamps to 0
+		// rather than a floor of 1, since "no chunking" is the valid default, not an error.
+		retentionChunkMaxChars: Math.max(0, Math.floor(settings.get("mnemopi.retentionChunkMaxChars"))),
 		// 0 or negative disables the automatic in-session trigger; unlike
 		// `retainEveryNTurns` this is allowed to be zero, so clamp the floor
 		// to 0 rather than 1 (see `MnemopiSessionState.maybeConsolidateOnAgentEnd`).
