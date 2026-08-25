@@ -78,8 +78,9 @@ pub use select::{Select, SelectOption};
 pub use shader::Shader;
 pub use spinner::Spinner;
 pub use status::{
-	BoundaryLayout, ContextGaugeMode, Segment, Status, StatusPlacement, advisor_spend_label,
-	boundary_layout, compaction_threshold_color, context_gauge_cells, spend_label,
+	BoundaryLayout, CompactionBoundaries, ContextGauge, ContextGaugeMode, GaugeCell, Segment,
+	Status, StatusPlacement, advisor_spend_label, boundary_layout, compaction_boundary_color,
+	compaction_threshold_color, spend_label, write_compact_count,
 };
 pub use table::{Table, TableCell, TableRow};
 pub use tabs::Tabs;

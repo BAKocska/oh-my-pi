@@ -59,7 +59,7 @@ pub use image_overlay::{ImageOverlay, ImageOverlayEvent};
 pub use inspector::{HistoryInspector, HistoryInspectorEvent};
 use omp_core::Str;
 use omp_proto::omp::ui::v1;
-pub use omp_tui::components::{Attachment, ComposerStyle};
+pub use omp_tui::components::{Attachment, CompactionBoundaries, ComposerStyle};
 pub use overlays::{ListPicker, ListRow, OverlayPanel, PromptEvent, PromptOverlay, panel_divider};
 pub use palette::{CommandPalette, PaletteAction, PaletteEntry, PaletteEvent};
 pub use picker::{ModelPicker, PickerEvent};
@@ -314,6 +314,9 @@ pub struct StatusFacts {
 	pub context_window:         Option<u64>,
 	/// Background speculative-compaction lifecycle.
 	pub compaction_speculation: CompactionSpeculationStatus,
+	/// Auto-compaction boundary percents for the embedded context gauge,
+	/// absent when compaction is disabled or the window is unknown.
+	pub compaction_boundaries:  Option<CompactionBoundaries>,
 	/// Accumulated cost in billionths of a dollar.
 	pub cost_nanos:             u64,
 	/// Accumulated advisor-model cost in billionths of a dollar.
@@ -528,6 +531,8 @@ pub enum Intent {
 	SwitchModel(Str),
 	/// Start login, optionally for a specific provider.
 	Login(Option<Str>),
+	/// Continue provider/account selection or remove one stored credential.
+	Logout(Option<Str>),
 	/// Answer the active authentication prompt.
 	AuthAnswer {
 		/// Unmasked value entered by the user.
@@ -872,6 +877,14 @@ pub enum BackendEvent {
 	Sessions(Vec<SessionRow>),
 	/// Replace provider-login choices; each row's `id` is the provider key.
 	LoginProviders(Vec<SessionRow>),
+	/// Open one stage of provider logout selection.
+	LogoutChoices {
+		/// Picker title describing the current selection stage.
+		title: Str,
+		/// Providers or accounts; each row's `id` is returned through
+		/// [`Intent::Logout`].
+		rows:  Vec<SessionRow>,
+	},
 	/// Replace rewind choices.
 	RewindTargets(Vec<RewindTargetRow>),
 	/// Open a backend authentication prompt.

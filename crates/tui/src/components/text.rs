@@ -188,7 +188,13 @@ impl Component for TextLeaf {
 
 	fn measure(&mut self, _ctx: &UiContext) -> (u16, u16) {
 		if self.props.text_wrap() == TextWrap::Pre {
-			let natural = self.text.as_str().split('\n').map(cell_width).max().unwrap_or(0);
+			let natural = self
+				.text
+				.as_str()
+				.split('\n')
+				.map(cell_width)
+				.max()
+				.unwrap_or(0);
 			return (natural, natural);
 		}
 		let mut widest_word = 0;

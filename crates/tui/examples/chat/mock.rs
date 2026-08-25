@@ -10,8 +10,8 @@ use std::{
 
 use flume::{Receiver, Sender};
 use omp_chat_ui::{
-	BackendEvent, GitFacts, Intent, ModelRow, RewindTargetRow, SessionRow, SettingRow, StatusFacts,
-	ThinkingLevel,
+	BackendEvent, CompactionBoundaries, GitFacts, Intent, ModelRow, RewindTargetRow, SessionRow,
+	SettingRow, StatusFacts, ThinkingLevel,
 };
 use omp_core::{Str, sf};
 use omp_tui::components::ComposerStyle;
@@ -227,6 +227,10 @@ fn status(model: &Str, working: bool) -> StatusFacts {
 		dropped: 0,
 		git: Some(GitFacts { branch: sf!("main"), dirty: 5, staged: 9 }),
 		thinking: Some(ThinkingLevel::Max),
+		compaction_boundaries: Some(CompactionBoundaries {
+			threshold_percent:   80.0,
+			speculation_percent: Some(70.0),
+		}),
 		..StatusFacts::default()
 	}
 }

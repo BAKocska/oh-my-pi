@@ -1,18 +1,22 @@
 //! Durable quota-history CLI over the inference-owned account state store.
 
 use std::{
+	fmt::Write as _,
 	fs,
+	path::Path,
 	time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use miette::{IntoDiagnostic as _, miette};
 use omp_catalog::ProviderId;
+use omp_core::Str;
 use omp_inference::{
 	account::AccountStateStore,
 	answer::{UsageQuantity, UsageReport},
 	call::{UsageRequest, UsageScope},
 	id::AccountId,
 };
+use omp_storage::index::{SessionIndex, UsageDimension, UsageQuery};
 use serde_json::{Value, json};
 
 use crate::cli::UsageArgs;
@@ -39,15 +43,41 @@ pub async fn run(args: UsageArgs) -> miette::Result<()> {
 		return Ok(());
 	}
 
+	let snapshot = collect_quota(&data_dir, provider.as_ref(), account.as_ref()).await?;
+	for error in &snapshot.refresh_errors {
+		eprintln!("{error}");
+	}
+	if args.json {
+		println!("{}", serde_json::to_string_pretty(&snapshot.rows).into_diagnostic()?);
+		return Ok(());
+	}
+	if snapshot.rows.is_empty() {
+		println!("no quota observations");
+		return Ok(());
+	}
+	for row in snapshot.rows {
+		print_row(&row);
+	}
+	Ok(())
+}
+
+struct QuotaSnapshot {
+	rows:           Vec<Value>,
+	reports:        Vec<UsageReport>,
+	refresh_errors: Vec<String>,
+}
+
+async fn collect_quota(
+	data_dir: &Path,
+	provider: Option<&ProviderId>,
+	account: Option<&AccountId>,
+) -> miette::Result<QuotaSnapshot> {
+	let store = AccountStateStore::open(data_dir.join("credentials.db")).into_diagnostic()?;
 	let records = store.load_accounts().into_diagnostic()?;
 	let mut rows = Vec::new();
 	for record in &records {
-		if provider
-			.as_ref()
-			.is_some_and(|value| value != &record.provider)
-			|| account
-				.as_ref()
-				.is_some_and(|value| value != &record.account)
+		if provider.is_some_and(|value| value != &record.provider)
+			|| account.is_some_and(|value| value != &record.account)
 		{
 			continue;
 		}
@@ -79,16 +109,14 @@ pub async fn run(args: UsageArgs) -> miette::Result<()> {
 			}));
 		}
 	}
-	let manager = omp_driver::registry::production_usage_manager(&data_dir)
+	let manager = omp_driver::registry::production_usage_manager(data_dir)
 		.await
 		.into_diagnostic()?;
+	let mut reports = Vec::new();
+	let mut refresh_errors = Vec::new();
 	for record in &records {
-		if provider
-			.as_ref()
-			.is_some_and(|value| value != &record.provider)
-			|| account
-				.as_ref()
-				.is_some_and(|value| value != &record.account)
+		if provider.is_some_and(|value| value != &record.provider)
+			|| account.is_some_and(|value| value != &record.account)
 		{
 			continue;
 		}
@@ -110,26 +138,177 @@ pub async fn run(args: UsageArgs) -> miette::Result<()> {
 			)
 			.await
 		{
-			Ok(report) => merge_fresh(&mut rows, &report),
-			Err(error) => eprintln!(
+			Ok(report) => {
+				merge_fresh(&mut rows, &report);
+				reports.push(report);
+			},
+			Err(error) => refresh_errors.push(format!(
 				"usage refresh failed for {} / {}: {error}",
 				record.provider.as_str(),
 				mask(record.account.as_str())
-			),
+			)),
 		}
 	}
-	if args.json {
-		println!("{}", serde_json::to_string_pretty(&rows).into_diagnostic()?);
-		return Ok(());
+	Ok(QuotaSnapshot { rows, reports, refresh_errors })
+}
+
+/// Renders durable per-model accounting and the latest provider quota windows.
+pub async fn render_report(data_dir: &Path) -> miette::Result<Str> {
+	fs::create_dir_all(data_dir).into_diagnostic()?;
+	let index = SessionIndex::open_authoritative_reader(data_dir.join("sessions.sqlite3"))
+		.into_diagnostic()?;
+	let models = index.usage(&UsageQuery::default()).into_diagnostic()?;
+	let quota = collect_quota(data_dir, None, None).await?;
+
+	let mut rendered = String::from("**Usage**\n\n");
+	if models.is_empty() {
+		rendered.push_str("No durable model usage receipts recorded.\n");
+	} else {
+		rendered.push_str("| Model | Input | Output | Cache read | Cache write | Cost |\n");
+		rendered.push_str("|---|---:|---:|---:|---:|---:|\n");
+		let mut total_input = 0_u64;
+		let mut total_output = 0_u64;
+		let mut total_cache_read = 0_u64;
+		let mut total_cache_write = 0_u64;
+		let mut total_cost = 0_u64;
+		for bucket in &models {
+			let model = bucket
+				.key
+				.iter()
+				.find_map(|(dimension, value)| {
+					(*dimension == UsageDimension::Model).then_some(value.as_str())
+				})
+				.unwrap_or("unknown");
+			total_input = total_input.saturating_add(bucket.usage.input_tokens);
+			total_output = total_output.saturating_add(bucket.usage.output_tokens);
+			total_cache_read = total_cache_read.saturating_add(bucket.usage.cache_read_tokens);
+			total_cache_write = total_cache_write.saturating_add(bucket.usage.cache_write_tokens);
+			total_cost = total_cost.saturating_add(bucket.cost.nanos_usd);
+			let _ = writeln!(
+				rendered,
+				"| `{model}` | {} | {} | {} | {} | ${:.6} |",
+				bucket.usage.input_tokens,
+				bucket.usage.output_tokens,
+				bucket.usage.cache_read_tokens,
+				bucket.usage.cache_write_tokens,
+				bucket.cost.nanos_usd as f64 / 1_000_000_000.0,
+			);
+		}
+		let _ = writeln!(
+			rendered,
+			"| **Total** | **{total_input}** | **{total_output}** | **{total_cache_read}** | \
+			 **{total_cache_write}** | **${:.6}** |",
+			total_cost as f64 / 1_000_000_000.0,
+		);
 	}
-	if rows.is_empty() {
-		println!("no quota observations");
-		return Ok(());
+
+	rendered.push_str("\n**Quota windows**\n");
+	if quota.rows.is_empty() {
+		rendered.push_str("\nNo quota observations.\n");
+	} else {
+		for row in &quota.rows {
+			let provider = row["provider"].as_str().unwrap_or("unknown");
+			let account = row["account"].as_str().unwrap_or("********");
+			let window = row["window"].as_str().unwrap_or("unknown");
+			let label = row["label"].as_str().unwrap_or(window);
+			let consumed = row["consumed"].as_f64();
+			let limit = row["limit"].as_f64();
+			let remaining = row["remaining"].as_f64();
+			let fraction = consumed
+				.zip(limit)
+				.and_then(|(used, total)| (total != 0.0).then_some(used / total));
+			let _ = write!(
+				rendered,
+				"\n- **{provider}** `{account}` · {label}\n  `{}` {} / {}",
+				quota_bar(fraction),
+				consumed.map_or_else(|| "?".to_owned(), format_number),
+				limit.map_or_else(|| "?".to_owned(), format_number),
+			);
+			if let Some(remaining) = remaining {
+				let _ = write!(rendered, " · {} remaining", format_number(remaining));
+			}
+			if let Some(reset_at) = row["resetAtMs"].as_u64() {
+				let _ = write!(rendered, " · resets at {reset_at}");
+			}
+			if let Some(observed_at) = row["observedAtMs"].as_u64() {
+				let _ = write!(rendered, " · observed at {observed_at}");
+			}
+			rendered.push('\n');
+		}
 	}
-	for row in rows {
-		print_row(&row);
+	for error in quota.refresh_errors {
+		let _ = writeln!(rendered, "\n_{error}_");
 	}
-	Ok(())
+	Ok(Str::from(rendered))
+}
+
+/// Lists or spends saved Codex rate-limit resets.
+pub async fn reset_usage(data_dir: &Path, target: &str) -> miette::Result<Str> {
+	let codex_provider = ProviderId::from("openai-codex");
+	let quota = collect_quota(data_dir, Some(&codex_provider), None).await?;
+	if quota.reports.is_empty() {
+		return Ok(Str::new_static("No Codex accounts found. Use /login to add one."));
+	}
+	let accounts = quota
+		.reports
+		.iter()
+		.map(|report| {
+			let label = report
+				.account_meta
+				.email
+				.as_ref()
+				.or(report.account_meta.provider_account_id.as_ref())
+				.map_or_else(|| mask(report.account.as_str()), ToString::to_string);
+			let available = report
+				.reset_credits
+				.as_ref()
+				.map_or(0, |credits| credits.available);
+			(label, available, report.account.clone())
+		})
+		.collect::<Vec<_>>();
+	let target = target.trim();
+	if target.is_empty() {
+		let mut rendered = String::from("Saved Codex rate-limit resets:");
+		for (index, (label, available, _)) in accounts.iter().enumerate() {
+			let active = if index == 0 { " (active)" } else { "" };
+			let _ = write!(rendered, "\n- {label}: {available} available{active}");
+		}
+		rendered
+			.push_str("\n\nSpend one with `/usage reset <account email>` or `/usage reset active`.");
+		return Ok(Str::from(rendered));
+	}
+	let selected = if target.eq_ignore_ascii_case("active") {
+		accounts.first()
+	} else {
+		accounts.iter().find(|(label, _, account)| {
+			label.eq_ignore_ascii_case(target) || account.as_str().eq_ignore_ascii_case(target)
+		})
+	};
+	let Some((label, available, selected_account)) = selected else {
+		return Ok(Str::from(format!("No Codex account matches \"{target}\".")));
+	};
+	if *available == 0 {
+		return Ok(Str::from(format!("{label}: no saved resets to spend.")));
+	}
+	let redeemed = omp_driver::registry::redeem_codex_reset(data_dir, selected_account)
+		.await
+		.into_diagnostic()?
+		.ok_or_else(|| miette!("Codex reset redemption is unavailable"))?;
+	if redeemed {
+		Ok(Str::from(format!(
+			"Reset applied for {label} — your rate-limit window has been refreshed.",
+		)))
+	} else {
+		Ok(Str::from(format!("{label}: nothing to reset right now — no credit was spent.",)))
+	}
+}
+
+fn format_number(value: f64) -> String {
+	if value.fract() == 0.0 {
+		format!("{value:.0}")
+	} else {
+		format!("{value:.2}")
+	}
 }
 
 fn merge_fresh(rows: &mut Vec<Value>, report: &UsageReport) {
@@ -146,6 +325,7 @@ fn merge_fresh(rows: &mut Vec<Value>, report: &UsageReport) {
 		});
 		if let Some(row) = existing {
 			row["consumed"] = json!(consumed);
+			row["label"] = json!(window.label.as_deref());
 			row["remaining"] = json!(remaining);
 			row["limit"] = json!(limit);
 			row["resetAtMs"] = json!(window.resets_at.and_then(unix_millis));
@@ -156,6 +336,7 @@ fn merge_fresh(rows: &mut Vec<Value>, report: &UsageReport) {
 				"provider": provider,
 				"account": account,
 				"window": window.id.as_str(),
+				"label": window.label.as_deref(),
 				"consumed": consumed,
 				"remaining": remaining,
 				"limit": limit,

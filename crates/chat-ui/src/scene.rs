@@ -18,9 +18,10 @@ use omp_tui::{
 	anim::{self, Easing, Shimmer, Tween},
 	components::{
 		Attachment, AttachmentContent, Attachments, ComposerStatusAttachment, ComposerStyle,
-		ContextGaugeMode, EditorPane, Img, KeywordAccent, Segment, Status, TextLeaf, ToolCard,
-		ToolState, advisor_spend_label, boundary_layout, collapse_hud_line,
-		compaction_threshold_color, context_gauge_cells, hr::truncate_to_width, spend_label,
+		ContextGauge, ContextGaugeMode, EditorPane, GaugeCell, Img, KeywordAccent, Segment, Status,
+		TextLeaf, ToolCard, ToolState, advisor_spend_label, boundary_layout, collapse_hud_line,
+		compaction_boundary_color, compaction_threshold_color, hr::truncate_to_width, spend_label,
+		write_compact_count,
 	},
 	next_slot,
 };
@@ -1447,23 +1448,37 @@ impl ChatStatus {
 			left.paint(pc, Rect::new(layout.left_x, rect.y, left_width, 1));
 			if matches!(gauge, ContextGaugeMode::Bar) {
 				let facts = &self.work.borrow().facts;
-				let total = facts.context_window.unwrap_or_default();
-				let used = context_gauge_cells(layout.boundary_width, facts.context_tokens, total);
+				let plan = ContextGauge::plan(
+					layout.boundary_width,
+					facts.context_tokens,
+					facts.context_window,
+					facts.compaction_boundaries,
+				);
 				let (_, _, _, _, horizontal, _) = pc.ctx.charset.border(Border::Round);
 				let mut bytes = [0_u8; 4];
-				let glyph = horizontal.encode_utf8(&mut bytes);
+				let line = horizontal.encode_utf8(&mut bytes);
+				let accent = compaction_threshold_color(&self.theme);
+				let boundary = compaction_boundary_color(&self.theme);
 				for offset in 0..layout.boundary_width {
-					let color = if offset < used {
-						compaction_threshold_color(&self.theme)
-					} else {
-						self.theme.border
+					let x = layout.boundary_x.saturating_add(offset);
+					let (glyph, color): (&str, Color) = match plan.cell(offset) {
+						GaugeCell::Used => (line, accent),
+						GaugeCell::Unused => (line, self.theme.border),
+						GaugeCell::Threshold => (pc.ctx.charset.icon(Icon::ContextCompaction), boundary),
+						GaugeCell::Speculation => {
+							(pc.ctx.charset.icon(Icon::ContextSpeculation), self.theme.muted)
+						},
+						GaugeCell::Percent(cell) => {
+							let color = if plan.overflowed() {
+								self.theme.err
+							} else {
+								accent
+							};
+							(cell, color)
+						},
+						GaugeCell::Window(cell) => (cell, boundary),
 					};
-					pc.frame.put(
-						layout.boundary_x.saturating_add(offset),
-						rect.y,
-						glyph,
-						Style::new().fg(color),
-					);
+					pc.frame.put(x, rect.y, glyph, Style::new().fg(color));
 				}
 			}
 			right.paint(pc, Rect::new(layout.right_x, rect.y, right_width, 1));
@@ -2745,6 +2760,7 @@ impl Chat {
 			| BackendEvent::ModelsUpdated { .. }
 			| BackendEvent::Sessions(_)
 			| BackendEvent::LoginProviders(_)
+			| BackendEvent::LogoutChoices { .. }
 			| BackendEvent::RewindTargets(_)
 			| BackendEvent::AuthPrompt { .. }
 			| BackendEvent::AuthPromptClose
@@ -4436,14 +4452,11 @@ fn elapsed_label(elapsed: Duration) -> Str {
 }
 
 fn compact_count(value: u64) -> Str {
-	if value >= 1_000_000 {
-		sf!("{:.1}m", value as f64 / 1_000_000.0)
-	} else if value >= 1_000 {
-		sf!("{:.0}k", value as f64 / 1_000.0)
-	} else {
-		sf!("{value}")
-	}
+	let mut label = StrMut::default();
+	let _ = write_compact_count(&mut label, value);
+	label.freeze()
 }
+
 fn context_usage_label(tokens: u64, window: Option<u64>) -> (Str, bool) {
 	let Some(window) = window.filter(|window| *window > 0) else {
 		return (compact_count(tokens), false);
@@ -4543,6 +4556,32 @@ mod tests {
 		let text = frame_text(chat.render(Size::new(80, 8)).frame);
 		assert!(text.contains(" Fable 5"), "{text}");
 		assert!(!text.contains("think"), "{text}");
+	}
+
+	#[test]
+	fn boxed_composer_embeds_the_context_gauge_in_its_top_border() {
+		let mut chat = Chat::new(&ctx());
+		let viewport = Size::new(100, 10);
+		chat.set_composer_style(ComposerStyle::Box);
+		chat.set_status(StatusFacts {
+			model: "Fable 5".into(),
+			context_tokens: 160_000,
+			context_window: Some(200_000),
+			compaction_boundaries: Some(crate::CompactionBoundaries {
+				threshold_percent:   80.0,
+				speculation_percent: Some(70.0),
+			}),
+			..StatusFacts::default()
+		});
+		let text = frame_text(chat.render(viewport).frame);
+		let border = text
+			.lines()
+			.find(|line| line.contains("80%"))
+			.unwrap_or_else(|| panic!("top border embeds the usage percent: {text}"));
+		assert!(border.contains("200k"), "window label rides the gauge: {border}");
+		assert!(border.contains('┃'), "compaction threshold tick: {border}");
+		assert!(border.contains('╎'), "speculation tick: {border}");
+		assert!(!border.contains("80%/"), "numeric context segment is absorbed: {border}");
 	}
 
 	#[test]

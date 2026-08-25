@@ -64,7 +64,7 @@ use omp_proto::{
 	thread::v1::{Blob, Item, Message, Part, Role, blob, item, part},
 };
 use omp_storage::{
-	index::SessionIndex,
+	index::{NewSession, SessionIndex, SessionKind},
 	transcript::{
 		self, ModelChange as JournalModelChange, ModelId as JournalModelId,
 		ModelRef as JournalModelRef, ProviderId as JournalProviderId, SessionId,
@@ -88,9 +88,10 @@ use serde_json::Value;
 
 use crate::chat_ui::{
 	commands::{
-		AdvisorRequest, CommandFuture, CommandResult, CommandRole, CommandSurface, ConfigCommandHost,
-		ConfigScope, ConsumedResult, DispatchResult, FlowCommandHost, McpRequest, ModelCommandHost,
-		ParsedFlags, SessionCommandHost, SessionRequest, ShellCommandHost, WorkspaceRequest,
+		AdvisorRequest, BranchRequest, CommandFuture, CommandResult, CommandRole, CommandSurface,
+		ConfigCommandHost, ConfigScope, ConsumedResult, DispatchResult, FlowCommandHost, McpRequest,
+		ModelCommandHost, ParsedFlags, SessionCommandHost, SessionRequest, ShellCommandHost,
+		WorkspaceRequest,
 	},
 	input::{ChatCommand, CommandContribution, CommandRoster, CommandUsage, ParsedTurnBudget},
 };
@@ -759,6 +760,24 @@ enum UiCmd {
 		operation: RegimeOperation,
 		reply:     flume::Sender<Result<RegimeMutation, omp_agent::AgentError>>,
 	},
+	ForceTool {
+		tool: Str,
+	},
+	Handoff {
+		request: omp_agent::ManualCompactionRequest,
+		reply:   flume::Sender<Result<omp_agent::ManualCompactionOutcome, String>>,
+	},
+	CreateSessionChild {
+		kind:       omp_agent::ChildKind,
+		child_id:   Str,
+		child_path: PathBuf,
+		title:      Option<Str>,
+		reply:      flume::Sender<Result<(), String>>,
+	},
+	DeleteCurrentSession {
+		path:  PathBuf,
+		reply: flume::Sender<Result<(), String>>,
+	},
 }
 enum MaintenanceEvent {
 	Compact(Result<omp_agent::ManualCompactionOutcome, omp_agent::AgentError>),
@@ -949,6 +968,7 @@ fn inspect_image_enabled(state: &BridgeState) -> bool {
 
 struct BridgeState {
 	model: String,
+	pending_session_delete: Option<std::time::Instant>,
 	git: Option<GitWorkbenchBackend>,
 	advisor: Option<Arc<Mutex<AdvisorEngine>>>,
 	session_id: Str,
@@ -1170,6 +1190,7 @@ fn structural_roster(
 			let declaration = commands::CommandDeclaration {
 				order:           0,
 				name:            command.name.clone(),
+				icon:            omp_tui::Icon::SlashCommand,
 				aliases:         command.aliases.iter().cloned().collect::<Vec<_>>().into(),
 				description:     command.description.clone(),
 				argument_hint:   command.hint.clone(),
@@ -1260,6 +1281,7 @@ pub async fn run<C, R>(
 	collab: Option<CollabCommandHandle>,
 	modes: Arc<RegimeHandle>,
 	auth: Option<ChatAuth>,
+	auth_control: Option<omp_inference::auth::AuthControlHandle>,
 	data_dir: PathBuf,
 	settings_manager: Arc<SettingsManager>,
 	telemetry_index: Arc<omp_storage::telemetry_index::TelemetryIndex>,
@@ -1428,6 +1450,95 @@ where
 					});
 					let _ = maintenance_tx.send(MaintenanceEvent::Shake(result));
 				},
+				UiCmd::ForceTool { tool } => {
+					agent.tool_choices_mut().remove_by_label("user-force");
+					agent.tool_choices_mut().push_once(
+						omp_inference::call::ToolChoice::Named(tool),
+						omp_agent::tool_choice::PushOptions {
+							priority: omp_agent::tool_choice::DirectivePriority::Head,
+							label: Some(sf!("user-force")),
+							..omp_agent::tool_choice::PushOptions::default()
+						},
+					);
+				},
+				UiCmd::Handoff { request, reply } => {
+					let result = agent
+						.compact_manual(request)
+						.await
+						.map_err(|error| error.to_string());
+					let _ = reply.send(result);
+				},
+				UiCmd::CreateSessionChild { kind, child_id, child_path, title, reply } => {
+					let result = (|| -> Result<(), String> {
+						let parent_id = agent.journal().session_id().clone();
+						let root = {
+							let journal = agent.journal().load().map_err(|error| error.to_string())?;
+							journal.header().cwd.clone()
+						};
+						let sessions_dir = child_path
+							.parent()
+							.ok_or_else(|| String::from("child session path has no parent"))?;
+						let index_path = sessions_dir
+							.parent()
+							.unwrap_or(sessions_dir)
+							.join("sessions.sqlite3");
+						let index =
+							Arc::new(SessionIndex::open(index_path).map_err(|error| error.to_string())?);
+						let session_id = SessionId(child_id);
+						let created_ms = now_ms();
+						let root_text = root.to_string_lossy();
+						let request = NewSession {
+							id: &session_id,
+							cwd: root_text.as_ref(),
+							project: root_text.as_ref(),
+							created_ms,
+							kind: SessionKind::Interactive,
+							parent: Some(&parent_id),
+							remote: false,
+						};
+						let header = transcript::Header {
+							v:       4,
+							id:      session_id.clone(),
+							created: created_ms,
+							cwd:     root.clone(),
+						};
+						let mut child = index
+							.create_session(&request, || {
+								let child =
+									agent
+										.journal()
+										.create_child(&child_path, &header, created_ms, kind)?;
+								let watermark = child.byte_watermark()?;
+								Ok::<_, omp_agent::JournalError>((child, watermark))
+							})
+							.map_err(|error| error.to_string())?;
+						child.attach_session_index(index, session_id);
+						if let Some(title) = title {
+							child
+								.append_title(created_ms, title, transcript::TitleSource::User)
+								.map_err(|error| error.to_string())?;
+						}
+						Ok(())
+					})();
+					let _ = reply.send(result);
+				},
+				UiCmd::DeleteCurrentSession { path, reply } => {
+					let expected = agent.journal().session_id().0.as_str();
+					let matches = path
+						.file_stem()
+						.and_then(|stem| stem.to_str())
+						.is_some_and(|stem| stem == expected);
+					if !matches {
+						let _ = reply.send(Err(String::from(
+							"refusing to delete a path that is not the live session",
+						)));
+						continue;
+					}
+					drop(agent);
+					let result = fs::remove_file(&path).map_err(|error| error.to_string());
+					let _ = reply.send(result);
+					break;
+				},
 				UiCmd::Regime { operation, reply } => {
 					let result = match operation {
 						RegimeOperation::Start { id, queue, prompt_slot } => {
@@ -1479,6 +1590,7 @@ where
 	drop(snapshot);
 	let mut state = BridgeState {
 		model,
+		pending_session_delete: None,
 		git: None,
 		advisor,
 		session_id: session_id.clone(),
@@ -1572,6 +1684,7 @@ where
 
 	let bridge_executor = executor.clone();
 	let mcp_inspector = environment_host.mcp_inspector();
+	let extension_reload = environment_host.extension_reload_handle();
 	let bridge = async move {
 		let mut presentation_endpoint = presentation_endpoint;
 		loop {
@@ -1649,8 +1762,10 @@ where
 									&control,
 									&agent_state,
 									&modes,
-									parent.as_ref(),
+									&parent,
 									auth.as_ref(),
+									auth_control.as_ref(),
+									&extension_reload,
 									&data_dir,
 									settings_manager.as_ref(),
 									telemetry_index.as_ref(),
@@ -2519,22 +2634,26 @@ fn shake_notice(outcome: &omp_agent::ManualShakeOutcome) -> Str {
 }
 
 struct LiveCommandHost<'a, R> {
-	mcp_inspector: &'a omp_envd::McpInspectorHandle,
-	executor:      &'a Executor,
-	backend:       &'a flume::Sender<BackendEvent>,
-	commands_tx:   &'a flume::Sender<UiCmd>,
-	abort:         &'a omp_agent::AbortHandle,
-	control:       &'a omp_agent::ControlSender,
-	agent_state:   &'a AgentState,
-	modes:         &'a RegimeHandle,
-	auth:          Option<&'a ChatAuth>,
-	data_dir:      &'a Path,
-	list_sessions: &'a mut R,
-	bus:           &'a omp_agent::EventBus,
-	registry:      &'a Registry,
-	dropped:       u64,
-	roster:        commands::CommandRoster,
-	state:         &'a mut BridgeState,
+	mcp_inspector:    &'a omp_envd::McpInspectorHandle,
+	executor:         &'a Executor,
+	backend:          &'a flume::Sender<BackendEvent>,
+	commands_tx:      &'a flume::Sender<UiCmd>,
+	abort:            &'a omp_agent::AbortHandle,
+	control:          &'a omp_agent::ControlSender,
+	agent_state:      &'a AgentState,
+	modes:            &'a RegimeHandle,
+	auth:             Option<&'a ChatAuth>,
+	auth_control:     Option<&'a omp_inference::auth::AuthControlHandle>,
+	parent:           Arc<dyn omp_envd::eval::ParentSessionHost>,
+	mailbox:          &'a omp_agent::MailboxSender,
+	extension_reload: &'a omp_envd::ExtensionReloadHandle,
+	data_dir:         &'a Path,
+	list_sessions:    &'a mut R,
+	bus:              &'a omp_agent::EventBus,
+	registry:         &'a Registry,
+	dropped:          u64,
+	roster:           commands::CommandRoster,
+	state:            &'a mut BridgeState,
 }
 
 fn silent_command() -> CommandFuture<'static> {
@@ -2835,6 +2954,212 @@ where
 		silent_command()
 	}
 
+	fn handoff(&mut self, instructions: Option<Str>) -> CommandFuture<'_> {
+		Box::pin(async move {
+			if chat_active(self.state.submit_pending, self.bus.phase()) {
+				return Ok(CommandResult::Consumed(ConsumedResult::status(
+					"Wait for the active turn to finish before handing off.",
+				)));
+			}
+			let (reply_tx, reply_rx) = flume::bounded(1);
+			self
+				.commands_tx
+				.send_async(UiCmd::Handoff {
+					request: omp_agent::ManualCompactionRequest {
+						mode:  Some(omp_agent::ManualCompactionMode::Soft),
+						focus: instructions,
+					},
+					reply:   reply_tx,
+				})
+				.await
+				.into_diagnostic()?;
+			let status = match reply_rx.recv_async().await {
+				Ok(Ok(_)) => Str::new_static("Context handed off and compacted in place."),
+				Ok(Err(error)) => sf!("Handoff failed: {error}"),
+				Err(_) => sf!("Handoff failed: agent reply channel is closed."),
+			};
+			Ok(CommandResult::Consumed(ConsumedResult::status(status)))
+		})
+	}
+
+	fn branch(&mut self, request: BranchRequest) -> CommandFuture<'_> {
+		Box::pin(async move {
+			if chat_active(self.state.submit_pending, self.bus.phase()) {
+				return Ok(CommandResult::Consumed(ConsumedResult::status(
+					"Wait for the active turn to finish before branching.",
+				)));
+			}
+			let checkpoint = if let Some(checkpoint) = request.checkpoint {
+				match checkpoint.parse::<u64>() {
+					Ok(checkpoint) => checkpoint,
+					Err(_) => {
+						return Ok(CommandResult::Consumed(ConsumedResult::status(
+							"Checkpoint must be a durable event number.",
+						)));
+					},
+				}
+			} else {
+				let (reply_tx, reply_rx) = flume::bounded(1);
+				self
+					.commands_tx
+					.send_async(UiCmd::ListRewind { reply: reply_tx })
+					.await
+					.into_diagnostic()?;
+				match reply_rx.recv_async().await {
+					Ok(Ok(targets)) => {
+						let Some(target) = targets.last() else {
+							return Ok(CommandResult::Consumed(ConsumedResult::status(
+								"No user checkpoint is available to branch from.",
+							)));
+						};
+						target.event
+					},
+					Ok(Err(error)) => {
+						return Ok(CommandResult::Consumed(ConsumedResult::status(error)));
+					},
+					Err(_) => {
+						return Ok(CommandResult::Consumed(ConsumedResult::status(
+							"Agent checkpoint reply channel is closed.",
+						)));
+					},
+				}
+			};
+			let child_id = Str::from(omp_core::Ulid::generate().to_string());
+			let root = Path::new(self.state.workspace_root.as_str());
+			let sessions_dir = omp_env::project_state::directory(self.data_dir, root)
+				.into_diagnostic()?
+				.join("sessions");
+			let child_path = sessions_dir.join(sf!("{child_id}.jsonl").as_str());
+			let (reply_tx, reply_rx) = flume::bounded(1);
+			self
+				.commands_tx
+				.send_async(UiCmd::CreateSessionChild {
+					kind: omp_agent::ChildKind::Branch { checkpoint },
+					child_id: child_id.clone(),
+					child_path,
+					title: None,
+					reply: reply_tx,
+				})
+				.await
+				.into_diagnostic()?;
+			match reply_rx.recv_async().await {
+				Ok(Ok(())) => {
+					send_backend(
+						self.backend,
+						BackendEvent::Sessions(vec![SessionRow {
+							id:     child_id.clone(),
+							label:  child_id.clone(),
+							detail: sf!("branch of {}", self.state.session_id),
+							pinned: false,
+						}]),
+					);
+					Ok(CommandResult::Consumed(ConsumedResult::silent()))
+				},
+				Ok(Err(error)) => {
+					Ok(CommandResult::Consumed(ConsumedResult::status(sf!("Branch failed: {error}"))))
+				},
+				Err(_) => Ok(CommandResult::Consumed(ConsumedResult::status(
+					"Branch failed: agent reply channel is closed.",
+				))),
+			}
+		})
+	}
+
+	fn fork(&mut self, title: Option<Str>) -> CommandFuture<'_> {
+		Box::pin(async move {
+			if chat_active(self.state.submit_pending, self.bus.phase()) {
+				return Ok(CommandResult::Consumed(ConsumedResult::status(
+					"Wait for the active turn to finish before forking.",
+				)));
+			}
+			let child_id = Str::from(omp_core::Ulid::generate().to_string());
+			let root = Path::new(self.state.workspace_root.as_str());
+			let sessions_dir = omp_env::project_state::directory(self.data_dir, root)
+				.into_diagnostic()?
+				.join("sessions");
+			let child_path = sessions_dir.join(sf!("{child_id}.jsonl").as_str());
+			let label = title.clone().unwrap_or_else(|| child_id.clone());
+			let (reply_tx, reply_rx) = flume::bounded(1);
+			self
+				.commands_tx
+				.send_async(UiCmd::CreateSessionChild {
+					kind: omp_agent::ChildKind::Fork,
+					child_id: child_id.clone(),
+					child_path,
+					title,
+					reply: reply_tx,
+				})
+				.await
+				.into_diagnostic()?;
+			match reply_rx.recv_async().await {
+				Ok(Ok(())) => {
+					send_backend(
+						self.backend,
+						BackendEvent::Sessions(vec![SessionRow {
+							id: child_id,
+							label,
+							detail: sf!("fork of {}", self.state.session_id),
+							pinned: false,
+						}]),
+					);
+					Ok(CommandResult::Consumed(ConsumedResult::silent()))
+				},
+				Ok(Err(error)) => {
+					Ok(CommandResult::Consumed(ConsumedResult::status(sf!("Fork failed: {error}"))))
+				},
+				Err(_) => Ok(CommandResult::Consumed(ConsumedResult::status(
+					"Fork failed: agent reply channel is closed.",
+				))),
+			}
+		})
+	}
+
+	fn branch_tree(&mut self) -> CommandFuture<'_> {
+		let result = (|| -> miette::Result<Str> {
+			fn render(node: &SessionTree, current: &str, depth: usize, output: &mut String) {
+				for _ in 0..depth {
+					output.push_str("  ");
+				}
+				output.push_str("- `");
+				output.push_str(node.id.as_str());
+				output.push('`');
+				if node.id == current {
+					output.push_str(" ← current");
+				}
+				output.push('\n');
+				for child in &node.children {
+					render(child, current, depth + 1, output);
+				}
+			}
+
+			let root = Path::new(self.state.workspace_root.as_str());
+			let sessions_dir = omp_env::project_state::directory(self.data_dir, root)
+				.into_diagnostic()?
+				.join("sessions");
+			let current = SessionId(self.state.session_id.clone());
+			let index_path = sessions_dir
+				.parent()
+				.unwrap_or(sessions_dir.as_path())
+				.join("sessions.sqlite3");
+			let root_id = if index_path.is_file() {
+				SessionIndex::open_authoritative_reader(&index_path)
+					.into_diagnostic()?
+					.lineage(&current)
+					.into_diagnostic()?
+					.first()
+					.map_or_else(|| current.0.clone(), |link| link.id.0.clone())
+			} else {
+				current.0.clone()
+			};
+			let tree = SessionTree::load(&sessions_dir.join(sf!("{root_id}.jsonl").as_str()))
+				.map_err(|error| miette::miette!("{error}"))?;
+			let mut output = String::from("**Session lineage**\n\n");
+			render(&tree, current.0.as_str(), 0, &mut output);
+			Ok(Str::from(output))
+		})();
+		Box::pin(async move { Ok(CommandResult::Consumed(ConsumedResult::status(result?))) })
+	}
+
 	fn session(&mut self, request: SessionRequest) -> CommandFuture<'_> {
 		match request {
 			SessionRequest::Info => {
@@ -2847,7 +3172,75 @@ where
 				Box::pin(async move { Ok(CommandResult::Consumed(ConsumedResult::status(status))) })
 			},
 			SessionRequest::Delete => {
-				self.unavailable("This session mutation is not attached to the live journal owner.")
+				if chat_active(self.state.submit_pending, self.bus.phase()) {
+					return Box::pin(async {
+						Ok(CommandResult::Consumed(ConsumedResult::status(
+							"Wait for the active turn to finish before deleting this session.",
+						)))
+					});
+				}
+				let root = Path::new(self.state.workspace_root.as_str());
+				let sessions_dir =
+					match omp_env::project_state::directory(self.data_dir, root).into_diagnostic() {
+						Ok(directory) => directory.join("sessions"),
+						Err(error) => return Box::pin(async move { Err(error) }),
+					};
+				let session_id = self.state.session_id.clone();
+				let path = sessions_dir.join(sf!("{session_id}.jsonl").as_str());
+				if !path.is_file() {
+					return Box::pin(async {
+						Ok(CommandResult::Consumed(ConsumedResult::status(
+							"Session has not been saved yet.",
+						)))
+					});
+				}
+				let now = Instant::now();
+				if self
+					.state
+					.pending_session_delete
+					.is_none_or(|started| now.duration_since(started) > Duration::from_secs(30))
+				{
+					self.state.pending_session_delete = Some(now);
+					return Box::pin(async {
+						Ok(CommandResult::Consumed(ConsumedResult::status(
+							"Run `/session delete` again within 30 seconds to permanently delete this \
+							 session.",
+						)))
+					});
+				}
+				self.state.pending_session_delete = None;
+				Box::pin(async move {
+					let (reply_tx, reply_rx) = flume::bounded(1);
+					self
+						.commands_tx
+						.send_async(UiCmd::DeleteCurrentSession { path, reply: reply_tx })
+						.await
+						.into_diagnostic()?;
+					match reply_rx.recv_async().await {
+						Ok(Ok(())) => {
+							let pins = PinStore::new(&sessions_dir);
+							match pins.load() {
+								Ok(pinned) if pinned.contains(session_id.as_str()) => {
+									if let Err(error) = pins.toggle(&SessionId(session_id)) {
+										tracing::warn!(%error, "failed to remove deleted session pin");
+									}
+								},
+								Ok(_) => {},
+								Err(error) => {
+									tracing::warn!(%error, "failed to inspect deleted session pin");
+								},
+							}
+							send_backend(self.backend, BackendEvent::NewSessionRequested);
+							Ok(CommandResult::Consumed(ConsumedResult::silent()))
+						},
+						Ok(Err(error)) => Ok(CommandResult::Consumed(ConsumedResult::status(sf!(
+							"Failed to delete session: {error}"
+						)))),
+						Err(_) => Ok(CommandResult::Consumed(ConsumedResult::status(
+							"Failed to delete session: agent reply channel is closed.",
+						))),
+					}
+				})
 			},
 			SessionRequest::Pin(selector) => {
 				let session = if let Some(selector) = selector {
@@ -2888,8 +3281,52 @@ where
 		}
 	}
 
-	fn workspace(&mut self, _: WorkspaceRequest) -> CommandFuture<'_> {
-		self.unavailable("This workspace mutation is not attached to the live Environment owner.")
+	fn workspace(&mut self, request: WorkspaceRequest) -> CommandFuture<'_> {
+		let control = self.control.clone();
+		let current = PathBuf::from(self.state.workspace_root.as_str());
+		Box::pin(async move {
+			let status = match request {
+				WorkspaceRequest::List => {
+					let roots = control.workspace_roots().await.into_diagnostic()?;
+					commands::workspace::render(&roots, &current)
+				},
+				WorkspaceRequest::Move(raw) => {
+					let root = commands::workspace::canonical_directory(&current, raw.as_str()).await?;
+					let roots = control.workspace_roots().await.into_diagnostic()?;
+					if roots.primary() == root {
+						sf!("The future primary workspace root is already `{}`.", root.display())
+					} else {
+						control
+							.move_workspace_root(now_ms(), root.clone())
+							.await
+							.into_diagnostic()?;
+						sf!(
+							"Future primary workspace root set to `{}`. The live session remains rooted \
+							 at `{}`; resume this session for the change to take effect.",
+							root.display(),
+							current.display()
+						)
+					}
+				},
+				WorkspaceRequest::Add(_) => {
+					return Err(commands::workspace::mutation_unavailable("add-dir"));
+				},
+				WorkspaceRequest::Remove(_) => {
+					return Err(commands::workspace::mutation_unavailable("remove-dir"));
+				},
+			};
+			Ok(CommandResult::Consumed(ConsumedResult::status(status)))
+		})
+	}
+
+	fn debug(&mut self, inspector: Option<Str>) -> CommandFuture<'_> {
+		let rendered = commands::render_debug(
+			inspector.as_deref(),
+			self.data_dir,
+			self.state.workspace_root.as_str(),
+			self.state.session_id.as_str(),
+		);
+		Box::pin(async move { Ok(CommandResult::Consumed(ConsumedResult::status(rendered?))) })
 	}
 }
 
@@ -2904,6 +3341,41 @@ where
 	fn switch(&mut self, selector: Option<Str>) -> CommandFuture<'_> {
 		self.select_model(selector, false)
 	}
+
+	fn extended_context(&mut self, action: Str) -> CommandFuture<'_> {
+		Box::pin(async move {
+			if chat_active(self.state.submit_pending, self.bus.phase()) {
+				return Ok(CommandResult::Consumed(ConsumedResult::status(
+					"Wait for the active turn to finish before changing extended context.",
+				)));
+			}
+			let selection =
+				commands::resolve_extended_context(self.state.model.as_str(), action.as_str())?;
+			if let Some(target) = selection.target.as_ref() {
+				switch_model(
+					self.backend,
+					self.agent_state,
+					self.data_dir,
+					target.as_str(),
+					self.state,
+					self.control,
+					false,
+				)
+				.await;
+				if self.state.model.as_str() != target.as_str() {
+					return Ok(CommandResult::Consumed(ConsumedResult::silent()));
+				}
+			}
+			let window = selection
+				.window
+				.map_or_else(|| "unknown".to_owned(), |tokens| format!("{tokens} tokens"));
+			Ok(CommandResult::Consumed(ConsumedResult::status(sf!(
+				"Extended context is {} for `{}` ({window}).",
+				if selection.enabled { "on" } else { "off" },
+				self.state.model,
+			))))
+		})
+	}
 }
 
 impl<R> ConfigCommandHost for LiveCommandHost<'_, R>
@@ -2915,12 +3387,100 @@ where
 		silent_command()
 	}
 
-	fn setup(&mut self) -> CommandFuture<'_> {
-		self.unavailable("Provider setup requires an attached account authority.")
+	fn setup(&mut self, section: Option<Str>) -> CommandFuture<'_> {
+		if section.is_some_and(|section| !section.trim().eq_ignore_ascii_case("providers")) {
+			return Box::pin(async {
+				Ok(CommandResult::Consumed(ConsumedResult::status("Usage: /setup [providers]")))
+			});
+		}
+		if self.auth.is_none() {
+			send_backend(self.backend, BackendEvent::Error(sf!(GATEWAY_LOGIN_MESSAGE)));
+			return silent_command();
+		}
+		let current = model_provider(Catalog::embedded(), &self.state.model);
+		send_backend(
+			self.backend,
+			BackendEvent::LoginProviders(provider_rows(Catalog::embedded(), current.as_deref())),
+		);
+		silent_command()
 	}
 
 	fn providers(&mut self) -> CommandFuture<'_> {
-		self.unavailable("Provider listing requires an attached account authority.")
+		let catalog = Catalog::embedded();
+		let accounts = self
+			.auth_control
+			.map(|control| control.accounts(None))
+			.unwrap_or_default();
+		let mut rendered = String::from(
+			"# Providers\n\n| Provider | Authentication | Source | Models |\n|---|---|---|---:|\n",
+		);
+		for provider in catalog.providers() {
+			let provider_accounts = accounts
+				.iter()
+				.filter(|account| account.provider == provider.id)
+				.collect::<Vec<_>>();
+			let authentication = if provider_accounts.is_empty() {
+				"Not authenticated".to_owned()
+			} else {
+				provider_accounts
+					.iter()
+					.map(|account| {
+						if account.enabled {
+							account.principal.as_str().to_owned()
+						} else {
+							format!("{} (disabled)", account.principal)
+						}
+					})
+					.collect::<Vec<_>>()
+					.join(", ")
+			};
+			let source = if let Some(control) = self.auth_control {
+				let sources = provider_accounts
+					.iter()
+					.map(|account| match control.metadata(&account.account) {
+						Ok(Some(metadata)) => format!("stored {}", metadata.kind),
+						Ok(None) => "environment or external authority".to_owned(),
+						Err(_) => "credential source unavailable".to_owned(),
+					})
+					.collect::<Vec<_>>();
+				if sources.is_empty() {
+					"—".to_owned()
+				} else {
+					sources.join(", ")
+				}
+			} else {
+				"live authority unavailable".to_owned()
+			};
+			let models = catalog
+				.models()
+				.iter()
+				.filter(|model| {
+					model.routes.iter().any(|route| {
+						catalog
+							.route(route)
+							.is_some_and(|route| route.provider == provider.id)
+					})
+				})
+				.collect::<Vec<_>>();
+			let available = models
+				.iter()
+				.filter(|model| model.availability == omp_catalog::ModelAvailability::Available)
+				.count();
+			let login_required = models
+				.iter()
+				.filter(|model| model.availability == omp_catalog::ModelAvailability::LoginRequired)
+				.count();
+			let unavailable = models.len().saturating_sub(available + login_required);
+			let model_status =
+				format!("{available} available, {login_required} login, {unavailable} unavailable");
+			rendered.push_str(&format!(
+				"| {} (`{}`) | {} | {} | {} |\n",
+				provider.name, provider.id, authentication, source, model_status
+			));
+		}
+		Box::pin(
+			async move { Ok(CommandResult::Consumed(ConsumedResult::status(Str::from(rendered)))) },
+		)
 	}
 
 	fn login(&mut self, provider: Option<Str>) -> CommandFuture<'_> {
@@ -2928,8 +3488,108 @@ where
 		silent_command()
 	}
 
-	fn logout(&mut self, _: Option<Str>) -> CommandFuture<'_> {
-		self.unavailable("Provider logout requires an attached account authority.")
+	fn logout(&mut self, provider: Option<Str>) -> CommandFuture<'_> {
+		let Some(control) = self.auth_control else {
+			send_backend(self.backend, BackendEvent::Error(sf!(GATEWAY_LOGIN_MESSAGE)));
+			return silent_command();
+		};
+		let accounts = control.accounts(None);
+		let requested = provider;
+		let Some(requested) = requested else {
+			let rows = Catalog::embedded()
+				.providers()
+				.iter()
+				.filter_map(|provider| {
+					let count = accounts
+						.iter()
+						.filter(|account| account.provider == provider.id)
+						.filter(|account| control.metadata(&account.account).ok().flatten().is_some())
+						.count();
+					(count > 0).then(|| SessionRow {
+						id:     Str::from(provider.id.as_str()),
+						label:  provider.name.clone(),
+						detail: sf!("{count} stored account(s)"),
+						pinned: false,
+					})
+				})
+				.collect::<Vec<_>>();
+			if rows.is_empty() {
+				return Box::pin(async {
+					Ok(CommandResult::Consumed(ConsumedResult::status(
+						"No stored provider credentials to log out. Remove environment or external \
+						 authentication at its source.",
+					)))
+				});
+			}
+			send_backend(self.backend, BackendEvent::LogoutChoices {
+				title: sf!("Logout from provider"),
+				rows,
+			});
+			return silent_command();
+		};
+		if let Some(account) = accounts.iter().find(|account| {
+			account.account.as_str() == requested.as_str()
+				&& control.metadata(&account.account).ok().flatten().is_some()
+		}) {
+			let account_id = account.account.clone();
+			let provider = account.provider.clone();
+			let label = Str::from(account.principal.as_str());
+			let control = control.clone();
+			return Box::pin(async move {
+				match control.delete(account_id).await {
+					Ok(()) => Ok(CommandResult::Consumed(ConsumedResult::status(sf!(
+						"Successfully logged out {label} from {provider}. Credential removed from the \
+						 live authentication store."
+					)))),
+					Err(error) => {
+						Ok(CommandResult::Consumed(ConsumedResult::status(sf!("Logout failed: {error}"))))
+					},
+				}
+			});
+		}
+		let Some(provider) = Catalog::embedded().provider(&ProviderId::from_ref(requested.as_str()))
+		else {
+			send_backend(
+				self.backend,
+				BackendEvent::Error(sf!("Unknown OAuth provider: {requested}")),
+			);
+			return silent_command();
+		};
+		let rows = accounts
+			.iter()
+			.filter(|account| account.provider == provider.id)
+			.filter(|account| control.metadata(&account.account).ok().flatten().is_some())
+			.map(|account| {
+				let source = match control.metadata(&account.account) {
+					Ok(Some(metadata)) => sf!("stored {}", metadata.kind),
+					Ok(None) => sf!("environment or external authority"),
+					Err(_) => sf!("credential source unavailable"),
+				};
+				SessionRow {
+					id:     Str::from(account.account.as_str()),
+					label:  Str::from(account.principal.as_str()),
+					detail: if account.enabled {
+						source
+					} else {
+						sf!("{source} · disabled")
+					},
+					pinned: false,
+				}
+			})
+			.collect::<Vec<_>>();
+		if rows.is_empty() {
+			return Box::pin(async move {
+				Ok(CommandResult::Consumed(ConsumedResult::status(sf!(
+					"Logout skipped: no stored credentials for {requested}. Current authentication, if \
+					 any, comes from an environment or external source; remove that source to log out."
+				))))
+			});
+		}
+		send_backend(self.backend, BackendEvent::LogoutChoices {
+			title: sf!("Logout from {}", provider.name),
+			rows,
+		});
+		silent_command()
 	}
 }
 
@@ -3489,12 +4149,27 @@ where
 		})
 	}
 
-	fn usage(&mut self, _: Str) -> CommandFuture<'_> {
-		self.unavailable("Usage receipts are not attached to this interactive session.")
+	fn usage(&mut self, args: Str) -> CommandFuture<'_> {
+		Box::pin(async move {
+			let trimmed = args.trim();
+			let rendered = if trimmed.is_empty() || trimmed.as_str() == "show" {
+				crate::usage_cmd::render_report(self.data_dir).await?
+			} else if trimmed.as_str() == "reset" {
+				crate::usage_cmd::reset_usage(self.data_dir, "").await?
+			} else if let Some(target) = trimmed.as_str().strip_prefix("reset ") {
+				crate::usage_cmd::reset_usage(self.data_dir, target).await?
+			} else {
+				Str::new_static("Usage: /usage [show|reset [account|active]]")
+			};
+			Ok(CommandResult::Consumed(ConsumedResult::status(rendered)))
+		})
 	}
 
-	fn stats(&mut self, _: ParsedFlags) -> CommandFuture<'_> {
-		self.unavailable("Stats service is not attached to this interactive session.")
+	fn stats(&mut self, flags: ParsedFlags) -> CommandFuture<'_> {
+		Box::pin(async move {
+			let launch = crate::stats_cmd::launch_dashboard(self.data_dir, &flags.0).await?;
+			Ok(CommandResult::Consumed(ConsumedResult::status(launch.message)))
+		})
 	}
 
 	fn plan(&mut self, args: Str) -> CommandFuture<'_> {
@@ -3595,36 +4270,231 @@ where
 		})
 	}
 
-	fn loop_command(&mut self, _: Str) -> CommandFuture<'_> {
-		self.unavailable("Loop control is not attached to this interactive session.")
+	fn loop_command(&mut self, args: Str) -> CommandFuture<'_> {
+		let outcome = match self.modes.toggle_loop(args.as_str(), now_ms()) {
+			Ok(outcome) => outcome,
+			Err(error) => return Box::pin(async move { Err(miette::miette!("{error}")) }),
+		};
+		match outcome {
+			omp_driver::modes::LoopCommandOutcome::Disabled => Box::pin(async {
+				Ok(CommandResult::Consumed(ConsumedResult::status("Loop mode disabled.")))
+			}),
+			omp_driver::modes::LoopCommandOutcome::Enabled { prompt: None, message } => {
+				Box::pin(async move { Ok(CommandResult::Consumed(ConsumedResult::status(message))) })
+			},
+			omp_driver::modes::LoopCommandOutcome::Enabled { prompt: Some(prompt), message } => {
+				send_backend(self.backend, BackendEvent::Notice(message));
+				Box::pin(async move {
+					Ok(CommandResult::Prompt(commands::PromptResult {
+						text:       prompt,
+						provenance: commands::CommandProvenance::builtin(),
+					}))
+				})
+			},
+		}
 	}
 
-	fn queue(&mut self, _: Str) -> CommandFuture<'_> {
-		self.unavailable("Queue control is not attached to this interactive session.")
+	fn queue(&mut self, prompt: Str) -> CommandFuture<'_> {
+		if !chat_active(self.state.submit_pending, self.bus.phase()) {
+			return Box::pin(async move {
+				Ok(CommandResult::Prompt(commands::PromptResult {
+					text:       prompt,
+					provenance: commands::CommandProvenance::builtin(),
+				}))
+			});
+		}
+		let item = input::user_message(prompt.as_str());
+		if self
+			.mailbox
+			.try_enqueue(Interrupt {
+				class: InterruptClass::Idle,
+				item,
+				source: InterruptSource::Producer(sf!("user")),
+			})
+			.is_err()
+		{
+			return Box::pin(async { Err(miette::miette!("Agent input channel is closed.")) });
+		}
+		self.state.queued = self.state.queued.saturating_add(1);
+		self
+			.state
+			.queued_prompts
+			.push_back(omp_chat_ui::QueuedPrompt {
+				text:        prompt.clone(),
+				attachments: Vec::new(),
+			});
+		send_backend(self.backend, BackendEvent::UserReplayed { text: prompt, chips: Vec::new() });
+		send_status(self.backend, self.state, self.bus, self.dropped);
+		Box::pin(async {
+			Ok(CommandResult::Consumed(ConsumedResult::status(
+				"Queued message for when the agent yields.",
+			)))
+		})
 	}
 
-	fn force(&mut self, _: Str) -> CommandFuture<'_> {
-		self.unavailable("Forced tool choice is not attached to this interactive session.")
+	fn force(&mut self, args: Str) -> CommandFuture<'_> {
+		let args = args.trim();
+		let args = args.as_str();
+		let (tool, prompt) = args
+			.split_once(char::is_whitespace)
+			.map_or((args, ""), |(tool, prompt)| (tool, prompt.trim()));
+		if tool.is_empty() {
+			return self.unavailable("Usage: /force:<tool-name> [prompt]");
+		}
+		if !self
+			.agent_state
+			.snapshot()
+			.turn
+			.params
+			.tools
+			.iter()
+			.any(|candidate| candidate.name == tool)
+		{
+			let message = sf!("Tool `{tool}` is not active for the current session.");
+			return Box::pin(
+				async move { Ok(CommandResult::Consumed(ConsumedResult::status(message))) },
+			);
+		}
+		let tool = Str::new(tool);
+		let prompt = Str::new(prompt);
+		Box::pin(async move {
+			self
+				.commands_tx
+				.send_async(UiCmd::ForceTool { tool: tool.clone() })
+				.await
+				.into_diagnostic()?;
+			let status = sf!("Next turn forced to use {tool}.");
+			if prompt.is_empty() {
+				return Ok(CommandResult::Consumed(ConsumedResult::status(status)));
+			}
+			send_backend(self.backend, BackendEvent::Notice(status));
+			Ok(CommandResult::Prompt(commands::PromptResult {
+				text:       prompt,
+				provenance: commands::CommandProvenance::builtin(),
+			}))
+		})
 	}
 
-	fn fast(&mut self, _: Str) -> CommandFuture<'_> {
-		self.unavailable("Fast tier control is not attached to this interactive session.")
+	fn fast(&mut self, args: Str) -> CommandFuture<'_> {
+		let current = self.agent_state.snapshot().turn.params.service_tier
+			== omp_proto::inference::v1::ServiceTier::Priority as i32;
+		let requested = match args.trim().as_str() {
+			"" | "toggle" => Some(!current),
+			"on" => Some(true),
+			"off" => Some(false),
+			"status" => None,
+			_ => return self.unavailable("Usage: /fast [on|off|status]"),
+		};
+		if requested == Some(true) {
+			let supported = resolve_model(Catalog::embedded(), self.state.model.as_str())
+				.and_then(|model| model.capabilities.chat.as_ref())
+				.and_then(|chat| chat.service_tiers.constraints())
+				.is_some_and(|tiers| tiers.iter().any(|tier| tier.priority > 0));
+			if !supported {
+				return Box::pin(async {
+					Ok(CommandResult::Consumed(ConsumedResult::status(
+						"Fast mode is unavailable for the current model.",
+					)))
+				});
+			}
+		}
+		if let Some(enabled) = requested {
+			self.agent_state.update(|snapshot| {
+				snapshot.turn.params.service_tier = if enabled {
+					omp_proto::inference::v1::ServiceTier::Priority as i32
+				} else {
+					omp_proto::inference::v1::ServiceTier::Unspecified as i32
+				};
+			});
+		}
+		let enabled = requested.unwrap_or(current);
+		let status = if requested.is_none() {
+			if enabled {
+				"Fast mode is on."
+			} else {
+				"Fast mode is off."
+			}
+		} else if enabled {
+			"Fast mode enabled."
+		} else {
+			"Fast mode disabled."
+		};
+		Box::pin(async move { Ok(CommandResult::Consumed(ConsumedResult::status(status))) })
 	}
 
-	fn prewalk(&mut self, _: Str) -> CommandFuture<'_> {
-		self.unavailable("Prewalk does not own the visible mode resource.")
+	fn prewalk(&mut self, args: Str) -> CommandFuture<'_> {
+		match args.trim().as_str() {
+			"" | "on" => Box::pin(async move {
+				if self.modes.mode_holder().as_deref() == Some("prewalk") {
+					return Ok(CommandResult::Consumed(ConsumedResult::status(mode_status(self.modes))));
+				}
+				let _ = start_mode_regime(
+					self.backend,
+					self.commands_tx,
+					self.modes,
+					"prewalk",
+					false,
+					None,
+				)
+				.await;
+				Ok(CommandResult::Consumed(ConsumedResult::silent()))
+			}),
+			"off" => Box::pin(async move {
+				if self.modes.mode_holder().as_deref() != Some("prewalk") {
+					return Ok(CommandResult::Consumed(ConsumedResult::status(mode_status(self.modes))));
+				}
+				if let Some(activation) = self.modes.mode_activation() {
+					let _ =
+						stop_mode_regime(self.backend, self.commands_tx, "prewalk", activation).await;
+				}
+				Ok(CommandResult::Consumed(ConsumedResult::silent()))
+			}),
+			"status" => {
+				let status = mode_status(self.modes);
+				Box::pin(async move { Ok(CommandResult::Consumed(ConsumedResult::status(status))) })
+			},
+			_ => self.unavailable("Usage: /prewalk [on|off|status]"),
+		}
 	}
 
-	fn btw(&mut self, _: Str) -> CommandFuture<'_> {
-		self.unavailable("Ephemeral asides are not attached to this interactive session.")
+	fn btw(&mut self, prompt: Str) -> CommandFuture<'_> {
+		let parent = Arc::clone(&self.parent);
+		Box::pin(async move {
+			let answer = commands::asides::ask_btw(parent.as_ref(), prompt.as_str()).await?;
+			Ok(CommandResult::Consumed(ConsumedResult::status(sf!("**BTW**\n\n{}", answer))))
+		})
 	}
 
-	fn tan(&mut self, _: Str) -> CommandFuture<'_> {
-		self.unavailable("Background asides are not attached to this interactive session.")
+	fn tan(&mut self, prompt: Str) -> CommandFuture<'_> {
+		let job_id = commands::asides::spawn_tan(
+			Arc::clone(&self.parent),
+			self.backend.clone(),
+			self.bus.clone(),
+			prompt,
+		);
+		Box::pin(async move {
+			Ok(CommandResult::Consumed(ConsumedResult::status(sf!(
+				"Dispatched background tan `{job_id}`."
+			))))
+		})
 	}
 
-	fn omfg(&mut self, _: Str) -> CommandFuture<'_> {
-		self.unavailable("TTSR rule generation is not attached to this interactive session.")
+	fn omfg(&mut self, instruction: Str) -> CommandFuture<'_> {
+		let parent = Arc::clone(&self.parent);
+		let workspace_root = PathBuf::from(self.state.workspace_root.as_str());
+		Box::pin(async move {
+			let path = commands::asides::forge_ttsr(
+				self.executor,
+				parent.as_ref(),
+				workspace_root,
+				instruction.as_str(),
+			)
+			.await?;
+			Ok(CommandResult::Consumed(ConsumedResult::status(Str::from(format!(
+				"Saved durable TTSR rule to `{}`.",
+				path.display()
+			)))))
+		})
 	}
 
 	fn live(&mut self, _: Str) -> CommandFuture<'_> {
@@ -3666,8 +4536,39 @@ where
 	}
 
 	fn utility(&mut self, request: commands::UtilityRequest) -> CommandFuture<'_> {
-		let commands::UtilityRequest::Vision(request) = request else {
-			return self.unavailable("This utility is not attached to the interactive session.");
+		let request = match request {
+			commands::UtilityRequest::Changelog(request) => {
+				let status = commands::utility::render_changelog(request);
+				return Box::pin(
+					async move { Ok(CommandResult::Consumed(ConsumedResult::status(status))) },
+				);
+			},
+			commands::UtilityRequest::Tools => {
+				let live_tools = extension_live_tools(self.registry);
+				let snapshot = self.agent_state.snapshot();
+				let status = commands::utility::render_tools(
+					&live_tools,
+					&snapshot.enabled_tools,
+					&self.state.settings.tools,
+					&self.state.extension_declarations,
+				);
+				return Box::pin(
+					async move { Ok(CommandResult::Consumed(ConsumedResult::status(status))) },
+				);
+			},
+			commands::UtilityRequest::Computer(request) => {
+				return Box::pin(async move {
+					let status = commands::utility::handle_computer(
+						request,
+						self.registry,
+						&self.state.settings.tools,
+						&self.state.model,
+					)
+					.await?;
+					Ok(CommandResult::Consumed(ConsumedResult::status(status)))
+				});
+			},
+			commands::UtilityRequest::Vision(request) => request,
 		};
 		self.state.vision_override = match request {
 			commands::VisionRequest::On => Some(InspectImageMode::On),
@@ -3695,6 +4596,15 @@ where
 			self.state.model
 		);
 		Box::pin(async move { Ok(CommandResult::Consumed(ConsumedResult::status(status))) })
+	}
+
+	fn ssh(&mut self, request: commands::SshRequest) -> CommandFuture<'_> {
+		let workspace = PathBuf::from(self.state.workspace_root.as_str());
+		let data_dir = self.data_dir.to_owned();
+		Box::pin(async move {
+			let status = commands::ssh::execute(request, &workspace, &data_dir)?;
+			Ok(CommandResult::Consumed(ConsumedResult::status(status)))
+		})
 	}
 
 	fn collab(&mut self, request: commands::CollabRequest) -> CommandFuture<'_> {
@@ -3868,10 +4778,64 @@ where
 					Ok(CommandResult::Consumed(ConsumedResult::silent()))
 				})
 			},
-			commands::ExtensionRequest::Marketplace(_)
+			request @ (commands::ExtensionRequest::Marketplace(_)
 			| commands::ExtensionRequest::Plugins(_)
-			| commands::ExtensionRequest::Reload => {
-				self.unavailable("Extension mutation requires the discovery configuration owner.")
+			| commands::ExtensionRequest::Reload) => {
+				let extension_reload = self.extension_reload;
+				let backend = self.backend;
+				let data_dir = self.data_dir;
+				let registry = self.registry;
+				let mcp_inspector = self.mcp_inspector;
+				let state = &mut *self.state;
+				Box::pin(async move {
+					let (status, reload) = match request {
+						commands::ExtensionRequest::Reload => {
+							(Str::new_static("Plugins reloaded."), true)
+						},
+						request => {
+							let workspace = PathBuf::from(state.workspace_root.as_str());
+							let output =
+								commands::extension_runtime::execute(request, data_dir, &workspace).await?;
+							(output.status, output.reload)
+						},
+					};
+					if reload {
+						extension_reload
+							.reload()
+							.await
+							.map_err(|error| miette::miette!("{error}"))?;
+						let workspace = PathBuf::from(state.workspace_root.as_str());
+						let content = omp_driver::discovery::active_content_snapshots(&workspace);
+						let sources = vec![content.commands.iter().cloned().map(Into::into).collect()];
+						let security_enabled = state
+							.typed_commands
+							.command_usage_name("/security")
+							.is_some();
+						state.commands = CommandRoster::new(sources.clone());
+						state.typed_commands = structural_roster(&sources, security_enabled);
+						state.skills = content.skills;
+						state.extension_declarations = content.declarations;
+						state.extension_generation = state.extension_generation.wrapping_add(1).max(1);
+						let mut completions = state
+							.typed_commands
+							.completions_for(command_role(state.collab.as_ref()));
+						completions.extend(state.skills.all().iter().map(|skill| {
+							let name = format!("skill:{}", skill.name);
+							Command::new(&name, skill.description.as_str(), &[]).with_icon(Icon::Skill)
+						}));
+						send_backend(backend, BackendEvent::SlashCommands(completions));
+						let live_tools = extension_live_tools(registry);
+						let live_mcp = commands::snapshot_live_mcp(mcp_inspector);
+						let snapshot = commands::build_inspector_snapshot_from_declarations(
+							&state.extension_declarations,
+							&live_tools,
+							&live_mcp,
+							state.extension_generation,
+						);
+						send_backend(backend, BackendEvent::ExtensionSnapshotUpdated(snapshot));
+					}
+					Ok(CommandResult::Consumed(ConsumedResult::status(status)))
+				})
 			},
 		}
 	}
@@ -4125,19 +5089,136 @@ where
 					sf!("Reconnected MCP server `{name}`: {state}.")
 				},
 				McpRequest::Reauth(name) => {
-					return Err(miette::miette!(
-						"MCP reauthentication for `{name}` is unavailable: the credential authority has \
-						 no command-safe OAuth replacement operation",
-					));
+					let status = self
+						.state
+						.environment
+						.mcp_status(McpStatusRequest {
+							name:          Some(name.to_string()),
+							wire_revision: omp_proto::SCHEMA_REV,
+						})
+						.await
+						.into_diagnostic()?;
+					let server = status
+						.servers
+						.first()
+						.and_then(|status| status.server.clone())
+						.ok_or_else(|| miette::miette!("MCP server `{name}` is not configured"))?;
+					let backend = (*self.backend).clone();
+					self
+						.mcp_inspector
+						.reauthorize(name.as_str(), move |url| {
+							send_backend(
+								&backend,
+								BackendEvent::Notice(sf!("[open to authorize]({url})")),
+							);
+						})
+						.await
+						.into_diagnostic()?;
+					let result = self
+						.state
+						.environment
+						.mcp_reset(McpResetRequest {
+							server:        Some(McpServerRef {
+								name:             server.name,
+								definition_epoch: server.definition_epoch,
+							}),
+							wire_revision: omp_proto::SCHEMA_REV,
+						})
+						.await
+						.into_diagnostic()?;
+					let state = result
+						.status
+						.map(|status| {
+							McpLifecycleState::try_from(status.state)
+								.unwrap_or(McpLifecycleState::Unspecified)
+								.as_str_name()
+						})
+						.unwrap_or("UNKNOWN");
+					sf!("Reauthorized MCP server `{name}`: {state}.")
 				},
 				McpRequest::Unauth(name) => {
-					return Err(miette::miette!(
-						"MCP credential removal for `{name}` is unavailable: the credential authority \
-						 has no command-safe affinity deletion operation",
-					));
+					let status = self
+						.state
+						.environment
+						.mcp_status(McpStatusRequest {
+							name:          Some(name.to_string()),
+							wire_revision: omp_proto::SCHEMA_REV,
+						})
+						.await
+						.into_diagnostic()?;
+					let server = status
+						.servers
+						.first()
+						.and_then(|status| status.server.clone())
+						.ok_or_else(|| miette::miette!("MCP server `{name}` is not configured"))?;
+					let removed = self
+						.mcp_inspector
+						.clear_authorization(name.as_str())
+						.await
+						.into_diagnostic()?;
+					let reset = self
+						.state
+						.environment
+						.mcp_reset(McpResetRequest {
+							server:        Some(McpServerRef {
+								name:             server.name,
+								definition_epoch: server.definition_epoch,
+							}),
+							wire_revision: omp_proto::SCHEMA_REV,
+						})
+						.await;
+					let status = match reset {
+						Ok(result) => result.status,
+						Err(_) => self
+							.state
+							.environment
+							.mcp_status(McpStatusRequest {
+								name:          Some(name.to_string()),
+								wire_revision: omp_proto::SCHEMA_REV,
+							})
+							.await
+							.into_diagnostic()?
+							.servers
+							.into_iter()
+							.next(),
+					};
+					let status =
+						status.ok_or_else(|| miette::miette!("MCP server `{name}` is not configured"))?;
+					let state = McpLifecycleState::try_from(status.state)
+						.unwrap_or(McpLifecycleState::Unspecified)
+						.as_str_name();
+					if removed {
+						sf!(
+							"Cleared stored credential for MCP server `{name}`. Connection: {state} · {}",
+							status.detail
+						)
+					} else {
+						sf!(
+							"No stored credential found for MCP server `{name}`. Connection reset: \
+							 {state} · {}",
+							status.detail
+						)
+					}
 				},
 			};
 			Ok(CommandResult::Consumed(ConsumedResult::status(notice)))
+		})
+	}
+
+	fn cleanse(&mut self, args: omp_driver::cleanse::CleanseArgs) -> CommandFuture<'_> {
+		if chat_active(self.state.submit_pending, self.bus.phase()) {
+			return Box::pin(async {
+				Ok(CommandResult::Consumed(ConsumedResult::status(
+					"Wait for the active turn to finish before cleansing the workspace.",
+				)))
+			});
+		}
+		let root = self.state.local_root.clone();
+		let data_dir = self.data_dir.to_path_buf();
+		Box::pin(async move {
+			let cancel = CancellationToken::new();
+			let status = commands::run_cleanse(&root, &data_dir, args, &cancel).await?;
+			Ok(CommandResult::Consumed(ConsumedResult::status(status)))
 		})
 	}
 }
@@ -4184,8 +5265,10 @@ async fn handle_intent<C, R>(
 	control: &omp_agent::ControlSender,
 	agent_state: &AgentState,
 	modes: &RegimeHandle,
-	parent: &ChatParentHost<C>,
+	parent: &Arc<ChatParentHost<C>>,
 	auth: Option<&ChatAuth>,
+	auth_control: Option<&omp_inference::auth::AuthControlHandle>,
+	extension_reload: &omp_envd::ExtensionReloadHandle,
 	data_dir: &Path,
 	settings_manager: &SettingsManager,
 	telemetry_index: &omp_storage::telemetry_index::TelemetryIndex,
@@ -4348,6 +5431,10 @@ where
 				agent_state,
 				modes,
 				auth,
+				auth_control,
+				parent: parent.clone(),
+				mailbox,
+				extension_reload,
 				data_dir,
 				list_sessions,
 				bus,
@@ -4370,6 +5457,9 @@ where
 				},
 				DispatchResult::Handled(CommandResult::Exit) => return Ok(true),
 			};
+			if !text.trim().is_empty() {
+				modes.capture_loop_prompt(&text);
+			}
 			match state.commands.parse_input(&text) {
 				Ok(ChatCommand::Nothing) => {
 					if should_abort_empty(chat_active(state.submit_pending, bus.phase()), state.queued) {
@@ -4749,6 +5839,7 @@ where
 		Intent::Abort => {
 			if chat_active(state.submit_pending, bus.phase()) {
 				abort.abort();
+				modes.pause_loop();
 				if let Ok(Some(goal)) = modes.interrupt_goal(now_ms(), true) {
 					if let Some(activation) = modes.mode_activation() {
 						let _ = stop_mode_regime(backend, commands_tx, "goal", activation).await;
@@ -5222,6 +6313,44 @@ where
 				);
 			} else {
 				handle_login(backend, auth, provider, state);
+			}
+		},
+		Intent::Logout(target) => {
+			if chat_active(state.submit_pending, bus.phase()) {
+				send_backend(
+					backend,
+					BackendEvent::Error(sf!("Wait for the active turn to finish before logging out.")),
+				);
+			} else {
+				let roster = state.typed_commands.clone();
+				let mut command_host = LiveCommandHost {
+					mcp_inspector,
+					executor,
+					backend,
+					commands_tx,
+					abort,
+					control,
+					agent_state,
+					modes,
+					auth,
+					auth_control,
+					parent: parent.clone(),
+					mailbox,
+					extension_reload,
+					data_dir,
+					list_sessions,
+					bus,
+					registry,
+					dropped,
+					roster,
+					state,
+				};
+				if let CommandResult::Consumed(consumed) =
+					ConfigCommandHost::logout(&mut command_host, target).await?
+					&& let Some(status) = consumed.status
+				{
+					send_backend(backend, BackendEvent::Notice(status));
+				}
 			}
 		},
 		Intent::Resume(None) => {
@@ -6779,6 +7908,10 @@ fn send_status(
 			context_tokens: state.context_tokens,
 			context_window: state.context_window,
 			compaction_speculation: omp_chat_ui::CompactionSpeculationStatus::Idle,
+			compaction_boundaries: compaction_boundaries(
+				&state.settings.compaction,
+				state.context_window,
+			),
 			cost_nanos: state.cost_nanos,
 			advisor_cost_nanos,
 			queued: state.queued,
@@ -6811,6 +7944,33 @@ fn send_status(
 			separator: StatusSeparator::Dot,
 		}),
 	);
+}
+
+/// Auto-compaction boundary percents for the embedded context gauge, absent
+/// when compaction is disabled or the window is unknown. Mirrors pi's
+/// `computeCompactionBoundaries`: the threshold marks where auto-compaction
+/// fires; speculation marks where the background summarizer starts, absent
+/// when async compaction is off or no ladder method speculates.
+fn compaction_boundaries(
+	settings: &settings::CompactionSettings,
+	context_window: Option<u64>,
+) -> Option<omp_chat_ui::CompactionBoundaries> {
+	let window = context_window.filter(|window| *window > 0)?;
+	let order = settings.method_order();
+	if order.as_slice().is_empty() {
+		return None;
+	}
+	let threshold = (window as f64 * settings.threshold_fraction).floor() as u64;
+	if threshold == 0 || threshold > window {
+		return None;
+	}
+	let speculates = settings.async_enabled && order.speculation_tier().is_some();
+	let lead = omp_agent::speculation_lead_tokens(threshold);
+	Some(omp_chat_ui::CompactionBoundaries {
+		threshold_percent:   threshold as f64 / window as f64 * 100.0,
+		speculation_percent: speculates
+			.then(|| threshold.saturating_sub(lead) as f64 / window as f64 * 100.0),
+	})
 }
 
 fn status_model_label(model: &str) -> Str {
@@ -7281,6 +8441,7 @@ mod tests {
 		let (environment, _transport) = omp_env::EnvClient::in_process(1);
 		BridgeState {
 			model: "test/model".to_owned(),
+			pending_session_delete: None,
 			git: None,
 			advisor: None,
 			title: SessionTitleState::default(),

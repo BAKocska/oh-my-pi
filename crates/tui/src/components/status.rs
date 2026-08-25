@@ -1,3 +1,5 @@
+use core::fmt::{self, Write as _};
+
 use omp_core::{IntoStr, Str};
 use smallvec::SmallVec;
 
@@ -67,19 +69,318 @@ pub const fn boundary_layout(
 	})
 }
 
-/// Number of cells filled by a proportional context gauge.
-pub const fn context_gauge_cells(width: u16, used: u64, total: u64) -> u16 {
-	if total == 0 {
-		return 0;
+/// Percent positions of the auto-compaction boundaries on a context gauge.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CompactionBoundaries {
+	/// Where auto-compaction fires, as a percent of the context window.
+	pub threshold_percent:   f64,
+	/// Where background speculation starts, absent when none will run (async
+	/// compaction disabled, or the first summarizing method is local and
+	/// therefore instant).
+	pub speculation_percent: Option<f64>,
+}
+
+/// Paint class of one embedded context-gauge cell.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GaugeCell<'a> {
+	/// Fill inside the used portion of the window.
+	Used,
+	/// Fill past the used portion.
+	Unused,
+	/// Auto-compaction threshold tick.
+	Threshold,
+	/// Background-speculation start tick.
+	Speculation,
+	/// One ASCII cell of the usage percent label.
+	Percent(&'a str),
+	/// One ASCII cell of the context-window label.
+	Window(&'a str),
+}
+
+/// Fixed-capacity ASCII scratch for gauge annotations; a write that would
+/// overflow or emit non-ASCII fails, and the caller drops the label.
+#[derive(Clone, Copy, Debug, Default)]
+struct GaugeLabel {
+	buf: [u8; 12],
+	len: u8,
+}
+
+impl GaugeLabel {
+	fn as_str(&self) -> &str {
+		// Writes reject non-ASCII bytes, so the buffer is always valid UTF-8.
+		str::from_utf8(&self.buf[..usize::from(self.len)]).unwrap_or_default()
 	}
-	let used = if used > total { total } else { used };
-	((width as u128 * used as u128 + total as u128 / 2) / total as u128) as u16
+
+	/// Single-character slice at `index` when this label starts at `start`.
+	fn cell_at(&self, start: Option<u16>, index: u16) -> Option<&str> {
+		let start = start?;
+		(index >= start && index < start + self.width()).then(|| {
+			let cell = usize::from(index - start);
+			&self.as_str()[cell..=cell]
+		})
+	}
+
+	fn width(&self) -> u16 {
+		u16::from(self.len)
+	}
+
+	fn is_empty(&self) -> bool {
+		self.len == 0
+	}
+}
+
+impl fmt::Write for GaugeLabel {
+	fn write_str(&mut self, s: &str) -> fmt::Result {
+		for &byte in s.as_bytes() {
+			if usize::from(self.len) == self.buf.len() || !byte.is_ascii() {
+				return Err(fmt::Error);
+			}
+			self.buf[usize::from(self.len)] = byte;
+			self.len += 1;
+		}
+		Ok(())
+	}
+}
+
+/// Writes `value` in the compact `k`/`m` notation shared by context labels.
+pub fn write_compact_count(out: &mut impl fmt::Write, value: u64) -> fmt::Result {
+	if value >= 1_000_000 {
+		write!(out, "{:.1}m", value as f64 / 1_000_000.0)
+	} else if value >= 1_000 {
+		write!(out, "{:.0}k", value as f64 / 1_000.0)
+	} else {
+		write!(out, "{value}")
+	}
+}
+
+/// Cell plan for the embedded context gauge bridging the status groups.
+///
+/// Ports pi's `statusLine.contextLine = "embedded"` top-border gauge: a
+/// proportional fill with the usage percent and context window absorbed as
+/// in-line labels, plus ticks where background speculation starts and where
+/// auto-compaction fires. An unknown window plans a solid used line (no
+/// context feedback), and usage past the window moves the percent label past
+/// the window label so it can paint in the error color.
+#[derive(Clone, Copy, Debug)]
+pub struct ContextGauge {
+	width:         u16,
+	solid:         bool,
+	overflow:      bool,
+	used:          u16,
+	percent:       GaugeLabel,
+	percent_start: Option<u16>,
+	window:        GaugeLabel,
+	window_start:  Option<u16>,
+	threshold:     Option<u16>,
+	speculation:   Option<u16>,
+}
+
+impl ContextGauge {
+	/// Plans a gauge for `width` boundary cells.
+	pub fn plan(
+		width: u16,
+		tokens: u64,
+		window: Option<u64>,
+		boundaries: Option<CompactionBoundaries>,
+	) -> Self {
+		let mut gauge = Self {
+			width,
+			solid: true,
+			overflow: false,
+			used: 0,
+			percent: GaugeLabel::default(),
+			percent_start: None,
+			window: GaugeLabel::default(),
+			window_start: None,
+			threshold: None,
+			speculation: None,
+		};
+		let Some(window_tokens) = window.filter(|window| *window > 0) else {
+			return gauge;
+		};
+		if width == 0 {
+			return gauge;
+		}
+		gauge.solid = false;
+		let percent = tokens as f64 / window_tokens as f64 * 100.0;
+		let clamped = percent.clamp(0.0, 100.0);
+		gauge.overflow = percent > 100.0;
+
+		let display = if gauge.overflow { percent } else { clamped };
+		let mut percent_label = GaugeLabel::default();
+		let wrote = if display > 0.0 && display < 1.0 {
+			write!(percent_label, "{display:.1}%")
+		} else {
+			write!(percent_label, "{display:.0}%")
+		};
+		if wrote.is_err() {
+			percent_label = GaugeLabel::default();
+		}
+		let mut window_label = GaugeLabel::default();
+		if write_compact_count(&mut window_label, window_tokens).is_err() {
+			window_label = GaugeLabel::default();
+		}
+
+		// Absorb both labels only when the line leaves fill on their flanks.
+		let mut scale = width;
+		if !percent_label.is_empty()
+			&& !window_label.is_empty()
+			&& width >= percent_label.width() + window_label.width() + 4
+		{
+			gauge.percent = percent_label;
+			gauge.window = window_label;
+			let window_start = if gauge.overflow {
+				let percent_start = width - gauge.percent.width();
+				gauge.percent_start = Some(percent_start);
+				percent_start - 1 - gauge.window.width()
+			} else {
+				width - gauge.window.width() - 1
+			};
+			gauge.window_start = Some(window_start);
+			scale = window_start;
+		}
+
+		// At least one accent cell: a fresh session still shows the used line
+		// starting at the left instead of a fully dim bar.
+		gauge.used = (((clamped / 100.0) * f64::from(scale)).round() as u16)
+			.max(1)
+			.min(scale);
+
+		// Boundary ticks are only meaningful when auto-compaction can fire and
+		// the line is long enough for ticks to read as positions.
+		if let Some(boundaries) = boundaries
+			&& width >= 8
+		{
+			let cell_for = |percent: f64| -> u16 {
+				let cell = ((percent / 100.0) * f64::from(scale)).round().max(0.0) as u16;
+				cell.min(scale.saturating_sub(1))
+			};
+			let threshold = cell_for(boundaries.threshold_percent);
+			gauge.threshold = Some(threshold);
+			// Threshold wins a shared cell.
+			gauge.speculation = boundaries
+				.speculation_percent
+				.map(cell_for)
+				.filter(|&tick| tick != threshold);
+		}
+
+		// Anchor the percent label at the fill boundary, nudged off the ticks.
+		if !gauge.percent.is_empty() && gauge.percent_start.is_none() {
+			let max_start = scale.saturating_sub(gauge.percent.width() + 1);
+			let preferred = gauge.used.max(1).min(max_start);
+			let end_of = |start: u16| start + gauge.percent.width();
+			let overlaps = |start: u16| {
+				let hits =
+					|tick: Option<u16>| tick.is_some_and(|tick| tick >= start && tick < end_of(start));
+				hits(gauge.threshold) || hits(gauge.speculation)
+			};
+			for distance in 0..=max_start {
+				if let Some(left) = preferred.checked_sub(distance)
+					&& left >= 1
+					&& !overlaps(left)
+				{
+					gauge.percent_start = Some(left);
+					break;
+				}
+				if distance == 0 {
+					continue;
+				}
+				let right = preferred + distance;
+				if right <= max_start && !overlaps(right) {
+					gauge.percent_start = Some(right);
+					break;
+				}
+			}
+		}
+		gauge
+	}
+
+	/// Planned width in cells.
+	pub const fn width(&self) -> u16 {
+		self.width
+	}
+
+	/// Whether usage exceeds the window; the percent label paints as an error.
+	pub const fn overflowed(&self) -> bool {
+		self.overflow
+	}
+
+	/// Paint class of the cell at `index`.
+	pub fn cell(&self, index: u16) -> GaugeCell<'_> {
+		if self.solid {
+			return GaugeCell::Used;
+		}
+		if let Some(cell) = self.percent.cell_at(self.percent_start, index) {
+			return GaugeCell::Percent(cell);
+		}
+		if self.threshold == Some(index) {
+			return GaugeCell::Threshold;
+		}
+		if self.speculation == Some(index) {
+			return GaugeCell::Speculation;
+		}
+		if let Some(cell) = self.window.cell_at(self.window_start, index) {
+			return GaugeCell::Window(cell);
+		}
+		if index < self.used {
+			GaugeCell::Used
+		} else {
+			GaugeCell::Unused
+		}
+	}
 }
 
 /// Returns the themed accent shared by the compaction threshold marker and
 /// context-window usage labels.
 pub const fn compaction_threshold_color(theme: &Theme) -> Color {
 	theme.accent
+}
+/// Returns the dimmed accent painting compaction boundary ticks and the
+/// embedded window label; pi dims the session accent by HSV saturation ×0.7
+/// and value ×0.75. Non-RGB colors pass through unchanged.
+pub fn compaction_boundary_color(theme: &Theme) -> Color {
+	scale_hsv(compaction_threshold_color(theme), 0.7, 0.75)
+}
+
+fn scale_hsv(color: Color, saturation_scale: f32, value_scale: f32) -> Color {
+	let Color::Rgb(red, green, blue) = color else {
+		return color;
+	};
+	let r = f32::from(red) / 255.0;
+	let g = f32::from(green) / 255.0;
+	let b = f32::from(blue) / 255.0;
+	let max = r.max(g).max(b);
+	let min = r.min(g).min(b);
+	let delta = max - min;
+	let hue = if delta <= f32::EPSILON {
+		0.0
+	} else if max == r {
+		60.0 * (((g - b) / delta).rem_euclid(6.0))
+	} else if max == g {
+		60.0 * ((b - r) / delta + 2.0)
+	} else {
+		60.0 * ((r - g) / delta + 4.0)
+	};
+	let saturation = if max <= f32::EPSILON {
+		0.0
+	} else {
+		delta / max
+	};
+	let saturation = (saturation * saturation_scale).clamp(0.0, 1.0);
+	let value = (max * value_scale).clamp(0.0, 1.0);
+	let chroma = value * saturation;
+	let x = chroma * (1.0 - ((hue / 60.0).rem_euclid(2.0) - 1.0).abs());
+	let (r, g, b) = match hue {
+		hue if hue < 60.0 => (chroma, x, 0.0),
+		hue if hue < 120.0 => (x, chroma, 0.0),
+		hue if hue < 180.0 => (0.0, chroma, x),
+		hue if hue < 240.0 => (0.0, x, chroma),
+		hue if hue < 300.0 => (x, 0.0, chroma),
+		_ => (chroma, 0.0, x),
+	};
+	let offset = value - chroma;
+	let channel = |part: f32| ((part + offset) * 255.0).round() as u8;
+	Color::Rgb(channel(r), channel(g), channel(b))
 }
 
 /// Formats primary-model spend for metered or subscription billing.
@@ -356,7 +657,8 @@ impl Component for Status {
 #[cfg(test)]
 mod tests {
 	use super::{
-		Segment, Status, advisor_spend_label, boundary_layout, context_gauge_cells, spend_label,
+		CompactionBoundaries, ContextGauge, GaugeCell, Segment, Status, advisor_spend_label,
+		boundary_layout, spend_label, write_compact_count,
 	};
 	use crate::{
 		Charset, Color, Prop, Ui, UiContext,
@@ -528,12 +830,76 @@ mod tests {
 		assert_eq!(layout.right_x, 39);
 	}
 
+	fn gauge_row(gauge: &ContextGauge) -> String {
+		(0..gauge.width())
+			.map(|index| match gauge.cell(index) {
+				GaugeCell::Used => '=',
+				GaugeCell::Unused => '-',
+				GaugeCell::Threshold => 'T',
+				GaugeCell::Speculation => 'S',
+				GaugeCell::Percent(cell) | GaugeCell::Window(cell) => {
+					cell.chars().next().unwrap_or('?')
+				},
+			})
+			.collect()
+	}
+
 	#[test]
-	fn context_gauge_rounds_and_clamps_to_its_boundary() {
-		assert_eq!(context_gauge_cells(20, 25, 100), 5);
-		assert_eq!(context_gauge_cells(9, 50, 100), 5);
-		assert_eq!(context_gauge_cells(20, 200, 100), 20);
-		assert_eq!(context_gauge_cells(20, 1, 0), 0);
+	fn context_gauge_embeds_percent_and_window_labels() {
+		let gauge = ContextGauge::plan(30, 50_000, Some(200_000), None);
+		assert!(!gauge.overflowed());
+		assert_eq!(gauge_row(&gauge), "======25%----------------200k-");
+	}
+
+	#[test]
+	fn context_gauge_marks_compaction_boundaries_and_dodges_them() {
+		let boundaries =
+			CompactionBoundaries { threshold_percent: 80.0, speculation_percent: Some(70.0) };
+		let gauge = ContextGauge::plan(30, 160_000, Some(200_000), Some(boundaries));
+		assert_eq!(gauge_row(&gauge), "==================S=T80%-200k-");
+	}
+
+	#[test]
+	fn context_gauge_overflow_breaks_the_percent_past_the_window_label() {
+		let gauge = ContextGauge::plan(30, 400_000, Some(200_000), None);
+		assert!(gauge.overflowed());
+		assert_eq!(gauge_row(&gauge), "=====================200k-200%");
+	}
+
+	#[test]
+	fn context_gauge_without_a_window_plans_a_solid_line() {
+		let gauge = ContextGauge::plan(6, 1_234, None, None);
+		assert_eq!(gauge_row(&gauge), "======");
+	}
+
+	#[test]
+	fn context_gauge_keeps_one_accent_cell_for_a_fresh_session() {
+		let gauge = ContextGauge::plan(30, 0, Some(200_000), None);
+		assert_eq!(gauge_row(&gauge), "=0%----------------------200k-");
+	}
+
+	#[test]
+	fn narrow_gauges_drop_labels_but_keep_the_fill() {
+		let gauge = ContextGauge::plan(
+			7,
+			100_000,
+			Some(200_000),
+			Some(CompactionBoundaries { threshold_percent: 80.0, speculation_percent: None }),
+		);
+		assert_eq!(gauge_row(&gauge), "====---", "width below 8 hides ticks and labels");
+	}
+
+	#[test]
+	fn compact_counts_share_the_context_label_notation() {
+		let mut label = String::new();
+		let _ = write_compact_count(&mut label, 200_000);
+		assert_eq!(label, "200k");
+		label.clear();
+		let _ = write_compact_count(&mut label, 1_500_000);
+		assert_eq!(label, "1.5m");
+		label.clear();
+		let _ = write_compact_count(&mut label, 999);
+		assert_eq!(label, "999");
 	}
 
 	#[test]

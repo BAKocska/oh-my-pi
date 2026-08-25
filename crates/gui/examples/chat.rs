@@ -16,9 +16,9 @@ use std::{
 
 use flume::{Receiver, Sender};
 use omp_chat_ui::{
-	BackendEvent, Chat, ChatKey, CommandPalette, GitFacts, Intent, ModelPicker, ModelRow,
-	PaletteAction, PaletteEntry, PaletteEvent, PickerEvent, SessionRow, Sidebar, StatusFacts,
-	Welcome, WelcomeEvent,
+	BackendEvent, Chat, ChatKey, CommandPalette, CompactionBoundaries, GitFacts, Intent,
+	ModelPicker, ModelRow, PaletteAction, PaletteEntry, PaletteEvent, PickerEvent, SessionRow,
+	Sidebar, StatusFacts, Welcome, WelcomeEvent,
 };
 use omp_core::{Str, sf};
 use omp_gui::{Effect, HostConfig, Scene, SceneFrame};
@@ -534,6 +534,10 @@ fn mock_status(model: &str, working: bool) -> StatusFacts {
 		attempt: 0,
 		dropped: 0,
 		git: Some(GitFacts { branch: sf!("main"), dirty: 5, staged: 9 }),
+		compaction_boundaries: Some(CompactionBoundaries {
+			threshold_percent:   80.0,
+			speculation_percent: Some(70.0),
+		}),
 		..StatusFacts::default()
 	}
 }
