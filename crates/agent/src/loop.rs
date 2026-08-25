@@ -1666,7 +1666,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 				.drain(DrainPoint::TurnBoundary, snapshot.defer_interrupts);
 			if stop == pb::StopReason::StopToolUse {
 				if let Err(error) = self
-					.complete_missing_speculation(
+					.reconcile_speculation(
 						&outcome.output,
 						&mut speculative,
 						snapshot.registry.as_ref(),
@@ -3121,7 +3121,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 		}
 	}
 
-	async fn complete_missing_speculation(
+	async fn reconcile_speculation(
 		&mut self,
 		output: &[Item],
 		speculative: &mut BTreeMap<Str, SpeculativeCall>,
@@ -3132,8 +3132,18 @@ impl<C: TurnClient + Clone> Agent<C> {
 			let Some(item::Kind::ToolCall(call)) = &item.kind else {
 				continue;
 			};
-			if speculative.contains_key(call.id.as_str()) {
-				continue;
+			let restored = restored_argument_bytes(&call.args_json, self.secret_obfuscator.as_ref())?;
+			if let Some(opened) = speculative.get(call.id.as_str()) {
+				if speculation_commits_verbatim(opened.relayed_args(), &restored) {
+					continue;
+				}
+				// The streamed fragments no longer parse to the final arguments
+				// (recovery repair or secret restoration), so the invocation
+				// consumed a stale prefix. Restart it with the final arguments.
+				let stale = speculative
+					.remove(call.id.as_str())
+					.expect("divergent speculation was just observed");
+				stale.abandon().await;
 			}
 			if !enabled_tools.iter().any(|name| name.as_str() == call.name) {
 				return Err(AgentError::Protocol("outcome names disabled tool"));
@@ -3160,7 +3170,6 @@ impl<C: TurnClient + Clone> Agent<C> {
 				self.invocation_fact_tx.clone(),
 				maximum_effects,
 			)?;
-			let restored = restored_argument_bytes(&call.args_json, self.secret_obfuscator.as_ref())?;
 			let fragment = str::from_utf8(&restored)
 				.map_err(|_| AgentError::Protocol("tool arguments are not UTF-8"))?;
 			opened.relay_fragment(fragment.to_str()).await?;
@@ -4016,6 +4025,24 @@ fn restored_argument_bytes(
 	Ok(bytes::Bytes::copy_from_slice(restored.get().as_bytes()))
 }
 
+/// Whether streamed speculative fragments remain authoritative for the final
+/// canonical arguments.
+///
+/// Empty fragments commit through the feed's seeded path, and byte-diverging
+/// fragments stay authoritative while they parse to the same JSON value
+/// (providers may stream non-canonical whitespace or escape forms). A
+/// value-level difference means recovery repair or secret restoration rewrote
+/// the arguments after their prefix was already consumed.
+fn speculation_commits_verbatim(relayed: &str, restored: &[u8]) -> bool {
+	if relayed.is_empty() || relayed.as_bytes() == restored {
+		return true;
+	}
+	match (serde_json::from_str::<Value>(relayed), serde_json::from_slice::<Value>(restored)) {
+		(Ok(streamed), Ok(canonical)) => streamed == canonical,
+		_ => false,
+	}
+}
+
 fn canonical_raw(bytes: &[u8]) -> Result<Box<RawValue>, AgentError> {
 	let value = serde_json::from_slice::<Value>(bytes)
 		.map_err(|_| AgentError::Protocol("invocation arguments are not one JSON document"))?;
@@ -4087,7 +4114,18 @@ fn committed_calls(
 		if committed_rev != opened.identity().rev.to_string() {
 			return Err(AgentError::Protocol("committed tool revision changed"));
 		}
-		committed.push(opened.commit(restored_argument_bytes(&call.args_json, secret_obfuscator)?));
+		let restored = restored_argument_bytes(&call.args_json, secret_obfuscator)?;
+		// The tool's streaming parser consumed the relayed fragments verbatim,
+		// so they stay authoritative whenever they parse to the final
+		// arguments; providers may stream non-canonical whitespace or escapes
+		// that a canonical re-serialization would silently rewrite.
+		let raw = match opened.relayed_args() {
+			relayed if speculation_commits_verbatim(relayed, &restored) && !relayed.is_empty() => {
+				bytes::Bytes::copy_from_slice(relayed.as_bytes())
+			},
+			_ => restored,
+		};
+		committed.push(opened.commit(raw));
 	}
 	Ok(committed)
 }
@@ -5425,6 +5463,95 @@ mod tests {
 		assert_eq!(summary.committed_turns, 2);
 		assert_eq!(opened.lock().len(), 2);
 		fs::remove_file(path).expect("remove journal");
+	}
+
+	#[test]
+	fn speculation_commits_verbatim_tolerates_formatting_drift_only() {
+		// Empty and byte-identical streams commit as-is.
+		assert!(speculation_commits_verbatim("", br#"{"path":"src"}"#));
+		assert!(speculation_commits_verbatim(r#"{"path":"src"}"#, br#"{"path":"src"}"#));
+		// Non-canonical provider whitespace and escapes parse to the same value.
+		assert!(speculation_commits_verbatim(
+			"{\"path\": \"src\",\n  \"pattern\": \"a|b\"}",
+			br#"{"path":"src","pattern":"a|b"}"#
+		));
+		assert!(speculation_commits_verbatim(r#"{"p": "\u0061"}"#, br#"{"p":"a"}"#));
+		// Value drift (recovery repair, secret restoration) is not committable.
+		assert!(!speculation_commits_verbatim(r#"{"p": "PLACEHOLDER"}"#, br#"{"p":"real"}"#));
+		// A stream that never parsed cannot stay authoritative.
+		assert!(!speculation_commits_verbatim(r#"{"p":"src""#, br#"{"p":"src"}"#));
+	}
+
+	#[tokio::test]
+	async fn committed_calls_commit_streamed_fragments_verbatim() {
+		let (client, transport) = EnvClient::in_process(0);
+		let (requests, _responses) = transport.into_parts();
+		let events = EventBus::new();
+		let identity =
+			ToolIdentity { name: sf!("grep"), rev: omp_tool::Rev { family: sf!("test"), n: 1 } };
+		let mut streamed = SpeculativeCall::open(
+			&client,
+			&events,
+			sf!("call-streamed"),
+			identity.clone(),
+			Duration::from_secs(1),
+		)
+		.await
+		.expect("open streamed call");
+		let _ = requests.recv_async().await.expect("InvokeTool frame");
+		// Providers may stream non-canonical whitespace; those exact bytes are
+		// what the tool's streaming parser consumed.
+		streamed
+			.relay_fragment(sf!("{{\"path\": \"src/lib.rs\"}}"))
+			.await
+			.expect("relay spaced fragment");
+		let _ = requests.recv_async().await.expect("ArgText frame");
+		let seeded = SpeculativeCall::open(
+			&client,
+			&events,
+			sf!("call-seeded"),
+			identity.clone(),
+			Duration::from_secs(1),
+		)
+		.await
+		.expect("open seeded call");
+		let _ = requests
+			.recv_async()
+			.await
+			.expect("second InvokeTool frame");
+		let mut speculative =
+			BTreeMap::from([(sf!("call-streamed"), streamed), (sf!("call-seeded"), seeded)]);
+		let item = |id: &str, args: &'static [u8]| Item {
+			kind: Some(item::Kind::ToolCall(thread::ToolCall {
+				id: id.to_owned(),
+				name: "grep".to_owned(),
+				args_json: Bytes::from_static(args),
+				..thread::ToolCall::default()
+			})),
+			props: Some(pb::ValueMap {
+				fields: BTreeMap::from([(omp_tool::TOOL_REV_PROP.to_owned(), pb::Value {
+					kind: Some(value::Kind::String(identity.rev.to_string())),
+				})]),
+			}),
+			..Item::default()
+		};
+		let output = [
+			item("call-streamed", br#"{"path":"src/lib.rs"}"#),
+			item("call-seeded", b"{\"path\": \"x\"}"),
+		];
+		let calls = committed_calls(&output, &mut speculative, None).expect("commit calls");
+		let raw = |id: &str| {
+			calls
+				.iter()
+				.find(|call| call.call_id().as_str() == id)
+				.expect("committed call")
+				.raw_args()
+				.clone()
+		};
+		// Streamed fragments stay authoritative byte-for-byte.
+		assert_eq!(raw("call-streamed"), Bytes::from_static(b"{\"path\": \"src/lib.rs\"}"));
+		// Without fragments the canonical restored form seeds the commitment.
+		assert_eq!(raw("call-seeded"), Bytes::from_static(br#"{"path":"x"}"#));
 	}
 
 	#[test]

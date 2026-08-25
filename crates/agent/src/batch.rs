@@ -640,6 +640,7 @@ struct SpeculativeCallInner {
 	identity: ToolIdentity,
 	pump:     InvocationPump,
 	events:   EventBus,
+	relayed:  StrMut,
 }
 
 impl SpeculativeCall {
@@ -687,7 +688,13 @@ impl SpeculativeCall {
 		});
 		let pump = spawn_invocation_pump(invocation, call_id.clone(), events.clone());
 		Ok(Self {
-			inner: Some(SpeculativeCallInner { call_id, identity, pump, events: events.clone() }),
+			inner: Some(SpeculativeCallInner {
+				call_id,
+				identity,
+				pump,
+				events: events.clone(),
+				relayed: StrMut::default(),
+			}),
 		})
 	}
 
@@ -730,11 +737,36 @@ impl SpeculativeCall {
 	/// Subscribed hooks observe the raw fragment before the environment document
 	/// feed. The negative path performs one atomic load and no clone.
 	pub async fn relay_fragment(&mut self, fragment: Str) -> Result<(), BatchError> {
-		let inner = self.inner.as_ref().expect("live speculative call");
+		let inner = self.inner.as_mut().expect("live speculative call");
 		if let Some(hooks) = inner.pump.hooks.get() {
 			hooks.arg_text(&inner.call_id, &fragment);
 		}
-		inner.pump.arg_text(fragment).await
+		inner.pump.arg_text(fragment.clone()).await?;
+		inner.relayed.push_str(&fragment);
+		Ok(())
+	}
+
+	/// Returns the exact concatenation of every relayed argument fragment.
+	pub fn relayed_args(&self) -> &str {
+		self
+			.inner
+			.as_ref()
+			.expect("live speculative call")
+			.relayed
+			.as_str()
+	}
+
+	/// Cancels this uncommitted invocation and waits for its terminal.
+	///
+	/// The wait covers the environment's abort verdict (or stream close), so a
+	/// replacement invocation may reuse the same invocation id afterwards.
+	pub(crate) async fn abandon(mut self) {
+		let SpeculativeCallInner { pump, .. } = self.inner.take().expect("live speculative call");
+		pump.cancelled.store(true, Ordering::Release);
+		if pump.cancel().await.is_err() {
+			return;
+		}
+		while !matches!(pump.output().await, PumpOutput::Terminal(_)) {}
 	}
 
 	/// Returns the admission receipt fixed by the environment, when available.
@@ -760,7 +792,7 @@ impl SpeculativeCall {
 			.as_millis()
 			.try_into()
 			.unwrap_or(u64::MAX);
-		let SpeculativeCallInner { call_id, identity, pump, events } =
+		let SpeculativeCallInner { call_id, identity, pump, events, .. } =
 			self.inner.take().expect("live speculative call");
 		let effects = pump.effects.get().cloned().unwrap_or_default();
 		CommittedCall {
@@ -1727,6 +1759,57 @@ mod tests {
 		assert_eq!(args_events[1].0, Bytes::from_static(br#""command":"cargo ch"#));
 		assert_eq!(args_events[1].1["path"].as_str(), Some("src/main.rs"));
 		assert_eq!(args_events[1].1["command"].as_str(), Some("cargo ch"));
+	}
+
+	#[tokio::test]
+	async fn abandon_waits_for_the_environment_terminal() {
+		let (client, transport) = EnvClient::in_process(0);
+		let (requests, responses) = transport.into_parts();
+		let events = EventBus::new();
+		let mut call = SpeculativeCall::open(
+			&client,
+			&events,
+			sf!("stale"),
+			identity("stale_tool"),
+			Duration::from_secs(1),
+		)
+		.await
+		.expect("open call");
+		let opened = requests.recv_async().await.expect("InvokeTool frame");
+		let request_id = opened.request_id;
+		assert!(matches!(opened.body, Some(client_frame::Body::InvokeTool(_))));
+
+		call
+			.relay_fragment(sf!(r#"{{"path":"OLD"}}"#))
+			.await
+			.expect("relay stale fragment");
+		assert_eq!(call.relayed_args(), r#"{"path":"OLD"}"#);
+		let fragment = requests.recv_async().await.expect("ArgText frame");
+		assert!(matches!(fragment.body, Some(client_frame::Body::ArgText(_))));
+
+		let abandon = tokio::spawn(call.abandon());
+		let cancelled = requests.recv_async().await.expect("cancel frame");
+		assert!(matches!(cancelled.body, Some(client_frame::Body::Cancel(_))));
+		// Without a server terminal the invocation id is not yet reusable.
+		assert!(!abandon.is_finished());
+		responses
+			.send_async(frame::ServerFrame {
+				request_id,
+				body: Some(server_frame::Body::Verdict(frame::Verdict {
+					invocation_id: "stale".into(),
+					json: Bytes::from_static(
+						br#"{"kind":"aborted","value":{"reason":"restarted","kind":"skipped"}}"#,
+					),
+					..Default::default()
+				})),
+				..Default::default()
+			})
+			.await
+			.expect("abort verdict");
+		time::timeout(Duration::from_secs(1), abandon)
+			.await
+			.expect("abandon returns after the terminal")
+			.expect("abandon task");
 	}
 
 	#[tokio::test]
