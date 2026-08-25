@@ -69,6 +69,25 @@ impl Interrupt {
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 #[error("invocation event stream is closed")]
 pub struct InvocationSendError;
+/// Whether a committed raw payload supersedes mismatched streamed fragments.
+///
+/// The agent loop and provider codecs may canonicalize committed arguments
+/// (serde re-serialization drops whitespace and normalizes escapes), and the
+/// recovery layer may repair a sloppy stream into a valid document. A
+/// cosmetic difference must not reject the invocation: the commitment is
+/// accepted when both sides parse to the same JSON document, or when only
+/// the commitment parses (a repaired stream, where the commitment is
+/// authoritative). Two documents with different values remain a protocol
+/// violation.
+fn commit_supersedes_stream(streamed: &str, committed: &str) -> bool {
+	let Ok(committed) = serde_json::from_str::<serde_json::Value>(committed) else {
+		return false;
+	};
+	match serde_json::from_str::<serde_json::Value>(streamed) {
+		Ok(streamed) => streamed == committed,
+		Err(_) => true,
+	}
+}
 
 struct DirectFeed {
 	state:     Mutex<DirectFeedState>,
@@ -180,9 +199,15 @@ impl InvocationFeed {
 					.flat_map(|fragment| fragment.bytes())
 					.eq(raw.bytes())
 			{
-				direct
-					.protocol
-					.get_or_insert_with(|| sf!("committed arguments differ from streamed fragments"));
+				let mut streamed = String::with_capacity(direct.byte_len);
+				for fragment in &direct.fragments {
+					streamed.push_str(fragment);
+				}
+				if !commit_supersedes_stream(&streamed, &raw) {
+					direct
+						.protocol
+						.get_or_insert_with(|| sf!("committed arguments differ from streamed fragments"));
+				}
 			}
 			direct.committed = true;
 			if let Some(feed) = direct.parser.take() {
@@ -889,6 +914,24 @@ impl<'c> IncomingParams<'c> {
 				.finalizer
 				.clone()
 				.ok_or_else(|| ParamError::Protocol(sf!("argument finalizer cursor is unavailable")))?;
+			let observed_raw = cursor
+				.raw_document()
+				.await
+				.map_err(|error| param_error(error, self.arg_specs))?;
+			// A canonicalized or repaired commitment supersedes the streamed
+			// text; finalize from the committed document instead of the feed.
+			let cursor = if observed_raw == raw {
+				cursor
+			} else if commit_supersedes_stream(&observed_raw, &raw) {
+				let (mut feed, doc) = IncomingDoc::channel();
+				let _ = feed.push(&raw);
+				feed.finish();
+				doc.cursor()
+			} else {
+				return Err(ParamError::Protocol(sf!(
+					"finalized arguments differ from streamed fragments",
+				)));
+			};
 			let pulled = cursor
 				.pull_at(&[], PullMode::Complete, "an argument object")
 				.await
@@ -898,15 +941,6 @@ impl<'c> IncomingParams<'c> {
 			};
 			if !matches!(&root, Value::Object(_)) {
 				return Err(malformed_issue("an argument object", Some(value_kind(&root))));
-			}
-			let observed_raw = cursor
-				.raw_document()
-				.await
-				.map_err(|error| param_error(error, self.arg_specs))?;
-			if observed_raw != raw {
-				return Err(ParamError::Protocol(sf!(
-					"finalized arguments differ from streamed fragments",
-				)));
 			}
 			validate_structure(&cursor, &root, self.arg_specs).await?;
 			let mut repairs = SmallVec::new();
@@ -1035,7 +1069,7 @@ impl<'c> IncomingParams<'c> {
 					}
 					self.assembled.push_str(&raw);
 				}
-				if self.assembled != raw.as_str() {
+				if self.assembled != raw.as_str() && !commit_supersedes_stream(&self.assembled, &raw) {
 					return self.protocol("committed arguments differ from streamed fragments");
 				}
 				self.committed = Some(raw);
@@ -1260,6 +1294,49 @@ mod tests {
 			panic!("pull failure must remain a structured argument issue");
 		};
 		*issue
+	}
+
+	#[test]
+	fn canonicalized_commitment_supersedes_whitespaced_stream() {
+		let (feed, mut params) = IncomingParams::channel();
+		feed
+			.arg_text(sf!(r#"{{"pattern": "TODO", "#))
+			.expect("fragment remains connected");
+		feed
+			.arg_text(sf!(r#""path": "src"}}"#))
+			.expect("fragment remains connected");
+		feed
+			.args_committed(sf!(r#"{{"pattern":"TODO","path":"src"}}"#))
+			.expect("commit remains connected");
+		let raw = block_on(params.committed()).expect("cosmetic normalization is accepted");
+		assert_eq!(raw.as_str(), r#"{"pattern":"TODO","path":"src"}"#);
+	}
+
+	#[test]
+	fn repaired_commitment_supersedes_a_sloppy_stream() {
+		let (feed, mut params) = IncomingParams::channel();
+		feed
+			.arg_text(sf!(r#"{{"path":"crates"#))
+			.expect("fragment remains connected");
+		feed
+			.args_committed(sf!(r#"{{"path":"crates"}}"#))
+			.expect("commit remains connected");
+		let raw = block_on(params.committed()).expect("repaired commitment is authoritative");
+		assert_eq!(raw.as_str(), r#"{"path":"crates"}"#);
+	}
+
+	#[test]
+	fn materially_different_commitment_stays_a_protocol_error() {
+		let (feed, mut params) = IncomingParams::channel();
+		feed
+			.arg_text(sf!(r#"{{"path":"src"}}"#))
+			.expect("fragment remains connected");
+		feed
+			.args_committed(sf!(r#"{{"path":"elsewhere"}}"#))
+			.expect("commit remains connected");
+		let error = block_on(params.committed()).expect_err("divergent values are rejected");
+		assert!(matches!(error, CommitError::Protocol(message)
+			if message.contains("committed arguments differ")));
 	}
 
 	#[test]
