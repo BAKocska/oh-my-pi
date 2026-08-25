@@ -3223,6 +3223,12 @@ export const SETTINGS_SCHEMA = {
 	"mnemopi.recallMaxQueryChars": { type: "number", default: 4000 },
 	"mnemopi.injectionTokenLimit": { type: "number", default: 5000 },
 	"mnemopi.debug": { type: "boolean", default: false },
+	"mnemopi.recallLengthNormalization": {
+		type: "enum",
+		values: ["none", "log", "bm25"] as const,
+		default: "none",
+	},
+	"mnemopi.recallScoreFloor": { type: "number", default: 0 },
 	"mnemopi.retentionChunkMaxChars": { type: "number", default: 6000 },
 
 	// Hindsight (https://hindsight.vectorize.io)

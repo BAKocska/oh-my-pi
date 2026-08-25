@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { MnemopiOptions } from "@oh-my-pi/pi-mnemopi";
+import type { MnemopiOptions, RecallLengthNormalization } from "@oh-my-pi/pi-mnemopi";
 import { getMemoriesDir, logger } from "@oh-my-pi/pi-utils";
 import type { Settings } from "../config/settings";
 
@@ -35,6 +35,8 @@ export interface MnemopiBackendConfig {
 	recallMaxQueryChars: number;
 	injectionTokenLimit: number;
 	debug: boolean;
+	recallLengthNormalization: RecallLengthNormalization;
+	recallScoreFloor: number;
 	providerOptions: MnemopiProviderOptions;
 	llmMode: MnemopiLlmMode;
 	llmBaseUrl?: string;
@@ -90,6 +92,8 @@ export function loadMnemopiConfig(settings: Settings, agentDir: string): Mnemopi
 		recallMaxQueryChars: Math.max(256, Math.floor(settings.get("mnemopi.recallMaxQueryChars"))),
 		injectionTokenLimit: Math.max(256, Math.floor(settings.get("mnemopi.injectionTokenLimit"))),
 		debug: settings.get("mnemopi.debug"),
+		recallLengthNormalization: settings.get("mnemopi.recallLengthNormalization"),
+		recallScoreFloor: Math.max(0, settings.get("mnemopi.recallScoreFloor")),
 		providerOptions: {
 			noEmbeddings: settings.get("mnemopi.noEmbeddings"),
 			debug: settings.get("mnemopi.debug"),

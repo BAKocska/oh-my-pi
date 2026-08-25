@@ -143,6 +143,8 @@ function makeMnemopiConfig(
 		recallMaxQueryChars: 800,
 		injectionTokenLimit: 1024,
 		debug: false,
+		recallLengthNormalization: "none",
+		recallScoreFloor: 0,
 		providerOptions: {
 			noEmbeddings: true,
 			embeddingModel: undefined,

@@ -441,6 +441,8 @@ export class MnemopiSessionState {
 					const results = await target.memory.recallEnhanced(recallQuery, this.config.recallLimit, {
 						includeFacts: true,
 						channelId: target.bank,
+						lengthNormalization: this.config.recallLengthNormalization,
+						scoreFloor: this.config.recallScoreFloor,
 					});
 					targetSucceeded = true;
 					for (const result of results) {
