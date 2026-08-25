@@ -6825,19 +6825,6 @@ fn handle_agent_event(
 						},
 						now_ms(),
 					);
-					send_retained_fact(
-						backend,
-						"usage",
-						turn_id.as_str(),
-						serde_json::json!({
-							"title": state.model,
-							"input_tokens": usage.input_tokens,
-							"output_tokens": usage.output_tokens,
-							"cache_read_tokens": usage.cache_read_tokens,
-							"cache_write_tokens": usage.cache_write_tokens,
-						}),
-						"Provider usage recorded for the completed turn.",
-					);
 				}
 				for (_, id) in state.active_parts.drain() {
 					send_backend(backend, BackendEvent::AssistantEnd { id });
