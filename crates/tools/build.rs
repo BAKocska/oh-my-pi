@@ -26,9 +26,18 @@ fn main() {
 		.and_then(|p| p.parent().map(Path::to_path_buf));
 
 	if let Some(vendor_dir) = &vendor {
+		// Vendor-tree swaps rewrite PYTHON.json; tracking it covers the
+		// appearance of the `needs-lld` marker. The marker itself is tracked
+		// only while present — cargo treats a missing `rerun-if-changed` path
+		// as always changed, which would rebuild omp-tools (and every
+		// dependent) on each invocation.
+		let python_manifest = vendor_dir.join("PYTHON.json");
+		if python_manifest.is_file() {
+			println!("cargo::rerun-if-changed={}", python_manifest.display());
+		}
 		let marker = vendor_dir.join("needs-lld");
-		println!("cargo::rerun-if-changed={}", marker.display());
 		if marker.is_file() {
+			println!("cargo::rerun-if-changed={}", marker.display());
 			let shim = manifest.join("../py/scripts/ld64.lld");
 			println!("cargo::rerun-if-changed={}", shim.display());
 			assert!(

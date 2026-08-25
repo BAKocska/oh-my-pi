@@ -29,9 +29,17 @@ fn main() {
 		.and_then(|p| p.parent().map(Path::to_path_buf));
 
 	if let Some(vendor_dir) = &vendor {
+		// Vendor-tree swaps rewrite PYTHON.json; tracking it covers the
+		// appearance of the `needs-lld` marker. The marker itself is tracked
+		// only while present — cargo treats a missing `rerun-if-changed` path
+		// as always changed, which would relink every omp binary per build.
+		let python_manifest = vendor_dir.join("PYTHON.json");
+		if python_manifest.is_file() {
+			println!("cargo::rerun-if-changed={}", python_manifest.display());
+		}
 		let marker = vendor_dir.join("needs-lld");
-		println!("cargo::rerun-if-changed={}", marker.display());
 		if marker.is_file() {
+			println!("cargo::rerun-if-changed={}", marker.display());
 			let shim = manifest.join("../py/scripts/ld64.lld");
 			println!("cargo::rerun-if-changed={}", shim.display());
 			assert!(
@@ -64,8 +72,15 @@ fn main() {
 }
 fn write_changelog(manifest: &Path) {
 	let workspace = manifest.join("../..");
-	println!("cargo::rerun-if-changed={}", workspace.join(".git/packed-refs").display());
-	println!("cargo::rerun-if-changed={}", workspace.join(".git/refs/tags").display());
+	// Track only ref paths that exist: a missing `rerun-if-changed` path makes
+	// cargo rerun this script (and relink omp) on every build. A tag created
+	// on a tree where neither path existed refreshes the changelog on the next
+	// ordinary rebuild instead.
+	for refs in [workspace.join(".git/packed-refs"), workspace.join(".git/refs/tags")] {
+		if refs.exists() {
+			println!("cargo::rerun-if-changed={}", refs.display());
+		}
+	}
 	let generated = Command::new("git")
 		.arg("-C")
 		.arg(&workspace)

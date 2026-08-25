@@ -99,9 +99,14 @@ fn main() {
 	// Homebrew lld. Dev trees (freethreaded+debug) use native machine code and
 	// skip the shim entirely. Gated by the `needs-lld` marker dropped by
 	// fetch-python.sh.
+	// A missing marker is deliberately NOT tracked: cargo treats a missing
+	// `rerun-if-changed` path as always changed, which would rebuild omp-py
+	// (and relink every dependent binary) on each invocation. Marker
+	// appearance is covered by the tracked PYTHON.json, which fetch-python.sh
+	// rewrites whenever it regenerates the vendor tree.
 	let needs_lld = vendor.join("needs-lld").is_file();
-	println!("cargo::rerun-if-changed={}", vendor.join("needs-lld").display());
 	if needs_lld {
+		println!("cargo::rerun-if-changed={}", vendor.join("needs-lld").display());
 		let shim = manifest.join("scripts/ld64.lld");
 		assert!(
 			shim.is_file(),
