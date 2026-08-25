@@ -234,6 +234,16 @@ impl McpOAuth {
 		&self,
 		attempt: OAuthAttempt<'_>,
 	) -> Result<OAuthCredentialState, OAuthFlowError> {
+		self.authorize_presented(attempt, None).await
+	}
+
+	/// Runs authorization while presenting the complete browser URL before the
+	/// platform opener is invoked.
+	pub async fn authorize_presented(
+		&self,
+		attempt: OAuthAttempt<'_>,
+		present: Option<&(dyn Fn(&str) + Send + Sync)>,
+	) -> Result<OAuthCredentialState, OAuthFlowError> {
 		if attempt.challenge.kind != omp_oauth::ChallengeKind::OAuth {
 			return Err(OAuthFlowError::UnsupportedChallenge);
 		}
@@ -336,6 +346,9 @@ impl McpOAuth {
 			pkce,
 		)?;
 		let callback = LoopbackCallback::bind(listener_uri.as_str(), pending.pkce.state()).await?;
+		if let Some(present) = present {
+			present(pending.browser_url.as_str());
+		}
 		self.browser.open(pending.browser_url.as_str()).await?;
 		let grant = callback.receive(&attempt.cancel).await?;
 		let grant = complete_authorization(

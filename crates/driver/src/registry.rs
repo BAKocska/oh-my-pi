@@ -42,6 +42,7 @@ use omp_inference::{
 		AntigravityFingerprint, AntigravityPolicy, CcaHeaders, DEFAULT_ANTIGRAVITY_ARCH,
 		DEFAULT_ANTIGRAVITY_CL, DEFAULT_ANTIGRAVITY_OS, DEFAULT_ANTIGRAVITY_VERSION,
 	},
+	id::AccountId,
 	layer::{admission::AdmissionController, stack::BuiltinConfig},
 	operation::usage::{
 		ConsoleUsageFetcher, ConsoleUsageManager, UsageFetcherRegistry,
@@ -54,7 +55,7 @@ use omp_inference::{
 		kimi::KimiUsageFetcher,
 		minimax_code::MiniMaxCodeUsageFetcher,
 		ollama::OllamaUsageFetcher,
-		openai_codex::{CodexRedemption, OpenAiCodexUsageFetcher},
+		openai_codex::{CodexRedemption, CodexRedemptionReason, OpenAiCodexUsageFetcher},
 		opencode_go::OpenCodeGoUsageFetcher,
 		synthetic::SyntheticUsageFetcher,
 		umans::UmansUsageFetcher,
@@ -262,6 +263,28 @@ pub async fn production_usage_manager(
 pub fn production_redemption_authority(
 	data_dir: &Path,
 ) -> Result<Option<sync::Arc<dyn omp_agent::RedemptionAuthority>>, RegistryError> {
+	Ok(production_codex_redemption(data_dir)?.map(|service| {
+		sync::Arc::new(CodexRedemptionAuthority::new(sync::Arc::new(service)))
+			as sync::Arc<dyn omp_agent::RedemptionAuthority>
+	}))
+}
+
+/// Redeems one saved Codex reset for an exact durable account.
+pub async fn redeem_codex_reset(
+	data_dir: &Path,
+	account: &AccountId<str>,
+) -> Result<Option<bool>, RegistryError> {
+	let Some(service) = production_codex_redemption(data_dir)? else {
+		return Ok(None);
+	};
+	Ok(Some(
+		service
+			.redeem_account(CodexRedemptionReason::Restore, account)
+			.await,
+	))
+}
+
+fn production_codex_redemption(data_dir: &Path) -> Result<Option<CodexRedemption>, RegistryError> {
 	let catalog = snapshot::Catalog::try_embedded().map_err(RegistryError::Catalog)?;
 	let credential_store = open_credential_store(data_dir.join("credentials.db"))?;
 	let stored = Arc::new(auth_backend::combined_authority(credential_store));
@@ -280,10 +303,7 @@ pub fn production_redemption_authority(
 		&data_dir.join("credentials.db"),
 	)?))?;
 	let http = Arc::new(SystemOAuthHttpClient::new());
-	Ok(CodexRedemption::from_catalog(catalog, credentials, accounts, http).map(|service| {
-		sync::Arc::new(CodexRedemptionAuthority::new(sync::Arc::new(service)))
-			as sync::Arc<dyn omp_agent::RedemptionAuthority>
-	}))
+	Ok(CodexRedemption::from_catalog(catalog, credentials, accounts, http))
 }
 
 /// Builds the production inference registry and exposes a clone of its one

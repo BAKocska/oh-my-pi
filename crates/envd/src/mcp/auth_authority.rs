@@ -143,6 +143,11 @@ impl CombinedAuthAuthority {
 		Ok(metadata.generation)
 	}
 
+	/// Deletes every stored secret for one MCP affinity.
+	pub fn delete_mcp(&self, affinity: &AuthAffinity) -> Result<bool, StoreError> {
+		self.store.delete(&affinity.account)
+	}
+
 	/// Issues an MCP bearer lease pinned to opaque affinity and minimum expiry.
 	pub async fn mcp_lease(
 		&self,
@@ -253,5 +258,38 @@ mod tests {
 			.expect("provider lease");
 		assert_eq!(mcp.kind(), CredentialKind::Bearer);
 		assert_eq!(mcp.meta(), provider.meta());
+	}
+
+	#[tokio::test]
+	async fn deleting_mcp_credential_removes_it_from_the_shared_store() {
+		let directory = tempfile::tempdir().expect("credential directory");
+		let keys = Arc::new(HeadlessKeySource::new(KeyId::new("test-key"), [7; 32]));
+		let store = Arc::new(
+			CredentialStore::open(directory.path().join("credentials.sqlite3"), keys)
+				.expect("credential store"),
+		);
+		let authority = CombinedAuthAuthority::new(store);
+		let affinity = CombinedAuthAuthority::mcp_affinity(
+			"default",
+			"https://mcp.example/server",
+			PrincipalId::from("default"),
+		);
+		authority
+			.persist_mcp_bearer(&affinity, SecretString::from("opaque-token"), None, 1, None)
+			.expect("persist bearer");
+
+		assert!(authority.delete_mcp(&affinity).expect("delete bearer"));
+		assert!(
+			authority
+				.mcp_lease(&affinity, SystemTime::UNIX_EPOCH)
+				.await
+				.is_err(),
+			"deleted MCP credential must not remain leasable",
+		);
+		assert!(
+			!authority
+				.delete_mcp(&affinity)
+				.expect("delete absent bearer")
+		);
 	}
 }

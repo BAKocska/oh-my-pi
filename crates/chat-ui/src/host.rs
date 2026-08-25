@@ -836,6 +836,7 @@ fn rail_layers(sidebar: &mut Sidebar, viewport: Size) -> SmallVec<Layer<'_>, 4> 
 enum ListPurpose {
 	Resume,
 	Rewind,
+	Logout,
 	Pause,
 }
 
@@ -1788,6 +1789,7 @@ fn apply_backend(host: &mut ChatHost, event: BackendEvent, ctx: &UiContext) -> O
 		},
 		BackendEvent::Sessions(rows) => open_sessions(host, rows, ctx),
 		BackendEvent::LoginProviders(rows) => open_login_providers(host, rows, ctx),
+		BackendEvent::LogoutChoices { title, rows } => open_logout_choices(host, title, rows, ctx),
 		BackendEvent::RewindTargets(rows) => open_rewind(host, rows, ctx),
 		BackendEvent::AgentRoster(rows) => {
 			if let Some(Overlay::AgentHub(hub)) = &mut host.overlay {
@@ -1861,6 +1863,16 @@ fn open_sessions(host: &mut ChatHost, sessions: Vec<SessionRow>, ctx: &UiContext
 
 fn open_login_providers(host: &mut ChatHost, providers: Vec<SessionRow>, ctx: &UiContext) {
 	host.overlay = Some(Overlay::Providers(ProviderPicker::open(providers, ctx)));
+}
+
+fn open_logout_choices(host: &mut ChatHost, title: Str, choices: Vec<SessionRow>, ctx: &UiContext) {
+	let rows = choices
+		.into_iter()
+		.map(|row| ListRow { key: row.id, label: row.label, detail: row.detail })
+		.collect::<Vec<_>>();
+	let picker = ListPicker::open(title.as_str(), &rows, 0, ctx);
+	host.overlay =
+		Some(Overlay::List { picker, rows, prefill: Vec::new(), purpose: ListPurpose::Logout });
 }
 
 fn open_settings(host: &mut ChatHost, fields: Vec<SettingRow>, ctx: &UiContext) {
@@ -2012,6 +2024,9 @@ fn apply_overlay_event(
 							}
 						},
 						ListPurpose::Pause => {},
+						ListPurpose::Logout => {
+							send(intents, Intent::Logout(Some(row.key.clone())));
+						},
 					}
 				}
 				host.overlay = None;
