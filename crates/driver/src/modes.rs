@@ -196,6 +196,208 @@ pub enum RegimeError {
 	GoalExists,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum LoopLimit {
+	Iterations { initial: u64, remaining: u64 },
+	Duration { duration_ms: u64, deadline_ms: u64 },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LoopMode {
+	prompt: Option<Str>,
+	limit:  Option<LoopLimit>,
+}
+
+/// Result of toggling interactive loop mode.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LoopCommandOutcome {
+	/// An existing loop was disabled.
+	Disabled,
+	/// A loop was armed, optionally with an inline first prompt.
+	Enabled {
+		/// Inline prompt submitted through the ordinary prompt path.
+		prompt:  Option<Str>,
+		/// Operator-facing summary of the active bounds.
+		message: Str,
+	},
+}
+
+/// Invalid bounded-loop arguments.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum LoopCommandError {
+	/// The leading token looked like a bound but was not valid.
+	#[error("Usage: /loop [count|duration]. Examples: /loop 10, /loop 10m, /loop 10min.")]
+	Usage,
+	/// Iteration counts must be non-zero integers.
+	#[error("Loop count must be a positive integer.")]
+	Count,
+	/// Durations must be non-zero.
+	#[error("Loop duration must be positive.")]
+	Duration,
+	/// Only seconds, minutes, and hours are accepted.
+	#[error("Loop duration unit must be seconds, minutes, or hours.")]
+	Unit,
+}
+
+struct ParsedLoopArgs {
+	limit:  Option<LoopLimit>,
+	prompt: Option<Str>,
+}
+
+fn duration_unit_ms(unit: &str) -> Option<u64> {
+	match unit {
+		"s" | "sec" | "secs" | "second" | "seconds" => Some(1_000),
+		"m" | "min" | "mins" | "minute" | "minutes" => Some(60_000),
+		"h" | "hr" | "hrs" | "hour" | "hours" => Some(3_600_000),
+		_ => None,
+	}
+}
+
+fn positive_amount(text: &str, duration: bool) -> Result<u64, LoopCommandError> {
+	let amount = text.parse::<u64>().map_err(|_| {
+		if duration {
+			LoopCommandError::Duration
+		} else {
+			LoopCommandError::Count
+		}
+	})?;
+	if amount == 0 {
+		return Err(if duration {
+			LoopCommandError::Duration
+		} else {
+			LoopCommandError::Count
+		});
+	}
+	Ok(amount)
+}
+
+fn duration_limit(amount: &str, unit_ms: u64) -> Result<LoopLimit, LoopCommandError> {
+	let duration_ms = positive_amount(amount, true)?
+		.checked_mul(unit_ms)
+		.ok_or(LoopCommandError::Duration)?;
+	Ok(LoopLimit::Duration { duration_ms, deadline_ms: 0 })
+}
+
+fn compound_duration(token: &str) -> Option<Result<LoopLimit, LoopCommandError>> {
+	let bytes = token.as_bytes();
+	if bytes.is_empty() || !bytes[0].is_ascii_digit() || !bytes.iter().any(u8::is_ascii_alphabetic) {
+		return None;
+	}
+	if !bytes.iter().all(u8::is_ascii_alphanumeric)
+		|| !bytes.last().is_some_and(u8::is_ascii_alphabetic)
+	{
+		return Some(Err(LoopCommandError::Usage));
+	}
+	let mut at = 0;
+	let mut total = 0_u64;
+	while at < bytes.len() {
+		let amount_start = at;
+		while at < bytes.len() && bytes[at].is_ascii_digit() {
+			at += 1;
+		}
+		if amount_start == at {
+			return Some(Err(LoopCommandError::Usage));
+		}
+		let unit_start = at;
+		while at < bytes.len() && bytes[at].is_ascii_alphabetic() {
+			at += 1;
+		}
+		if unit_start == at {
+			return Some(Err(LoopCommandError::Usage));
+		}
+		let unit = &token[unit_start..at];
+		let Some(unit_ms) = duration_unit_ms(unit) else {
+			return Some(Err(LoopCommandError::Unit));
+		};
+		let amount = match positive_amount(&token[amount_start..unit_start], true) {
+			Ok(amount) => amount,
+			Err(error) => return Some(Err(error)),
+		};
+		let Some(segment) = amount.checked_mul(unit_ms) else {
+			return Some(Err(LoopCommandError::Duration));
+		};
+		let Some(next) = total.checked_add(segment) else {
+			return Some(Err(LoopCommandError::Duration));
+		};
+		total = next;
+	}
+	Some(if total == 0 {
+		Err(LoopCommandError::Duration)
+	} else {
+		Ok(LoopLimit::Duration { duration_ms: total, deadline_ms: 0 })
+	})
+}
+
+fn parse_loop_args(args: &str) -> Result<ParsedLoopArgs, LoopCommandError> {
+	let trimmed = args.trim();
+	if trimmed.is_empty() {
+		return Ok(ParsedLoopArgs { limit: None, prompt: None });
+	}
+	let first_end = trimmed.find(char::is_whitespace).unwrap_or(trimmed.len());
+	let first = &trimmed[..first_end];
+	let rest = trimmed[first_end..].trim();
+	let lower = first.to_ascii_lowercase();
+	let limit_shaped = lower
+		.as_bytes()
+		.first()
+		.is_some_and(|first| first.is_ascii_digit() || matches!(first, b'+' | b'-'));
+	if !limit_shaped {
+		return Ok(ParsedLoopArgs { limit: None, prompt: Some(Str::new(trimmed)) });
+	}
+	if lower.bytes().all(|byte| byte.is_ascii_digit()) {
+		let amount = positive_amount(lower.as_str(), false)?;
+		let mut rest_tokens = rest.split_whitespace();
+		if let Some(unit) = rest_tokens.next()
+			&& let Some(unit_ms) = duration_unit_ms(&unit.to_ascii_lowercase())
+		{
+			let limit = duration_limit(lower.as_str(), unit_ms)?;
+			let prompt = rest_tokens.collect::<Vec<_>>().join(" ");
+			return Ok(ParsedLoopArgs {
+				limit:  Some(limit),
+				prompt: (!prompt.is_empty()).then(|| Str::from(prompt)),
+			});
+		}
+		return Ok(ParsedLoopArgs {
+			limit:  Some(LoopLimit::Iterations { initial: amount, remaining: amount }),
+			prompt: (!rest.is_empty()).then(|| Str::new(rest)),
+		});
+	}
+	if let Some(limit) = compound_duration(lower.as_str()) {
+		return Ok(ParsedLoopArgs {
+			limit:  Some(limit?),
+			prompt: (!rest.is_empty()).then(|| Str::new(rest)),
+		});
+	}
+	Err(LoopCommandError::Usage)
+}
+
+fn format_duration(duration_ms: u64) -> String {
+	if duration_ms % 3_600_000 == 0 {
+		let hours = duration_ms / 3_600_000;
+		format!("{hours} {}", if hours == 1 { "hour" } else { "hours" })
+	} else if duration_ms % 60_000 == 0 {
+		let minutes = duration_ms / 60_000;
+		format!("{minutes} {}", if minutes == 1 { "minute" } else { "minutes" })
+	} else {
+		let seconds = duration_ms / 1_000;
+		format!("{seconds} {}", if seconds == 1 { "second" } else { "seconds" })
+	}
+}
+
+fn describe_loop_limit(limit: &LoopLimit) -> Str {
+	match limit {
+		LoopLimit::Iterations { initial, remaining } => sf!(
+			"{remaining} of {initial} {} remaining",
+			if *initial == 1 {
+				"iteration"
+			} else {
+				"iterations"
+			}
+		),
+		LoopLimit::Duration { duration_ms, .. } => sf!("{} limit", format_duration(*duration_ms)),
+	}
+}
+
 /// App-owned metadata paired with the authoritative regime-resource projection.
 #[derive(Debug, Default)]
 struct RegimeProjectionState {
@@ -208,6 +410,7 @@ struct RegimeProjectionState {
 	goal_usage_checkpoint:   GoalUsage,
 	budget_steering_pending: bool,
 	goal_todo_context:       Option<Str>,
+	loop_mode:               Option<LoopMode>,
 }
 
 #[derive(Clone, Debug)]
@@ -281,6 +484,116 @@ impl RegimeHandle {
 			plan_transitions: Arc::new(TransitionQueue::default()),
 			revision:         Arc::new(AtomicU64::new(0)),
 		}
+	}
+
+	/// Toggles prompt repetition, returning an inline prompt for normal
+	/// submission.
+	pub fn toggle_loop(
+		&self,
+		args: &str,
+		now_ms: u64,
+	) -> Result<LoopCommandOutcome, LoopCommandError> {
+		{
+			let mut state = self.state.lock();
+			if state.loop_mode.take().is_some() {
+				return Ok(LoopCommandOutcome::Disabled);
+			}
+		}
+		let mut parsed = parse_loop_args(args)?;
+		if let Some(LoopLimit::Duration { duration_ms, deadline_ms }) = parsed.limit.as_mut() {
+			*deadline_ms = now_ms.saturating_add(*duration_ms);
+		}
+		let limit_message = parsed
+			.limit
+			.as_ref()
+			.map(|limit| sf!(" {}.", describe_loop_limit(limit)))
+			.unwrap_or_default();
+		let prompt = parsed.prompt.clone();
+		self.state.lock().loop_mode = Some(LoopMode { prompt: parsed.prompt, limit: parsed.limit });
+		let tail = if prompt.is_some() {
+			"Repeating it after each turn."
+		} else {
+			"Your next prompt will repeat after each turn."
+		};
+		Ok(LoopCommandOutcome::Enabled {
+			prompt,
+			message: sf!(
+				"Loop mode enabled.{limit_message} {tail} Esc cancels the current iteration; /loop \
+				 again to disable."
+			),
+		})
+	}
+
+	/// Captures the first ordinary prompt submitted after an unbound loop is
+	/// armed.
+	pub fn capture_loop_prompt(&self, prompt: &str) {
+		let mut state = self.state.lock();
+		if let Some(loop_mode) = state.loop_mode.as_mut()
+			&& loop_mode.prompt.is_none()
+		{
+			loop_mode.prompt = Some(Str::new(prompt));
+		}
+	}
+
+	/// Pauses repetition until the next ordinary prompt is captured.
+	pub fn pause_loop(&self) {
+		if let Some(loop_mode) = self.state.lock().loop_mode.as_mut() {
+			loop_mode.prompt = None;
+		}
+	}
+
+	/// Returns a concise projection of interactive loop state.
+	pub fn loop_status(&self) -> Str {
+		let state = self.state.lock();
+		let Some(loop_mode) = state.loop_mode.as_ref() else {
+			return sf!("Loop: off");
+		};
+		let phase = if loop_mode.prompt.is_some() {
+			"running"
+		} else {
+			"waiting"
+		};
+		loop_mode.limit.as_ref().map_or_else(
+			|| sf!("Loop: {phase}"),
+			|limit| sf!("Loop: {phase} ({})", describe_loop_limit(limit)),
+		)
+	}
+
+	fn loop_continuation(&self, now_ms: u64) -> Option<Continuation> {
+		let active = self.state.lock().loop_mode.is_some();
+		let Some(prompt) = self.take_loop_prompt(now_ms) else {
+			return active.then_some(Continuation::Settle);
+		};
+		Some(Continuation::Continue {
+			owner:          sf!("loop"),
+			item:           user_item(prompt, now_ms),
+			label:          Some(sf!("loop")),
+			collapse_prior: false,
+		})
+	}
+
+	/// Consumes one authorized loop repetition at a settled turn boundary.
+	pub fn take_loop_prompt(&self, now_ms: u64) -> Option<Str> {
+		let mut state = self.state.lock();
+		let loop_mode = state.loop_mode.as_mut()?;
+		let Some(prompt) = loop_mode.prompt.clone() else {
+			return None;
+		};
+		match loop_mode.limit.as_mut() {
+			Some(LoopLimit::Iterations { remaining: 0, .. }) => {
+				state.loop_mode = None;
+				return None;
+			},
+			Some(LoopLimit::Iterations { remaining, .. }) => {
+				*remaining -= 1;
+			},
+			Some(LoopLimit::Duration { deadline_ms, .. }) if now_ms >= *deadline_ms => {
+				state.loop_mode = None;
+				return None;
+			},
+			Some(LoopLimit::Duration { .. }) | None => {},
+		}
+		Some(prompt)
 	}
 
 	/// Refreshes user-facing resource facts from the authoritative agent regime
@@ -816,7 +1129,29 @@ impl RegimeHandle {
 
 impl ContinuationSource for RegimeHandle {
 	fn decide(&self, signal: &LoopSignal, now_ms: u64) -> (Continuation, ContinuationPolicy) {
+		if let Some(candidate) = self.loop_continuation(now_ms) {
+			return (candidate, ContinuationPolicy {
+				max_consecutive: u32::MAX,
+				..ContinuationPolicy::default()
+			});
+		}
 		(self.goal_continuation(signal, now_ms), self.continuation_policy())
+	}
+
+	fn sync_regimes(&self, regimes: &RegimeSet) {
+		RegimeHandle::sync_regimes(self, regimes);
+	}
+}
+
+fn user_item(text: Str, now_ms: u64) -> Item {
+	Item {
+		seq:           0,
+		created_at_ms: now_ms,
+		kind:          Some(item::Kind::Message(Message {
+			role:  i32::from(Role::User),
+			parts: vec![Part { kind: Some(part::Kind::Text(text.to_string())) }],
+		})),
+		props:         None,
 	}
 }
 
@@ -935,5 +1270,46 @@ mod tests {
 		));
 		let signal = LoopSignal { stalled: true, ..LoopSignal::default() };
 		assert_eq!(modes.goal_continuation(&signal, 2), Continuation::Settle);
+	}
+	#[test]
+	fn bounded_loop_repeats_inline_prompt_then_disarms() {
+		let modes = RegimeHandle::new();
+		let outcome = modes.toggle_loop("2 keep going", 100).expect("arm loop");
+		assert!(matches!(
+			&outcome,
+			LoopCommandOutcome::Enabled { prompt: Some(prompt), .. } if prompt == "keep going"
+		));
+		for now_ms in [101, 102] {
+			assert!(matches!(
+				modes.decide(&LoopSignal::default(), now_ms).0,
+				Continuation::Continue { owner, .. } if owner == "loop"
+			));
+		}
+		assert_eq!(modes.decide(&LoopSignal::default(), 103).0, Continuation::Settle);
+		assert_eq!(modes.loop_status(), "Loop: off");
+	}
+
+	#[test]
+	fn pausing_loop_preserves_bounds_and_waits_for_a_new_prompt() {
+		let modes = RegimeHandle::new();
+		modes.toggle_loop("2 first", 0).expect("arm loop");
+		modes.pause_loop();
+		assert_eq!(modes.loop_status(), "Loop: waiting (2 of 2 iterations remaining)");
+		assert_eq!(modes.decide(&LoopSignal::default(), 1).0, Continuation::Settle);
+		modes.capture_loop_prompt("second");
+		assert!(matches!(modes.decide(&LoopSignal::default(), 2).0, Continuation::Continue { .. }));
+	}
+
+	#[test]
+	fn loop_parses_compound_duration_and_captures_next_prompt() {
+		let modes = RegimeHandle::new();
+		let outcome = modes.toggle_loop("1h30m", 1_000).expect("arm timed loop");
+		assert!(matches!(outcome, LoopCommandOutcome::Enabled { prompt: None, .. }));
+		modes.capture_loop_prompt("continue");
+		assert!(matches!(
+			modes.decide(&LoopSignal::default(), 5_400_999).0,
+			Continuation::Continue { .. }
+		));
+		assert_eq!(modes.decide(&LoopSignal::default(), 5_401_000).0, Continuation::Settle);
 	}
 }

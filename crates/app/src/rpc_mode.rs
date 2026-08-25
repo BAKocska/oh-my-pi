@@ -17,7 +17,7 @@ use std::{
 use flume::{Receiver, Sender};
 use futures::StreamExt as _;
 use miette::{IntoDiagnostic as _, miette};
-use omp_catalog::{ModelKey, ProviderId};
+use omp_catalog::{ModelKey, ProviderId, ServiceTier};
 use omp_core::{ExposeSecret as _, SecretString, Str, sf};
 use omp_driver::skills::SkillInvocationKind;
 use omp_envd::tool_url::host;
@@ -27,7 +27,8 @@ use omp_inference::{
 	auth::manager::AuthManager,
 	call::{
 		AuthInput, AuthMethod, AuthRequest, CallMeta, ChatRequest, ContentPart, LoginRequest,
-		Message, NegotiationPolicy, Role, Sampling, Setting, Target,
+		Message, NegotiationPolicy, OpaqueJson, Role, Sampling, Setting, Target, ToolChoice,
+		ToolDefinition, ToolInputConstraint,
 	},
 	event::ChatEvent,
 	id::{LoginSessionId, RequestId as InferenceRequestId},
@@ -1298,11 +1299,17 @@ impl Runtime {
 		mut cancellation: CancellationToken,
 	) {
 		loop {
+			self.state.lock().flow_modes.capture_loop_prompt(&message);
 			let _ = self.run_turn(message, cancellation.clone()).await;
 			let next = {
 				let mut state = self.state.lock();
 				state.active = None;
-				state.queue.pop_front()
+				state.queue.pop_front().or_else(|| {
+					state
+						.flow_modes
+						.take_loop_prompt(unix_millis())
+						.map(|prompt| prompt.to_string())
+				})
 			};
 			let Some(next) = next else { break };
 			message = next;
@@ -1320,9 +1327,24 @@ impl Runtime {
 			let mut state = self.state.lock();
 			let session_id = state.current.clone();
 			let model = state.config.model.clone();
+			let model = if mem::take(&mut state.prewalk_armed) {
+				omp_driver::chat::fallback_model_selector(omp_catalog::snapshot::Catalog::embedded())
+					.map_or(model, |selector| selector.to_string())
+			} else {
+				model
+			};
+			let forced_tool = state.forced_tool.take();
+			let fast_mode = state.config.fast_mode;
+			let host_tools = state.host_tools.clone();
 			let session = state.current_mut();
 			session.push_message("user", &prompt);
-			let request = build_request(session, contains_orchestrate(&prompt));
+			let request = build_request(
+				session,
+				contains_orchestrate(&prompt),
+				&host_tools,
+				forced_tool.as_deref(),
+				fast_mode,
+			);
 			(session_id, model, request)
 		};
 		self
@@ -2598,8 +2620,12 @@ impl ConfigCommandHost for RpcCommandHost {
 		unavailable_command("settings")
 	}
 
-	fn setup(&mut self) -> CommandFuture<'_> {
-		unavailable_command("setup")
+	fn setup(&mut self, section: Option<Str>) -> CommandFuture<'_> {
+		if section.is_some_and(|section| !section.trim().eq_ignore_ascii_case("providers")) {
+			return command_status("Usage: /setup [providers]");
+		}
+		let providers = oauth_providers_value(&self.runtime.state.lock().providers).to_string();
+		command_status(providers)
 	}
 
 	fn providers(&mut self) -> CommandFuture<'_> {
@@ -2611,8 +2637,114 @@ impl ConfigCommandHost for RpcCommandHost {
 		unavailable_command("login")
 	}
 
-	fn logout(&mut self, _provider: Option<Str>) -> CommandFuture<'_> {
-		unavailable_command("logout")
+	fn logout(&mut self, provider: Option<Str>) -> CommandFuture<'_> {
+		let runtime = self.runtime.clone();
+		Box::pin(async move {
+			let answer = runtime
+				.auth
+				.execute(AuthRequest::ListAccounts { provider: None })
+				.await
+				.map_err(|error| miette!(error.to_string()))?;
+			let AuthAnswer::Accounts(accounts) = answer else {
+				return Err(miette!("credential authority returned an unexpected account response"));
+			};
+			let Some(requested) = provider else {
+				let providers = accounts
+					.iter()
+					.map(|account| account.provider.as_str())
+					.collect::<HashSet<_>>();
+				let choices = runtime
+					.state
+					.lock()
+					.providers
+					.iter()
+					.filter(|provider| providers.contains(provider.id.as_str()))
+					.cloned()
+					.collect::<Vec<_>>();
+				return command_status(
+					json!({ "logoutProviders": choices, "message": "Select a provider to continue." })
+						.to_string(),
+				)
+				.await;
+			};
+			if let Some(account) = accounts
+				.iter()
+				.find(|account| account.account.as_str() == requested.as_str())
+			{
+				runtime
+					.auth
+					.execute(AuthRequest::Logout { account: account.account.clone() })
+					.await
+					.map_err(|error| miette!(error.to_string()))?;
+				let still_authenticated = accounts.iter().any(|candidate| {
+					candidate.provider == account.provider
+						&& candidate.account != account.account
+						&& candidate.state == AccountState::Active
+				});
+				if let Some(provider) = runtime
+					.state
+					.lock()
+					.providers
+					.iter_mut()
+					.find(|provider| provider.id == account.provider.as_str())
+				{
+					provider.authenticated = still_authenticated;
+				}
+				return command_status(sf!(
+					"Successfully logged out {} from {}.",
+					account
+						.label
+						.as_ref()
+						.map(Str::as_str)
+						.or_else(|| account
+							.principal
+							.as_ref()
+							.map(|principal| principal.as_str()))
+						.unwrap_or(account.account.as_str()),
+					account.provider
+				))
+				.await;
+			}
+			if !runtime
+				.state
+				.lock()
+				.providers
+				.iter()
+				.any(|provider| provider.id == requested.as_str())
+			{
+				return Err(miette!("Unknown OAuth provider: {requested}"));
+			}
+			let choices = accounts
+				.iter()
+				.filter(|account| account.provider.as_str() == requested.as_str())
+				.map(|account| {
+					json!({
+						"accountId": account.account,
+						"label": account
+							.label
+							.as_ref()
+							.map(Str::as_str)
+							.or_else(|| account.principal.as_ref().map(|principal| principal.as_str()))
+							.unwrap_or(account.account.as_str()),
+						"principal": account.principal,
+						"state": format!("{:?}", account.state),
+					})
+				})
+				.collect::<Vec<_>>();
+			if choices.is_empty() {
+				return command_status(sf!("Logout skipped: no stored credentials for {requested}."))
+					.await;
+			}
+			command_status(
+				json!({
+					"provider": requested,
+					"logoutAccounts": choices,
+					"message": "Select an accountId to remove.",
+				})
+				.to_string(),
+			)
+			.await
+		})
 	}
 }
 
@@ -2637,12 +2769,29 @@ impl FlowCommandHost for RpcCommandHost {
 		unavailable_command("shake")
 	}
 
-	fn usage(&mut self, _args: Str) -> CommandFuture<'_> {
-		unavailable_command("usage")
+	fn usage(&mut self, args: Str) -> CommandFuture<'_> {
+		Box::pin(async move {
+			let data_dir = omp_core::dirs::data_dir(None).into_diagnostic()?;
+			let trimmed = args.trim();
+			let rendered = if trimmed.is_empty() || trimmed.as_str() == "show" {
+				crate::usage_cmd::render_report(&data_dir).await?
+			} else if trimmed.as_str() == "reset" {
+				crate::usage_cmd::reset_usage(&data_dir, "").await?
+			} else if let Some(target) = trimmed.as_str().strip_prefix("reset ") {
+				crate::usage_cmd::reset_usage(&data_dir, target).await?
+			} else {
+				Str::new_static("Usage: /usage [show|reset [account|active]]")
+			};
+			Ok(CommandResult::Consumed(ConsumedResult::status(rendered)))
+		})
 	}
 
-	fn stats(&mut self, _flags: ParsedFlags) -> CommandFuture<'_> {
-		unavailable_command("stats")
+	fn stats(&mut self, flags: ParsedFlags) -> CommandFuture<'_> {
+		Box::pin(async move {
+			let data_dir = omp_core::dirs::data_dir(None).into_diagnostic()?;
+			let launch = crate::stats_cmd::launch_dashboard(&data_dir, &flags.0).await?;
+			Ok(CommandResult::Consumed(ConsumedResult::status(launch.message)))
+		})
 	}
 
 	fn plan(&mut self, _args: Str) -> CommandFuture<'_> {
@@ -2665,8 +2814,28 @@ impl FlowCommandHost for RpcCommandHost {
 		unavailable_command("guided-goal")
 	}
 
-	fn loop_command(&mut self, _args: Str) -> CommandFuture<'_> {
-		unavailable_command("loop")
+	fn loop_command(&mut self, args: Str) -> CommandFuture<'_> {
+		let outcome = {
+			let state = self.runtime.state.lock();
+			state.flow_modes.toggle_loop(args.as_str(), unix_millis())
+		};
+		match outcome {
+			Err(error) => Box::pin(async move { Err(miette!("{error}")) }),
+			Ok(omp_driver::modes::LoopCommandOutcome::Disabled) => {
+				command_status("Loop mode disabled.")
+			},
+			Ok(omp_driver::modes::LoopCommandOutcome::Enabled { prompt: None, message }) => {
+				command_status(message)
+			},
+			Ok(omp_driver::modes::LoopCommandOutcome::Enabled { prompt: Some(prompt), .. }) => {
+				Box::pin(async move {
+					Ok(CommandResult::Prompt(crate::chat_ui::commands::PromptResult {
+						text:       prompt,
+						provenance: crate::chat_ui::commands::CommandProvenance::builtin(),
+					}))
+				})
+			},
+		}
 	}
 
 	fn queue(&mut self, prompt: Str) -> CommandFuture<'_> {
@@ -2679,8 +2848,33 @@ impl FlowCommandHost for RpcCommandHost {
 		})
 	}
 
-	fn force(&mut self, _tool: Str) -> CommandFuture<'_> {
-		unavailable_command("force")
+	fn force(&mut self, args: Str) -> CommandFuture<'_> {
+		let args = args.trim();
+		let args = args.as_str();
+		let (tool, prompt) = args
+			.split_once(char::is_whitespace)
+			.map_or((args, ""), |(tool, prompt)| (tool, prompt.trim()));
+		if tool.is_empty() {
+			return Box::pin(async { Err(miette!("Usage: /force:<tool-name> [prompt]")) });
+		}
+		{
+			let mut state = self.runtime.state.lock();
+			if !state.host_tools.contains_key(tool) {
+				let tool = tool.to_owned();
+				return Box::pin(async move { Err(miette!("Host tool `{tool}` is not active.")) });
+			}
+			state.forced_tool = Some(tool.to_owned());
+		}
+		if prompt.is_empty() {
+			return command_status(format!("Next turn forced to use {tool}."));
+		}
+		let prompt = Str::new(prompt);
+		Box::pin(async move {
+			Ok(CommandResult::Prompt(crate::chat_ui::commands::PromptResult {
+				text:       prompt,
+				provenance: crate::chat_ui::commands::CommandProvenance::builtin(),
+			}))
+		})
 	}
 
 	fn fast(&mut self, args: Str) -> CommandFuture<'_> {
@@ -2699,8 +2893,31 @@ impl FlowCommandHost for RpcCommandHost {
 		})
 	}
 
-	fn prewalk(&mut self, _args: Str) -> CommandFuture<'_> {
-		unavailable_command("prewalk")
+	fn prewalk(&mut self, args: Str) -> CommandFuture<'_> {
+		match args.trim().as_str() {
+			"" | "on" => {
+				if omp_driver::chat::fallback_model_selector(omp_catalog::snapshot::Catalog::embedded())
+					.is_none()
+				{
+					return Box::pin(async { Err(miette!("No cheap prewalk model is available.")) });
+				}
+				self.runtime.state.lock().prewalk_armed = true;
+				command_status("Prewalk armed for the next turn.")
+			},
+			"off" => {
+				self.runtime.state.lock().prewalk_armed = false;
+				command_status("Prewalk disabled.")
+			},
+			"status" => {
+				let enabled = self.runtime.state.lock().prewalk_armed;
+				command_status(if enabled {
+					"Prewalk is on."
+				} else {
+					"Prewalk is off."
+				})
+			},
+			_ => Box::pin(async { Err(miette!("Usage: /prewalk [on|off|status]")) }),
+		}
 	}
 
 	fn btw(&mut self, _prompt: Str) -> CommandFuture<'_> {
@@ -2823,6 +3040,9 @@ struct ServerState {
 	content:              omp_driver::discovery::ActiveContentSnapshots,
 	subagents:            HashMap<String, SubagentSnapshot>,
 	transcript_lru:       VecDeque<(String, u64)>,
+	flow_modes:           omp_driver::modes::RegimeHandle,
+	forced_tool:          Option<String>,
+	prewalk_armed:        bool,
 }
 
 impl ServerState {
@@ -2869,6 +3089,9 @@ impl ServerState {
 			content,
 			subagents: HashMap::new(),
 			transcript_lru: VecDeque::new(),
+			flow_modes: omp_driver::modes::RegimeHandle::new(),
+			forced_tool: None,
+			prewalk_armed: false,
 		}
 	}
 
@@ -2983,7 +3206,13 @@ impl Session {
 	}
 }
 
-fn build_request(session: &Session, orchestration: bool) -> ChatRequest {
+fn build_request(
+	session: &Session,
+	orchestration: bool,
+	host_tools: &BTreeMap<String, Value>,
+	forced_tool: Option<&str>,
+	fast_mode: bool,
+) -> ChatRequest {
 	let mut messages = Vec::with_capacity(session.messages.len() + usize::from(orchestration));
 	if orchestration {
 		messages.push(Message {
@@ -3007,16 +3236,35 @@ fn build_request(session: &Session, orchestration: bool) -> ChatRequest {
 		}]),
 		name:    None,
 	}));
+	let tools = forced_tool.map_or_else(Vec::new, |_| {
+		host_tools
+			.values()
+			.filter_map(|value| serde_json::from_value::<HostToolDefinition>(value.clone()).ok())
+			.map(|tool| ToolDefinition {
+				name:        Str::from(tool.name),
+				description: Some(Str::from(tool.description)),
+				input:       ToolInputConstraint::JsonSchema {
+					parameters: OpaqueJson::new(tool.parameters),
+					strict:     false,
+				},
+			})
+			.collect::<Vec<_>>()
+	});
 	ChatRequest {
 		messages:          Arc::from(messages),
-		tools:             Arc::from([]),
+		tools:             Arc::from(tools),
 		hosted_tools:      Arc::from([]),
-		tool_choice:       Setting::Unset,
+		tool_choice:       forced_tool
+			.map_or(Setting::Unset, |tool| Setting::Require(ToolChoice::Named(Str::new(tool)))),
 		output:            Setting::Unset,
 		reasoning:         Setting::Unset,
 		verbosity:         Setting::Unset,
 		cache_retention:   Setting::Unset,
-		service_tier:      Setting::Unset,
+		service_tier:      if fast_mode {
+			Setting::Require(ServiceTier { name: sf!("priority"), priority: 10 })
+		} else {
+			Setting::Unset
+		},
 		sampling:          Sampling::default(),
 		max_output_tokens: None,
 		top_logprobs:      None,
@@ -3132,6 +3380,7 @@ fn rpc_command_roster(root: &Path, generation: u64) -> CommandRoster {
 			let declaration = CommandDeclaration {
 				order:           0,
 				name:            command.name.clone(),
+				icon:            omp_tui::Icon::SlashCommand,
 				aliases:         command.aliases.iter().cloned().collect::<Vec<_>>().into(),
 				description:     command.description.clone(),
 				argument_hint:   command.hint.clone(),
@@ -3606,6 +3855,29 @@ mod tests {
 		}))
 		.expect("host cancel");
 		assert_eq!(cancel.target_id, "inv-1");
+	}
+
+	#[test]
+	fn request_consumes_forced_host_tool_and_fast_tier() {
+		let session = Session::new("session".into(), None);
+		let tools = BTreeMap::from([(
+			"read".into(),
+			json!({
+				"name": "read",
+				"description": "Read a file",
+				"parameters": {"type": "object"},
+			}),
+		)]);
+		let request = build_request(&session, false, &tools, Some("read"), true);
+		assert_eq!(request.tools.len(), 1);
+		assert!(matches!(
+			&request.tool_choice,
+			Setting::Require(ToolChoice::Named(name)) if name == "read"
+		));
+		assert!(matches!(
+			&request.service_tier,
+			Setting::Require(ServiceTier { name, .. }) if name == "priority"
+		));
 	}
 
 	#[test]
