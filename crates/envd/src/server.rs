@@ -2624,6 +2624,11 @@ impl EnvServer {
 		Arc::new(WeakExtensionCallbackDispatcher { supervisor: Arc::downgrade(&self.ext_hosts) })
 	}
 
+	/// Drains idle extension workers and respawns their hot-reload generations.
+	pub async fn reload_extensions(&self) -> Result<Vec<u64>, WorkerError> {
+		self.ext_hosts.reload().await
+	}
+
 	/// Returns the shared extension and built-in provider usage registry.
 	pub fn usage_fetchers(&self) -> omp_inference::operation::usage::UsageFetcherRegistry {
 		self.usage_fetchers.clone()

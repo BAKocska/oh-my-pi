@@ -289,7 +289,21 @@ pub struct ProjectEnvironment {
 	github_credentials:  Arc<GithubCredentialBridge>,
 	lifecycle:           ProjectLifecycle,
 }
-/// Cloneable read authority for retained MCP inspector snapshots.
+/// Cloneable authority for replacing the Environment's extension worker
+/// generation.
+#[derive(Clone)]
+pub struct ExtensionReloadHandle {
+	server: Arc<EnvServer>,
+}
+
+impl ExtensionReloadHandle {
+	/// Drains idle extension workers and respawns their hot-reload generations.
+	pub async fn reload(&self) -> Result<Vec<u64>, worker::WorkerError> {
+		self.server.reload_extensions().await
+	}
+}
+
+/// Cloneable authority for retained MCP inspection and authentication commands.
 #[derive(Clone)]
 pub struct McpInspectorHandle {
 	manager: Arc<mcp::manager::McpManager>,
@@ -299,6 +313,25 @@ impl McpInspectorHandle {
 	/// Captures every live MCP catalog once at the current manager generation.
 	pub fn snapshots(&self) -> Vec<mcp::manager::McpInspectorSnapshot> {
 		self.manager.inspector_snapshots()
+	}
+
+	/// Deletes one server's credential from the shared encrypted store and
+	/// drops its authenticated connection.
+	pub async fn clear_authorization(&self, name: &str) -> Result<bool, mcp::manager::ManagerError> {
+		self.manager.clear_authorization(name).await
+	}
+
+	/// Runs a fresh OAuth grant while exposing the complete authorization URL
+	/// to the application shell.
+	pub async fn reauthorize<F>(
+		&self,
+		name: &str,
+		present: F,
+	) -> Result<bool, mcp::manager::ManagerError>
+	where
+		F: Fn(&str) + Send + Sync,
+	{
+		self.manager.reauthorize(name, &present).await
 	}
 }
 
@@ -937,6 +970,11 @@ impl ProjectEnvironment {
 		self.lifecycle.server.extension_callback_dispatcher()
 	}
 
+	/// Returns a cloneable extension-generation replacement authority.
+	pub fn extension_reload_handle(&self) -> ExtensionReloadHandle {
+		ExtensionReloadHandle { server: Arc::clone(&self.lifecycle.server) }
+	}
+
 	/// Returns the shared extension and built-in provider usage registry.
 	pub fn usage_fetchers(&self) -> omp_inference::operation::usage::UsageFetcherRegistry {
 		self.lifecycle.server.usage_fetchers()
@@ -970,7 +1008,7 @@ impl ProjectEnvironment {
 		})
 	}
 
-	/// Returns a cloneable read authority for retained MCP inspection.
+	/// Returns a cloneable authority for retained MCP commands and inspection.
 	pub fn mcp_inspector(&self) -> McpInspectorHandle {
 		McpInspectorHandle { manager: Arc::clone(self.lifecycle.server.mcp_manager()) }
 	}

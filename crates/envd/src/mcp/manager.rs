@@ -16,7 +16,10 @@ use futures::{
 use http::{HeaderMap, HeaderName, HeaderValue, header::WWW_AUTHENTICATE};
 use omp_core::Str;
 use omp_inference::{
-	auth::command::{CommandCredentialExecutor, CommandCredentialResolver},
+	auth::{
+		StoreError,
+		command::{CommandCredentialExecutor, CommandCredentialResolver},
+	},
 	id::PrincipalId,
 };
 use omp_oauth::{AuthChallenge, ChallengeKind, discover_auth_challenge};
@@ -66,7 +69,7 @@ use super::{
 	invoke,
 	json_rpc::RequestIdFormat,
 	legacy_sse::{LegacySseConfig, LegacySseTransport},
-	oauth::{AuthorityHeaders, McpOAuth, OAuthAttempt},
+	oauth::{AuthorityHeaders, McpOAuth, OAuthAttempt, OAuthFlowError},
 	prompts::{PromptContent, PromptDefinition, PromptError, PromptsClient},
 	resources::{
 		ResourceDefinition, ResourceError, ResourceTemplate, ResourcesClient, best_template,
@@ -1299,6 +1302,115 @@ impl McpManager {
 		self.reconnect(name, true).await.map(|_| ())
 	}
 
+	/// Deletes one MCP credential from the shared authority and drops its live
+	/// authenticated connection.
+	pub async fn clear_authorization(self: &Arc<Self>, name: &str) -> Result<bool, ManagerError> {
+		let (generation, config) = {
+			let state = self.state.lock();
+			let mount = state.mounts.get(name).ok_or(ManagerError::ServerNotFound)?;
+			if !matches!(
+				mount.spec.config.resolved_transport(),
+				TransportKind::Http | TransportKind::Sse
+			) {
+				return Err(ManagerError::UnsupportedAuthorization);
+			}
+			(mount.generation, Arc::clone(&mount.spec.config))
+		};
+		let authority = self
+			.authority
+			.read()
+			.clone()
+			.ok_or(ManagerError::CredentialAuthorityUnavailable)?;
+		let affinity =
+			CombinedAuthAuthority::mcp_affinity("default", name, PrincipalId::from("default"));
+		let removed = authority.delete_mcp(&affinity)?;
+		let stale = {
+			let mut state = self.state.lock();
+			let mount = state
+				.mounts
+				.get_mut(name)
+				.ok_or(ManagerError::ServerNotFound)?;
+			if mount.generation != generation || mount.spec.config != config {
+				return Err(ManagerError::StaleGeneration);
+			}
+			mount.spec.auth_headers = None;
+			mount.terminal_failure = true;
+			mount.connection.take()
+		};
+		if let Some(stale) = stale {
+			let _ = stale.client.transport().close().await;
+		}
+		self.publish_status(
+			name,
+			generation,
+			pb::McpLifecycleState::Failed,
+			"authentication cleared",
+		);
+		self.changed.notify_waiters();
+		Ok(removed)
+	}
+
+	/// Replaces one MCP OAuth grant and installs its live header lease.
+	pub async fn reauthorize(
+		self: &Arc<Self>,
+		name: &str,
+		present: &(dyn Fn(&str) + Send + Sync),
+	) -> Result<bool, ManagerError> {
+		let removed = self.clear_authorization(name).await?;
+		let (generation, config, server_url) = {
+			let state = self.state.lock();
+			let mount = state.mounts.get(name).ok_or(ManagerError::ServerNotFound)?;
+			let server_url = mount
+				.spec
+				.config
+				.url
+				.clone()
+				.ok_or(ManagerError::UnsupportedAuthorization)?;
+			(mount.generation, Arc::clone(&mount.spec.config), server_url)
+		};
+		let oauth = self
+			.oauth
+			.read()
+			.clone()
+			.ok_or(ManagerError::CredentialAuthorityUnavailable)?;
+		let challenge = AuthChallenge {
+			kind:                   ChallengeKind::OAuth,
+			authorization_endpoint: None,
+			token_endpoint:         None,
+			registration_endpoint:  None,
+			resource_metadata:      None,
+			auth_server:            None,
+			resource:               None,
+			scopes:                 Box::new([]),
+			client_id:              None,
+		};
+		let state = oauth
+			.authorize_presented(
+				OAuthAttempt {
+					profile:      "default",
+					server:       name,
+					server_url:   server_url.as_str(),
+					config:       &config,
+					challenge:    &challenge,
+					listener_uri: "http://127.0.0.1:3000/callback",
+					cancel:       self.shutdown.child_token(),
+				},
+				Some(present),
+			)
+			.await?;
+		let headers = AuthorityHeaders::new(oauth, state).await?;
+		let mut manager_state = self.state.lock();
+		let mount = manager_state
+			.mounts
+			.get_mut(name)
+			.ok_or(ManagerError::ServerNotFound)?;
+		if mount.generation != generation {
+			return Err(ManagerError::StaleGeneration);
+		}
+		mount.spec.auth_headers = Some(headers);
+		Ok(removed)
+	}
+
 	pub(crate) fn local_root(&self) -> &Path {
 		&self.local_root
 	}
@@ -2447,6 +2559,18 @@ pub enum ManagerError {
 	/// Dynamic transport values could not be resolved without exposing secrets.
 	#[error(transparent)]
 	ConfigValues(#[from] ConfigValueError),
+	/// The shared encrypted MCP credential authority is not attached.
+	#[error("MCP credential authority is unavailable")]
+	CredentialAuthorityUnavailable,
+	/// The selected transport cannot use Environment-owned OAuth.
+	#[error("MCP server does not declare an HTTP OAuth authorization flow")]
+	UnsupportedAuthorization,
+	/// Encrypted credential persistence failed.
+	#[error(transparent)]
+	CredentialStore(#[from] StoreError),
+	/// OAuth discovery, authorization, or token exchange failed.
+	#[error(transparent)]
+	OAuth(#[from] OAuthFlowError),
 	/// Declaration cannot construct the selected transport.
 	#[error("MCP declaration is invalid")]
 	InvalidConfig,
