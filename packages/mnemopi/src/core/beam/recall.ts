@@ -5,7 +5,13 @@ import { adjustWeights, classifyIntent } from "../query-intent";
 import { getSynonyms, normalizeQuery, STOP_WORDS as QUERY_STOP_WORDS } from "../synonyms";
 import { extractTemporal } from "../temporal-parser";
 import { cosineSimilarity } from "../vector-math";
-import type { BeamMemoryState, RecallEnhancedOptions, RecallOptions, RecallResult } from "./types";
+import type {
+	BeamMemoryState,
+	RecallEnhancedOptions,
+	RecallLengthNormalization,
+	RecallOptions,
+	RecallResult,
+} from "./types";
 
 type DbValue = string | number | null | Uint8Array;
 type Row = Record<string, unknown>;
@@ -102,6 +108,49 @@ export function clipRecallContent(
 	}
 	const head = content.slice(0, Math.max(0, limit - 1));
 	return { content: `${head}…`, truncated: true, fullLength };
+}
+
+/**
+ * Discount `score` by `contentLength` under {@link RecallLengthNormalization} `mode`
+ * (see {@link RecallOptions.lengthNormalization}). Applied to a widened candidate
+ * pool BEFORE the final MMR/topK selection in {@link recallEnhanced}, and mirrored by
+ * the polyphonic path's `diversityRerank`, so a long candidate that would otherwise
+ * win purely on raw relevance can be discounted relative to shorter, equally
+ * relevant candidates.
+ *
+ * - `none` (and any unrecognised runtime value): identity -- byte-identical to the
+ *   Phase-1 pipeline.
+ * - `log`: `score / log2(contentLength + 2)`. Mild penalty, independent of
+ *   `meanLength`.
+ * - `bm25`: `score / (0.25 + 0.75 * (contentLength / meanLength))` -- the classic
+ *   BM25 length-normalization term with `b = 0.75`, scaled relative to the
+ *   candidate pool's mean length (`meanLength`), so it penalizes outliers more
+ *   sharply than `log`.
+ *
+ * Every input is sanitized to a finite, non-negative value first (a non-finite or
+ * negative `score`/`contentLength`/`meanLength` becomes `0`, and a non-positive
+ * `meanLength` falls back to `1` for the `bm25` division), so the result is always
+ * finite regardless of what a caller passes.
+ */
+export function normalizeRecallScore(
+	score: number,
+	contentLength: number,
+	mode: RecallLengthNormalization,
+	meanLength = 0,
+): number {
+	const safeScore = Number.isFinite(score) ? Math.max(0, score) : 0;
+	if (mode === "none") return safeScore;
+	const safeLength = Number.isFinite(contentLength) ? Math.max(0, contentLength) : 0;
+	if (mode === "log") {
+		const denom = Math.log2(safeLength + 2);
+		return denom > 0 ? safeScore / denom : safeScore;
+	}
+	if (mode === "bm25") {
+		const safeMean = Number.isFinite(meanLength) && meanLength > 0 ? meanLength : 1;
+		const denom = 0.25 + 0.75 * (safeLength / safeMean);
+		return denom > 0 ? safeScore / denom : safeScore;
+	}
+	return safeScore;
 }
 
 const DEFAULT_LIMIT = 500;
@@ -1057,13 +1106,37 @@ export async function recallEnhanced(
 		useIntent: options.useIntent !== false,
 		useMmr: options.useMmr !== false,
 	};
-	const results = await recall(beam, query, Math.max(topK * 2, topK), {
+	const lengthNormalization = options.lengthNormalization ?? "none";
+	// `none` (the default) overfetches exactly like Phase 1, byte-identical output.
+	// Non-`none` modes overfetch a much wider raw pool first -- `normalizeRecallScore`
+	// below can only discount a long candidate that actually made it into the pool the
+	// final MMR/topK draws from.
+	const innerTopK = lengthNormalization === "none" ? Math.max(topK * 2, topK) : Math.max(topK * 4, 30);
+	const results = await recall(beam, query, innerTopK, {
 		...enhancedOptions,
 		updateRecallCounts: false,
 	});
 	if (options.includeFacts === true) {
 		const facts = factRecall(beam, query, factRecallLimit(topK));
 		results.push(...facts);
+	}
+	if (lengthNormalization !== "none") {
+		let totalLength = 0;
+		for (const result of results) totalLength += result.full_length ?? result.content.length;
+		const meanLength = results.length > 0 ? totalLength / results.length : 0;
+		for (const result of results) {
+			const length = result.full_length ?? result.content.length;
+			result.score = round4(normalizeRecallScore(result.score ?? 0, length, lengthNormalization, meanLength));
+		}
+	}
+	const scoreFloor =
+		typeof options.scoreFloor === "number" && Number.isFinite(options.scoreFloor)
+			? Math.max(0, options.scoreFloor)
+			: 0;
+	if (scoreFloor > 0) {
+		for (let index = results.length - 1; index >= 0; index--) {
+			if ((results[index]?.score ?? 0) < scoreFloor) results.splice(index, 1);
+		}
 	}
 	results.sort((left, right) => (right.score ?? 0) - (left.score ?? 0));
 	const finalResults = rerankRecallResults(results, options.mmrLambda ?? 0.7, topK);

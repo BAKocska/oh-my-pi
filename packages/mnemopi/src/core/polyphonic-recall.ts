@@ -1,8 +1,8 @@
 import type { Database } from "bun:sqlite";
 import { type Env, polyphonicRecallEnabled } from "../config";
 import { closeQuietly, type DatabasePath, openDatabase } from "../db";
-import { clipRecallContent, RECALL_CONTENT_PREVIEW_CHARS, STOP_WORDS } from "./beam/recall";
-import type { BeamMemoryState, JsonValue, Metadata, RecallResult } from "./beam/types";
+import { clipRecallContent, normalizeRecallScore, RECALL_CONTENT_PREVIEW_CHARS, STOP_WORDS } from "./beam/recall";
+import type { BeamMemoryState, JsonValue, Metadata, RecallLengthNormalization, RecallResult } from "./beam/types";
 import { EpisodicGraph, isPlausibleFactSubject } from "./episodic-graph";
 import { mmrRerank } from "./mmr";
 import { VeracityConsolidator } from "./veracity-consolidation";
@@ -42,6 +42,14 @@ export interface PolyphonicMemoryResult extends Omit<RecallResult, "metadata" | 
 
 export interface PolyphonicRecallOptions {
 	readonly queryEmbedding?: readonly number[] | Float32Array | null;
+	readonly lengthNormalization?: RecallLengthNormalization;
+	readonly scoreFloor?: number;
+}
+
+/** Options accepted by {@link PolyphonicRecallEngine.recall}'s fourth argument. */
+export interface PolyphonicRecallEngineOptions {
+	readonly lengthNormalization?: RecallLengthNormalization;
+	readonly scoreFloor?: number;
 }
 
 interface PolyphonicEngineOptions {
@@ -356,13 +364,16 @@ export class PolyphonicRecallEngine {
 		query: string,
 		queryEmbedding: readonly number[] | Float32Array | null = null,
 		topK = 10,
+		options: PolyphonicRecallEngineOptions = {},
 	): PolyphonicMemoryResult[] {
 		const vectorResults = this.vectorVoice(queryEmbedding);
 		const graphResults = this.graphVoice(query);
 		const factResults = this.factVoice(query);
 		const temporalResults = this.temporalVoice(query);
 		const combined = this.combineVoices(vectorResults, graphResults, factResults, temporalResults);
-		return this.hydrateResults(this.diversityRerank(combined, topK));
+		return this.hydrateResults(
+			this.diversityRerank(combined, topK, options.lengthNormalization ?? "none", options.scoreFloor),
+		);
 	}
 
 	vectorVoice(queryEmbedding: readonly number[] | Float32Array | null): VoiceRecallResult[] {
@@ -868,7 +879,12 @@ export class PolyphonicRecallEngine {
 	 * collapsed to a single row regardless of `topK` or of how different the memories
 	 * actually were.
 	 */
-	diversityRerank(results: ReadonlyMap<string, PolyphonicResult>, topK: number): PolyphonicResult[] {
+	diversityRerank(
+		results: ReadonlyMap<string, PolyphonicResult>,
+		topK: number,
+		lengthNormalization: RecallLengthNormalization = "none",
+		scoreFloor?: number,
+	): PolyphonicResult[] {
 		const limit = Math.max(0, Math.trunc(topK));
 		if (limit === 0) return [];
 		// RRF score first, memory id as a stable tiebreak. `mmrRerank` re-sorts by score
@@ -876,7 +892,6 @@ export class PolyphonicRecallEngine {
 		const ranked = [...results.values()].sort(
 			(a, b) => b.combinedScore - a.combinedScore || a.memoryId.localeCompare(b.memoryId),
 		);
-		if (ranked.length <= 1) return ranked.slice(0, limit);
 		// The voices can nominate far more candidates than `topK` (the graph voice walks
 		// `ctx` edges depth-2 and is not intrinsically bounded), so bound the pool that
 		// gets a content lookup and an MMR pass.
@@ -887,13 +902,31 @@ export class PolyphonicRecallEngine {
 			this.sessionId,
 			new Date().toISOString(),
 		);
-		const items = window
-			.filter(candidate => contents.has(candidate.memoryId))
-			.map(candidate => ({
-				candidate,
-				content: contents.get(candidate.memoryId) ?? "",
-				score: candidate.combinedScore,
-			}));
+		const visible = window.filter(candidate => contents.has(candidate.memoryId));
+		if (lengthNormalization !== "none" && visible.length > 0) {
+			// Raw, un-clipped content lengths -- `contents` never truncates -- so the discount
+			// reflects what a candidate actually costs, not what the caller sees after
+			// `hydrateResults` clips it to RECALL_CONTENT_PREVIEW_CHARS.
+			const meanLength =
+				visible.reduce((sum, candidate) => sum + (contents.get(candidate.memoryId)?.length ?? 0), 0) /
+				visible.length;
+			for (const candidate of visible) {
+				const length = contents.get(candidate.memoryId)?.length ?? 0;
+				candidate.combinedScore = normalizeRecallScore(
+					candidate.combinedScore,
+					length,
+					lengthNormalization,
+					meanLength,
+				);
+			}
+		}
+		const floor = typeof scoreFloor === "number" && Number.isFinite(scoreFloor) ? Math.max(0, scoreFloor) : 0;
+		const eligible = floor > 0 ? visible.filter(candidate => candidate.combinedScore >= floor) : visible;
+		const items = eligible.map(candidate => ({
+			candidate,
+			content: contents.get(candidate.memoryId) ?? "",
+			score: candidate.combinedScore,
+		}));
 		return mmrRerank(items, MMR_LAMBDA, limit).map(item => item.candidate);
 	}
 	getStats(): Record<string, JsonValue> {
@@ -1020,5 +1053,8 @@ export function polyphonicRecall(
 	topK = 10,
 	options: PolyphonicRecallOptions = {},
 ): PolyphonicMemoryResult[] {
-	return getPolyphonicEngine(beam).recall(query, options.queryEmbedding ?? null, topK);
+	return getPolyphonicEngine(beam).recall(query, options.queryEmbedding ?? null, topK, {
+		lengthNormalization: options.lengthNormalization,
+		scoreFloor: options.scoreFloor,
+	});
 }

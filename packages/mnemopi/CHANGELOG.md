@@ -12,6 +12,7 @@
 
 - Added a `QueryCache` instance to the recall orchestrator, so `enhancedRecall` finally caches anything. The cache key includes every option the row-visibility predicate reads (topK, facts, session/channel, mode, per-voice gates, author/date/source/topic/veracity/memoryType and `ignoreSessionScope`), so a visibility-widened recall cannot poison a narrower session-scoped bucket. In-memory per bank; SQLite persistence stays off, because separate-process runs reproduced stale reads, TTL resets on restart and cross-bank contamination.
 - Added `fts_memoria_facts`, an FTS index over flat extracted statements, and taught both the linear and polyphonic fact paths to search it alongside the legacy `fts_facts`. Legacy placeholder rows stay queryable.
+- `recall`/`recallEnhanced` and polyphonic recall accept `lengthNormalization` (`none` | `log` | `bm25`) and `scoreFloor` options. Non-`none` length modes widen the raw candidate pool, then discount long candidates before the final MMR/topK selection — `log` divides the score by `log2(contentLength + 2)`, `bm25` divides by the classic BM25 length term (`0.25 + 0.75 * length/meanLength`, i.e. `b = 0.75` against the pool's mean length); a positive floor drops candidates below the normalized score and lets a query abstain with zero results. Defaults (`none`, `0`) are byte-identical to the previous behavior, and the orchestrator's query-cache key includes both options so an A/B never serves a cached ranking across modes.
 
 ### Changed
 

@@ -123,6 +123,64 @@ describe("PolyphonicRecallEngine", () => {
 		}
 	});
 
+	it("applies length normalization to the raw polyphonic pool before final diversity", () => {
+		const beam = makeBeam();
+		try {
+			insertWorking(beam, "a-long", `quokka protocol ${"background ".repeat(500)}`);
+			insertWorking(beam, "z-short", "quokka protocol concise answer");
+			for (const id of ["a-long", "z-short"]) {
+				beam.db.run("INSERT INTO memory_embeddings (memory_id, embedding_json, model) VALUES (?, ?, 'test')", [
+					id,
+					JSON.stringify([1, 0]),
+				]);
+			}
+			const engine = new PolyphonicRecallEngine({
+				db: beam.db,
+				sessionId: beam.sessionId,
+				channelId: beam.channelId,
+			});
+			const recallWithMode = engine.recall.bind(engine) as unknown as (
+				query: string,
+				embedding: readonly number[],
+				topK: number,
+				options: { lengthNormalization: "none" | "log" | "bm25" },
+			) => ReturnType<PolyphonicRecallEngine["recall"]>;
+
+			const none = recallWithMode("quokka protocol", [1, 0], 2, { lengthNormalization: "none" });
+			const log = recallWithMode("quokka protocol", [1, 0], 2, { lengthNormalization: "log" });
+			const bm25 = recallWithMode("quokka protocol", [1, 0], 2, { lengthNormalization: "bm25" });
+
+			expect(none[0]?.id).toBe("a-long");
+			expect(log[0]?.id).toBe("z-short");
+			expect(bm25[0]?.id).toBe("z-short");
+		} finally {
+			closeQuietly(beam.db);
+		}
+	});
+
+	it("can abstain before diversity when every fused score is below the floor", () => {
+		const beam = makeBeam();
+		try {
+			insertWorking(beam, "weak", "quokka protocol incidental note");
+			beam.db.run("INSERT INTO memory_embeddings (memory_id, embedding_json, model) VALUES ('weak','[1,0]','test')");
+			const engine = new PolyphonicRecallEngine({
+				db: beam.db,
+				sessionId: beam.sessionId,
+				channelId: beam.channelId,
+			});
+			const recallWithFloor = engine.recall.bind(engine) as unknown as (
+				query: string,
+				embedding: readonly number[],
+				topK: number,
+				options: { scoreFloor: number },
+			) => ReturnType<PolyphonicRecallEngine["recall"]>;
+
+			expect(recallWithFloor("quokka protocol", [1, 0], 8, { scoreFloor: 1 })).toEqual([]);
+		} finally {
+			closeQuietly(beam.db);
+		}
+	});
+
 	it("returns a full topK when a single voice nominates every candidate", () => {
 		const beam = makeBeam();
 		try {

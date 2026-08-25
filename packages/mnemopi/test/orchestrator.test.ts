@@ -228,4 +228,41 @@ describe("cacheDiscriminator visibility widening", () => {
 			beam.close();
 		}
 	});
+
+	it("separates cache buckets by length-normalization mode", async () => {
+		process.env.MNEMOPI_ENHANCED_RECALL = "1";
+		process.env.MNEMOPI_POLYPHONIC_RECALL = "0";
+		const beam = visibilityBeam("session-a");
+		try {
+			insertWorking(beam, "long", `quokka protocol ${"background ".repeat(500)}`, {
+				sessionId: "session-a",
+				scope: "session",
+			});
+			insertWorking(beam, "short", "quokka protocol concise answer", {
+				sessionId: "session-a",
+				scope: "session",
+			});
+			const common = { queryEmbedding: null } as const;
+
+			await orchestrateRecall(beam, "quokka protocol", 2, {
+				...common,
+				lengthNormalization: "none",
+			} as never);
+			await orchestrateRecall(beam, "quokka protocol", 2, {
+				...common,
+				lengthNormalization: "log",
+			} as never);
+			await orchestrateRecall(beam, "quokka protocol", 2, {
+				...common,
+				lengthNormalization: "log",
+				scoreFloor: 1,
+			} as never);
+
+			const cache = beam.caches.queryCache;
+			if (!(cache instanceof OrchestratorQueryCache)) throw new Error("expected an OrchestratorQueryCache");
+			expect(cache.stats().size).toBe(3);
+		} finally {
+			beam.close();
+		}
+	});
 });

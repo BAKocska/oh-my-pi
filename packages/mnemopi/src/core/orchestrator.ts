@@ -22,7 +22,7 @@ export interface OrchestratorBeam extends BeamMemoryState {
 
 export interface OrchestrateRecallOptions
 	extends Omit<RecallEnhancedOptions, "queryEmbedding">,
-		Omit<PolyphonicRecallOptions, "queryEmbedding"> {
+		Omit<PolyphonicRecallOptions, "queryEmbedding" | "lengthNormalization" | "scoreFloor"> {
 	readonly queryEmbedding?: readonly number[] | Float32Array | null;
 	readonly enhanced?: boolean;
 	readonly forcePolyphonic?: boolean;
@@ -143,7 +143,14 @@ function cacheDiscriminator(
 	// plain `recall` does not -- their result shapes are not interchangeable.
 	const mode = polyphonic ? "poly" : options.enhanced === true ? "enh" : "lin";
 	const includeFacts = options.includeFacts === true ? "1" : "0";
-	return `${mode}|k=${topK}|facts=${includeFacts}|${visibilityDiscriminator(options)}|sess=${beam.sessionId}|voices=${voiceEnvMask()}`;
+	// Length mode and score floor both alter the final candidate set for the same
+	// query/topK; never serve a cache entry across either A/B boundary.
+	const lengthNormalization = options.lengthNormalization ?? "none";
+	const scoreFloor =
+		typeof options.scoreFloor === "number" && Number.isFinite(options.scoreFloor)
+			? Math.max(0, options.scoreFloor)
+			: 0;
+	return `${mode}|k=${topK}|facts=${includeFacts}|len=${lengthNormalization}|floor=${scoreFloor}|${visibilityDiscriminator(options)}|sess=${beam.sessionId}|voices=${voiceEnvMask()}`;
 }
 
 /**
