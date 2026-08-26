@@ -2,7 +2,6 @@
 
 use std::{
 	collections::{BTreeSet, HashSet},
-	env,
 	fs::{self as std_fs, OpenOptions},
 	future::{Future, ready},
 	io, iter,
@@ -17,7 +16,9 @@ use std::{
 
 use bytes::Bytes;
 use flate2::{read::GzDecoder, write::GzEncoder};
-use omp_core::{Hash32, Str, encoding::hex, sf};
+use omp_core::{
+	Hash32, Str, dirs::home_dir, encoding::hex, fs::replace_file_atomically, sf, shorten_home_path,
+};
 use omp_docserver::fs::{self, LocalFs};
 use omp_hashline::{
 	Clipboard, MismatchDetails, MismatchError, RevisionToken, compute_snapshot_tag,
@@ -1884,15 +1885,11 @@ fn display_write_path(path: &Path, workspace_root: &Path) -> Str {
 	if let Ok(relative) = path.strip_prefix(workspace_root) {
 		return Str::from(relative.to_string_lossy().replace('\\', "/"));
 	}
-	if let Some(home) = env::var_os("HOME").map(PathBuf::from)
-		&& let Ok(relative) = path.strip_prefix(home)
+	if let Some(home) = home_dir()
+		&& let Some(shortened) =
+			shorten_home_path(path.to_string_lossy().as_ref(), home.to_string_lossy().as_ref())
 	{
-		let relative = relative.to_string_lossy().replace('\\', "/");
-		return Str::from(if relative.is_empty() {
-			"~".to_owned()
-		} else {
-			format!("~/{relative}")
-		});
+		return Str::from(shortened);
 	}
 	Str::from(path.to_string_lossy().replace('\\', "/"))
 }
@@ -1963,7 +1960,7 @@ fn atomic_write_plain(path: &Path, content: &Bytes) -> Result<(), String> {
 		let _ = std_fs::remove_file(&temporary);
 		return Err(error);
 	}
-	if let Err(error) = std_fs::rename(&temporary, path) {
+	if let Err(error) = replace_file_atomically(&temporary, path) {
 		let _ = std_fs::remove_file(&temporary);
 		return Err(error.to_string());
 	}
@@ -3173,7 +3170,7 @@ fn atomic_replace(
 		let _ = std_fs::remove_file(&tmp_path);
 		return Err(error);
 	}
-	if let Err(error) = std_fs::rename(&tmp_path, path) {
+	if let Err(error) = replace_file_atomically(&tmp_path, path) {
 		let _ = std_fs::remove_file(&tmp_path);
 		return Err(special_fault(error.to_string()));
 	}

@@ -19,7 +19,7 @@ use http::{
 	HeaderMap, HeaderName, HeaderValue, StatusCode,
 	header::{ACCEPT, ACCEPT_ENCODING, ACCEPT_LANGUAGE, CONTENT_TYPE, RETRY_AFTER, USER_AGENT},
 };
-use omp_core::{Hash32, Str, sf};
+use omp_core::{Hash32, Str, dirs::home_dir, sf, shorten_home_path};
 use omp_hashline::RevisionToken;
 use omp_storage::document_cache::{DocumentCache, DocumentCacheKey};
 use omp_tools::read::{
@@ -45,8 +45,6 @@ use super::{
 const MAX_REDIRECTS: usize = 20;
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(10);
 const DEFAULT_RETRY_AFTER: Duration = Duration::from_secs(1);
-
-use std::env;
 
 use omp_storage::atomic;
 use thiserror::Error;
@@ -861,9 +859,9 @@ impl ReadSources for ReadSourceAdapter {
 
 fn resolve_authored_path(root: &Path, authored: &str) -> PathBuf {
 	let expanded = if authored == "~" {
-		env::var_os("HOME").map(PathBuf::from)
+		home_dir()
 	} else if let Some(rest) = authored.strip_prefix("~/") {
-		env::var_os("HOME").map(|home| PathBuf::from(home).join(rest))
+		home_dir().map(|home| home.join(rest))
 	} else {
 		None
 	};
@@ -883,15 +881,11 @@ fn display_path(root: &Path, canonical: &Path) -> Result<Str, Fault> {
 			utf8_slash_path(relative)
 		};
 	}
-	if let Some(home) = env::var_os("HOME").map(PathBuf::from)
-		&& let Ok(relative) = canonical.strip_prefix(home)
+	if let Some(home) = home_dir()
+		&& let Some(shortened) =
+			shorten_home_path(canonical.to_string_lossy().as_ref(), home.to_string_lossy().as_ref())
 	{
-		let suffix = utf8_slash_path(relative)?;
-		return Ok(if suffix.is_empty() {
-			sf!("~")
-		} else {
-			Str::from(format!("~/{suffix}"))
-		});
+		return Ok(Str::from(shortened));
 	}
 	utf8_path(canonical)
 }

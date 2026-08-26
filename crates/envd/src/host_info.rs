@@ -15,6 +15,7 @@ use tokio::{io::AsyncReadExt as _, process::Command, sync::OnceCell, time};
 
 const MAX_FIELD_BYTES: usize = 4 * 1024;
 const MAX_PROBE_BYTES: u64 = 256 * 1024;
+const GPU_CACHE_SCHEMA_VERSION: u64 = 1;
 #[cfg(any(target_os = "linux", windows, test))]
 const MAX_GPUS: usize = 16;
 const QUICK_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
@@ -121,11 +122,7 @@ async fn probe_gpus() -> Vec<String> {
 			GPU_PROBE_TIMEOUT,
 		)
 		.await
-		.map_or_else(Vec::new, |output| {
-			let mut gpus = parse_wmic_table(&output, "Name");
-			gpus.truncate(MAX_GPUS);
-			gpus
-		});
+		.map_or_else(Vec::new, |output| parse_windows_gpus(&output));
 	}
 	#[cfg(target_os = "linux")]
 	{
@@ -178,7 +175,7 @@ fn parse_linux_cpu(cpuinfo: &str) -> Option<String> {
 	})
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 fn parse_wmic_table(output: &str, header: &str) -> Vec<String> {
 	output
 		.lines()
@@ -186,6 +183,36 @@ fn parse_wmic_table(output: &str, header: &str) -> Vec<String> {
 		.filter(|line| !line.is_empty() && !line.eq_ignore_ascii_case(header))
 		.map(str::to_owned)
 		.collect()
+}
+
+#[cfg(any(windows, test))]
+fn parse_windows_gpus(output: &str) -> Vec<String> {
+	let adapters = parse_wmic_table(output, "Name");
+	let mut preferred = Vec::with_capacity(adapters.len());
+	let mut physical = Vec::with_capacity(adapters.len());
+	for adapter in &adapters {
+		let lower = adapter.to_ascii_lowercase();
+		if ["virtual", "mirror", "remote", "citrix"]
+			.iter()
+			.any(|needle| lower.contains(needle))
+		{
+			continue;
+		}
+		if ["nvidia", "amd", "radeon", "intel"]
+			.iter()
+			.any(|vendor| lower.contains(vendor))
+		{
+			preferred.push(adapter.clone());
+		} else {
+			physical.push(adapter.clone());
+		}
+	}
+	preferred.extend(physical);
+	if preferred.is_empty() {
+		preferred.extend(adapters.into_iter().take(1));
+	}
+	preferred.truncate(MAX_GPUS);
+	preferred
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -227,6 +254,9 @@ fn rank_linux_gpus(output: &str) -> Vec<String> {
 async fn load_gpu_cache(path: &Path) -> Option<Arc<[String]>> {
 	let bytes = tokio::fs::read(path).await.ok()?;
 	let value: Value = serde_json::from_slice(&bytes).ok()?;
+	if value.as_object()?.get("version")?.as_u64()? != GPU_CACHE_SCHEMA_VERSION {
+		return None;
+	}
 	let gpus = value.as_object()?.get("gpus")?;
 	if gpus.is_null() {
 		return Some(Arc::from([]));
@@ -241,9 +271,9 @@ async fn load_gpu_cache(path: &Path) -> Option<Arc<[String]>> {
 
 async fn save_gpu_cache(path: &Path, gpus: &[String]) -> io::Result<()> {
 	let value = if gpus.is_empty() {
-		json!({ "gpus": null })
+		json!({ "version": GPU_CACHE_SCHEMA_VERSION, "gpus": null })
 	} else {
-		json!({ "gpus": gpus })
+		json!({ "version": GPU_CACHE_SCHEMA_VERSION, "gpus": gpus })
 	};
 	let bytes = serde_json::to_vec_pretty(&value).expect("GPU cache value is serializable");
 	tokio::fs::write(path, bytes).await
@@ -375,6 +405,16 @@ mod tests {
 			 6000\n02:00.0 VGA compatible controller: ASPEED Graphics\n",
 		);
 		assert_eq!(ranked, ["NVIDIA RTX 6000", "Intel UHD"]);
+		assert_eq!(
+			parse_windows_gpus(
+				"Name\nGameViewer Virtual Display Adapter\nGeneric Physical Adapter\nIntel Arc \
+				 A770\nNVIDIA GeForce RTX 5090\nCitrix Mirror Adapter\n"
+			),
+			["Intel Arc A770", "NVIDIA GeForce RTX 5090", "Generic Physical Adapter"]
+		);
+		assert_eq!(parse_windows_gpus("Name\nRemote Display Adapter\nCitrix Virtual Adapter\n"), [
+			"Remote Display Adapter"
+		]);
 		assert_eq!(bound_field("abc\0  def", 7), "abc def");
 	}
 
@@ -392,5 +432,21 @@ mod tests {
 		let value: Value =
 			serde_json::from_slice(&tokio::fs::read(path).await.expect("read cache")).unwrap();
 		assert!(value["gpus"].is_null());
+		assert_eq!(value["version"], GPU_CACHE_SCHEMA_VERSION);
+	}
+
+	#[tokio::test]
+	async fn legacy_and_mismatched_gpu_cache_versions_are_rejected() {
+		let directory = tempfile::tempdir().expect("cache directory");
+		let path = directory.path().join("host-info.json");
+		for value in [
+			json!({ "gpus": ["GameViewer Virtual Display Adapter"] }),
+			json!({ "version": GPU_CACHE_SCHEMA_VERSION + 1, "gpus": ["NVIDIA RTX"] }),
+		] {
+			tokio::fs::write(&path, serde_json::to_vec(&value).unwrap())
+				.await
+				.expect("write stale cache");
+			assert!(load_gpu_cache(&path).await.is_none());
+		}
 	}
 }

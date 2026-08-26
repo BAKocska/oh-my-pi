@@ -9,6 +9,7 @@ use std::{
 use omp_core::{CowBytes, Str};
 use omp_tools::read::{
 	Fault,
+	image::MAX_IMAGE_INPUT_BYTES,
 	resolver::{
 		LineOffsetCache, Resolve, ResourceCompletion, ResourceEntry, ResourceList, fuzzy_score,
 	},
@@ -193,24 +194,30 @@ impl Resolve for LocalResolver {
 				message: Str::new_static("local:// resources must be regular files or directories."),
 			});
 		}
-		if known_binary(&target) {
+		let image = matches!(selector, ParsedSelector::Image);
+		if !image && known_binary(&target) {
 			return Err(binary_fault(resource));
 		}
-		let bytes = fs::read(&target).map_err(io_fault)?;
-		let sniff = &bytes[..bytes.len().min(SNIFF_BYTES)];
-		if sniff.contains(&0) || str::from_utf8(sniff).is_err() {
-			return Err(binary_fault(resource));
-		}
-		if metadata.len() > MAX_TEXT_BYTES
-			&& matches!(selector, ParsedSelector::None | ParsedSelector::Raw)
+		let byte_limit = if image {
+			MAX_IMAGE_INPUT_BYTES as u64
+		} else {
+			MAX_TEXT_BYTES
+		};
+		if metadata.len() > byte_limit
+			&& matches!(selector, ParsedSelector::None | ParsedSelector::Raw | ParsedSelector::Image)
 		{
 			return Err(Fault::Invalid {
 				message: Str::new(format!(
-					"local://{resource} is {} bytes; full text resolution is limited to \
-					 {MAX_TEXT_BYTES} bytes. Use a line selector or path-only read.",
+					"local://{resource} is {} bytes; full resolution is limited to {byte_limit} bytes. \
+					 Use a line selector or path-only read.",
 					metadata.len()
 				)),
 			});
+		}
+		let bytes = fs::read(&target).map_err(io_fault)?;
+		let sniff = &bytes[..bytes.len().min(SNIFF_BYTES)];
+		if !image && (sniff.contains(&0) || str::from_utf8(sniff).is_err()) {
+			return Err(binary_fault(resource));
 		}
 		select_bytes(&self.lines, resource, CowBytes::from(bytes), selector)
 	}

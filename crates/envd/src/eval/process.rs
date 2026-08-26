@@ -277,6 +277,8 @@ impl ProcessEvalExec {
 			message: sf!("unknown supervised Python process session"),
 		})?;
 		let gate = Arc::clone(&owned.run_gate).lock_owned().await;
+		// The gate covers child replacement as well as execution, so callers
+		// queued on the same session coalesce around the first fresh child.
 		let forced_reset = owned.needs_reset.swap(false, Ordering::AcqRel);
 		request.reset |= forced_reset || disposable;
 		let effective_reset = request.reset;
@@ -308,49 +310,86 @@ impl ProcessEvalExec {
 			{
 				stale.terminate().await;
 			}
-			if child_slot.is_none() {
-				match EvalChild::spawn(
-					&executable,
-					&owned.key.session,
-					request
-						.runtime
-						.cwd
-						.as_deref()
-						.unwrap_or_else(|| Path::new(".")),
-					Arc::clone(&host),
-					interrupt_grace,
-				)
-				.await
+			let mut retry_cancelled = None;
+			loop {
+				if child_slot.is_none() {
+					match EvalChild::spawn(
+						&executable,
+						&owned.key.session,
+						request
+							.runtime
+							.cwd
+							.as_deref()
+							.unwrap_or_else(|| Path::new(".")),
+						Arc::clone(&host),
+						interrupt_grace,
+					)
+					.await
+					{
+						Ok(child) => *child_slot = Some(child),
+						Err(error) => {
+							owned.needs_reset.store(true, Ordering::Release);
+							if task_cancelled.is_cancelled()
+								&& let Some(completion) = retry_cancelled.take()
+							{
+								let _ = events_tx.send(Ok(RunEvent::Completed(completion)));
+							} else {
+								let _ = events_tx.send(Err(resource_fault("open_session", error)));
+							}
+							return;
+						},
+					}
+				}
+				if request.reset {
+					request.reset = false;
+				}
+				if task_cancelled.is_cancelled()
+					&& let Some(completion) = retry_cancelled.take()
 				{
-					Ok(child) => *child_slot = Some(child),
-					Err(error) => {
-						owned.needs_reset.store(true, Ordering::Release);
-						let _ = events_tx.send(Err(resource_fault("open_session", error)));
+					if disposable && let Some(mut child) = child_slot.take() {
+						child.terminate().await;
+					}
+					let _ = events_tx.send(Ok(RunEvent::Completed(completion)));
+					return;
+				}
+				let child = child_slot.as_mut().expect("eval child initialized above");
+				match child
+					.run_cell(
+						cell_id.clone(),
+						request.clone(),
+						task_cancelled.clone(),
+						&events_tx,
+						owned.owner.as_str(),
+						&owned.key.session,
+						Arc::clone(&host),
+						&owned.needs_reset,
+						blobs.clone(),
+						retry_cancelled.is_none(),
+					)
+					.await
+				{
+					RunCellDisposition::Keep if !disposable => return,
+					RunCellDisposition::RetryDeadCancellation(completion) => {
+						child.terminate().await;
+						*child_slot = None;
+						retry_cancelled = Some(completion);
+						if task_cancelled.is_cancelled() {
+							owned.needs_reset.store(true, Ordering::Release);
+							let _ = events_tx.send(Ok(RunEvent::Completed(
+								retry_cancelled
+									.take()
+									.expect("dead-kernel cancellation recorded above"),
+							)));
+							return;
+						}
+					},
+					RunCellDisposition::Keep | RunCellDisposition::Drop => {
+						child.terminate().await;
+						*child_slot = None;
+						owned.needs_reset.store(!disposable, Ordering::Release);
 						return;
 					},
 				}
-			}
-			if request.reset {
-				request.reset = false;
-			}
-			let child = child_slot.as_mut().expect("eval child initialized above");
-			let keep = child
-				.run_cell(
-					cell_id,
-					request,
-					task_cancelled,
-					&events_tx,
-					owned.owner.as_str(),
-					&owned.key.session,
-					host,
-					&owned.needs_reset,
-					blobs,
-				)
-				.await && !disposable;
-			if !keep {
-				child.terminate().await;
-				*child_slot = None;
-				owned.needs_reset.store(!disposable, Ordering::Release);
 			}
 		});
 		Ok(ProcessEvalRun { events, cancelled, terminal: false, effective_reset })
@@ -472,6 +511,24 @@ struct EvalChild {
 	interrupt_grace: Duration,
 }
 
+enum RunCellDisposition {
+	Keep,
+	Drop,
+	RetryDeadCancellation(RunCompletion),
+}
+
+const fn should_retry_dead_kernel_cancellation(
+	outcome: CellOutcome,
+	caller_cancelled: bool,
+	kernel_alive: bool,
+	retry_available: bool,
+) -> bool {
+	matches!(outcome, CellOutcome::Cancelled)
+		&& !caller_cancelled
+		&& !kernel_alive
+		&& retry_available
+}
+
 impl EvalChild {
 	async fn spawn(
 		executable: &Path,
@@ -562,7 +619,8 @@ impl EvalChild {
 		host: Arc<SessionBridgeHost>,
 		needs_reset: &AtomicBool,
 		blobs: Option<BlobHost>,
-	) -> bool {
+		retry_dead_cancellation: bool,
+	) -> RunCellDisposition {
 		let run_id = self.next_run.fetch_add(1, Ordering::Relaxed);
 		let started = Instant::now();
 		let timeout = TimeoutHandle::new(request.timeout);
@@ -573,7 +631,7 @@ impl EvalChild {
 		else {
 			let _ = events
 				.send(Err(resource_fault("run", ProcessError::Duration(DurationError::Overflow))));
-			return false;
+			return RunCellDisposition::Drop;
 		};
 		if let Err(error) = write_frame(&mut self.stdin, &ParentFrame::Run {
 			run_id,
@@ -587,7 +645,7 @@ impl EvalChild {
 		{
 			needs_reset.store(true, Ordering::Release);
 			let _ = events.send(Err(session_lost(error)));
-			return false;
+			return RunCellDisposition::Drop;
 		}
 
 		let mut result = None;
@@ -605,14 +663,14 @@ impl EvalChild {
 					let _ = events.send(Ok(RunEvent::Completed(cancelled_completion(
 						elapsed_ms(started),
 					))));
-					return false;
+					return RunCellDisposition::Drop;
 				},
 				() = timeout.expired() => {
 					needs_reset.store(true, Ordering::Release);
 					self.interrupt();
 					time::sleep(self.interrupt_grace).await;
 					let _ = events.send(Ok(RunEvent::Completed(timeout_completion(elapsed_ms(started)))));
-					return false;
+					return RunCellDisposition::Drop;
 				},
 				frame = read_frame(&mut self.stdout) => frame,
 			};
@@ -635,12 +693,12 @@ impl EvalChild {
 							message: sf!("Python eval child exited during the active cell"),
 						}));
 					}
-					return false;
+					return RunCellDisposition::Drop;
 				},
 				Err(error) => {
 					needs_reset.store(true, Ordering::Release);
 					let _ = events.send(Err(session_lost(error)));
-					return false;
+					return RunCellDisposition::Drop;
 				},
 			};
 			match frame {
@@ -655,7 +713,7 @@ impl EvalChild {
 				{
 					if let Err(error) = spill.push(update.data.as_ref()) {
 						let _ = events.send(Err(resource_fault("spill_output", error)));
-						return false;
+						return RunCellDisposition::Drop;
 					}
 					update.sequence = wire_sequence;
 					wire_sequence = wire_sequence.saturating_add(1);
@@ -689,10 +747,10 @@ impl EvalChild {
 						Ok(value) => value,
 						Err(error) => {
 							let _ = events.send(Err(resource_fault("spill_output", error)));
-							return false;
+							return RunCellDisposition::Drop;
 						},
 					};
-					let _ = events.send(Ok(RunEvent::Completed(RunCompletion {
+					let completion = RunCompletion {
 						status,
 						result,
 						display_outputs,
@@ -700,8 +758,26 @@ impl EvalChild {
 						spilled_output: spilled.or(spilled_output),
 						total_lines: total_lines.max(spill_total_lines),
 						total_bytes: total_bytes.max(spill_total_bytes),
-					})));
-					return true;
+					};
+					if matches!(completion.status.outcome, CellOutcome::Cancelled) {
+						let kernel_alive = self.is_alive();
+						if should_retry_dead_kernel_cancellation(
+							completion.status.outcome,
+							cancelled.is_cancelled(),
+							kernel_alive,
+							retry_dead_cancellation,
+						) {
+							return RunCellDisposition::RetryDeadCancellation(completion);
+						}
+						let _ = events.send(Ok(RunEvent::Completed(completion)));
+						return if kernel_alive {
+							RunCellDisposition::Keep
+						} else {
+							RunCellDisposition::Drop
+						};
+					}
+					let _ = events.send(Ok(RunEvent::Completed(completion)));
+					return RunCellDisposition::Keep;
 				},
 				ChildFrame::BridgeCall { run_id: actual, request_id, token, name, args }
 					if actual == run_id && token == self.token =>
@@ -718,7 +794,7 @@ impl EvalChild {
 							.is_err()
 							{
 								needs_reset.store(true, Ordering::Release);
-								return false;
+								return RunCellDisposition::Drop;
 							}
 							continue;
 						},
@@ -732,7 +808,7 @@ impl EvalChild {
 							.is_err()
 							{
 								needs_reset.store(true, Ordering::Release);
-								return false;
+								return RunCellDisposition::Drop;
 							}
 							continue;
 						},
@@ -752,7 +828,7 @@ impl EvalChild {
 								let _ = events.send(Ok(RunEvent::Completed(cancelled_completion(
 									elapsed_ms(started),
 								))));
-								return false;
+								return RunCellDisposition::Drop;
 							},
 							event = progress_rx.recv_async() => {
 								let Ok(event) = event else {
@@ -766,7 +842,7 @@ impl EvalChild {
 									event,
 								}).await.is_err() {
 									needs_reset.store(true, Ordering::Release);
-									return false;
+									return RunCellDisposition::Drop;
 								}
 							},
 							result = &mut call => break result,
@@ -788,7 +864,7 @@ impl EvalChild {
 						let _ = events.send(Err(Fault::SessionLost {
 							message: sf!("Python eval child exited during a host bridge response",),
 						}));
-						return false;
+						return RunCellDisposition::Drop;
 					}
 				},
 				ChildFrame::Fatal { message } => {
@@ -801,7 +877,7 @@ impl EvalChild {
 						message: sf!("Python eval child sent an invalid or out-of-order frame",),
 					}));
 
-					return false;
+					return RunCellDisposition::Drop;
 				},
 			}
 		}
@@ -1998,6 +2074,24 @@ mod tests {
 			validate_parent_identity(parent.saturating_add(1)),
 			Err(ProcessError::InvalidParentIdentity)
 		));
+	}
+
+	#[test]
+	fn dead_kernel_cancellation_retries_only_without_caller_abort_and_only_once() {
+		assert!(should_retry_dead_kernel_cancellation(CellOutcome::Cancelled, false, false, true,));
+		for (outcome, caller_cancelled, kernel_alive, retry_available) in [
+			(CellOutcome::Complete, false, false, true),
+			(CellOutcome::Cancelled, true, false, true),
+			(CellOutcome::Cancelled, false, true, true),
+			(CellOutcome::Cancelled, false, false, false),
+		] {
+			assert!(!should_retry_dead_kernel_cancellation(
+				outcome,
+				caller_cancelled,
+				kernel_alive,
+				retry_available,
+			));
+		}
 	}
 
 	#[test]
