@@ -69,7 +69,7 @@ pub use components::{
 	DiffPatchTarget, DiffSelection, DiffTarget, DiffWhitespaceMode, ViewMode,
 };
 pub use context::{Appearance, Charset, Graphics, Grid, JamoWidth, Theme, UiContext};
-pub use debug::{FramePngError, frame_png, frame_text, respond_debug_query};
+pub use debug::{FramePngError, frame_ansi, frame_png, frame_text, respond_debug_query};
 pub use editcore::{
 	BufferOutcome, Command, CommandArgument, CompletionEdit, EditBuffer, EditOutcome, Editor,
 	EditorCompletion, EditorCompletion as Completion, EditorOptions, Picker, PickerRow,

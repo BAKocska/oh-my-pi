@@ -52,11 +52,11 @@ use omp_core::Str;
 use parking_lot::Mutex;
 
 use crate::{
-	frame::Frame,
+	frame::{CellContent, Frame, Style},
 	input::{InputEvent, Key, Mouse, MouseButton, MouseReport},
-	pump,
+	kitty, pump,
 	pump::{DebugOp, DebugQuery, TerminalEvent},
-	terminal, test_support,
+	renderer, terminal, test_support,
 };
 
 /// Environment variable naming the debug socket path.
@@ -137,6 +137,64 @@ pub fn frame_text(frame: &Frame) -> String {
 		text.push_str(&test_support::frame_row_text(frame, row));
 	}
 	text
+}
+/// Projects one painted frame to ANSI-styled terminal text.
+///
+/// Rows use the renderer's SGR encoding, are right-trimmed past the last
+/// visible or styled cell, and the output ends with a full style reset, so it
+/// pastes cleanly into any terminal or capture file.
+pub fn frame_ansi(frame: &Frame) -> String {
+	let mut output = String::new();
+	for row in 0..frame.size().height {
+		if row != 0 {
+			output.push('\n');
+		}
+		let mut end = 0;
+		for x in 0..frame.size().width {
+			let cell = frame.cell(x, row);
+			if cell.style().without_link() != Style::default()
+				|| !matches!(cell.content(), CellContent::Blank | CellContent::Continuation)
+			{
+				end = x + 1;
+			}
+		}
+		let mut active = Style::default();
+		renderer::emit_style(&mut output, active);
+		let mut x = 0;
+		while x < end {
+			let cell = frame.cell(x, row);
+			match cell.content() {
+				CellContent::Blank => {
+					set_ansi_style(&mut output, &mut active, cell.style().without_link());
+					output.push(' ');
+					x += 1;
+				},
+				CellContent::Grapheme { text, width } => {
+					set_ansi_style(&mut output, &mut active, cell.style().without_link());
+					output.push_str(text);
+					x = x.saturating_add((*width).max(1));
+				},
+				CellContent::Image { id, row: img_row, col, rows, cols } => {
+					let (placeholder, style) =
+						kitty::placeholder_cell(*id, *img_row, *col, *rows, *cols);
+					set_ansi_style(&mut output, &mut active, style);
+					output.push_str(&placeholder);
+					x += 1;
+				},
+				CellContent::Continuation => x += 1,
+			}
+		}
+	}
+	renderer::emit_style(&mut output, Style::default());
+	output
+}
+
+/// Switches the active SGR state when the next cell's style differs.
+fn set_ansi_style(output: &mut String, active: &mut Style, style: Style) {
+	if style != *active {
+		renderer::emit_style(output, style);
+		*active = style;
+	}
 }
 
 /// Rasterizes one painted terminal frame to a native PNG.

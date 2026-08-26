@@ -2348,7 +2348,7 @@ pub fn file_link_target(path: &Path, line: Option<u32>, column: Option<u32>) -> 
 	Some(Str::from(target))
 }
 
-fn emit_style(output: &mut String, style: Style) {
+pub(crate) fn emit_style(output: &mut String, style: Style) {
 	let style = style.without_link();
 	output.push_str(RESET_STYLE);
 	if style == Style::default() {

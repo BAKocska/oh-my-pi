@@ -43,7 +43,9 @@
 //! `bleed` flag extends it behind the frame. Attribute values may
 //! be bare, `'single'`-, or `"double"`-quoted. Bare text between tags is an
 //! implicit Markdown leaf — every Markdown feature works anywhere text
-//! does, and `<text>` is the verbatim escape hatch. Markup owns `<` only
+//! does, and `<text>` is the verbatim escape hatch: no tags, no Markdown,
+//! though HTML character references (`&amp;`, `&lt;`, …) still decode so
+//! producers can embed arbitrary text safely. Markup owns `<` only
 //! for its own known tags outside Markdown code context, so `<em>` HTML,
 //! `<https://x>` autolinks, fences, code spans, math, comments, and
 //! backslash escapes behave exactly as they do inside `<md>`. Inside
@@ -234,8 +236,8 @@ pub fn parse(source: &Str, ctx: &UiContext) -> Result<Cached, ParseError> {
 	parse_with_origin(source, ctx, MarkupOrigin::Core)
 }
 
-/// Parses markup at its trust boundary, retaining unknown elements but refusing
-/// malformed trees.
+/// Parses markup at its trust boundary, retaining unknown elements while
+/// recovering from malformed tags and attributes.
 pub fn parse_with_origin(
 	source: &Str,
 	ctx: &UiContext,
@@ -430,7 +432,7 @@ impl Parser<'_> {
 				continue;
 			}
 			if is_closing {
-				if closing != Some(name) {
+				if closing != Some(name) && (restricted || self.fragment) {
 					return Err(ParseError {
 						message: format!(
 							"closing </{name}> does not match open <{}>",
@@ -440,7 +442,16 @@ impl Parser<'_> {
 					});
 				}
 				self.add_text(&mut parts, parent_tag, parent_props, segment_start, at, indent);
-				return Ok((parts, close + 1));
+				if closing == Some(name) {
+					return Ok((parts, close + 1));
+				}
+				if closing.is_some() {
+					return Ok((parts, at));
+				}
+				at = close + 1;
+				segment_start = at;
+				fence = FenceScan::segment(indent);
+				continue;
 			}
 			self.add_text(&mut parts, parent_tag, parent_props, segment_start, at, indent);
 			let (part, next) = self.parse_element(at, close, restricted, parent_props)?;
@@ -449,7 +460,7 @@ impl Parser<'_> {
 			segment_start = at;
 			fence = FenceScan::segment(indent);
 		}
-		if closing.is_some() {
+		if closing.is_some() && (restricted || self.fragment) {
 			return Err(ParseError {
 				message: format!("unclosed <{}> tag", closing.unwrap_or_default()),
 				at:      self.src.len(),
@@ -477,7 +488,8 @@ impl Parser<'_> {
 				at,
 			});
 		}
-		let mut props = apply_attrs(attrs, at, self.source, self.ctx, inherited)?;
+		let mut props =
+			apply_attrs(attrs, at, self.source, self.ctx, inherited, !self.fragment && !restricted)?;
 		let tag = self.source.slice_ref(name);
 		let name = tag.as_str();
 		if self.fragment && (props.contains(Prop::Id) || props.contains(Prop::When)) {
@@ -520,7 +532,7 @@ impl Parser<'_> {
 				&['\n']
 			};
 			let body = self.src[body_start..end].trim_matches(trim);
-			let body = self.source.slice_ref(body);
+			let body = decode_raw_body(self.source, body);
 			let part = finish_element(name, props, Vec::new(), body, at)?;
 			return Ok((part, (end + closer.len()).min(self.src.len())));
 		}
@@ -533,16 +545,18 @@ impl Parser<'_> {
 			};
 			let end = self.src[body_start..]
 				.find(closer)
-				.map(|offset| body_start + offset)
-				.ok_or_else(|| ParseError {
+				.map(|offset| body_start + offset);
+			if end.is_none() && (restricted || self.fragment) {
+				return Err(ParseError {
 					message: format!("unclosed <{name}> tag"),
 					at:      self.src.len(),
-				})?;
-			let body = self
-				.source
-				.slice_ref(self.src[body_start..end].trim_matches(['\n', '\r']));
+				});
+			}
+			let end = end.unwrap_or(self.src.len());
+			let body =
+				decode_raw_body(self.source, self.src[body_start..end].trim_matches(['\n', '\r']));
 			let part = finish_element(name, props, Vec::new(), body, at)?;
-			return Ok((part, end + closer.len()));
+			return Ok((part, (end + closer.len()).min(self.src.len())));
 		}
 		if name == "md" {
 			return self.parse_md(body_start, indent, props, true);
@@ -583,9 +597,8 @@ impl Parser<'_> {
 		let child_props = child_props(props);
 		loop {
 			let event = self.next_md_event(segment_start, indent, require_close)?;
-			let (end, element) = match event {
-				MdEvent::Close(at) | MdEvent::End(at) => (at, None),
-				MdEvent::Element(at, close) => (at, Some((at, close))),
+			let end = match &event {
+				MdEvent::Close(at) | MdEvent::End(at) | MdEvent::Element(at, _) => *at,
 			};
 			let body = self.src[segment_start..end].trim_matches('\n');
 			let text = dedent(self.source, body, indent);
@@ -595,17 +608,17 @@ impl Parser<'_> {
 			} else {
 				embedded.push(markdown_part(text, child_props.clone()));
 			}
-			let Some((at, close)) = element else {
-				let next = if require_close {
-					end + "</md>".len()
-				} else {
-					end
-				};
-				return Ok((first_text, embedded, next));
-			};
-			let (part, next) = self.parse_element(at, close, true, &child_props)?;
-			embedded.push(part.into_cached("md")?);
-			segment_start = next;
+			match event {
+				MdEvent::Close(_) => {
+					return Ok((first_text, embedded, end + "</md>".len()));
+				},
+				MdEvent::End(_) => return Ok((first_text, embedded, end)),
+				MdEvent::Element(at, close) => {
+					let (part, next) = self.parse_element(at, close, true, &child_props)?;
+					embedded.push(part.into_cached("md")?);
+					segment_start = next;
+				},
+			}
 		}
 	}
 
@@ -675,11 +688,7 @@ impl Parser<'_> {
 				line_end
 			};
 		}
-		if require_close {
-			Err(ParseError { message: "unclosed <md> tag".into(), at: self.src.len() })
-		} else {
-			Ok(MdEvent::End(self.src.len()))
-		}
+		Ok(MdEvent::End(self.src.len()))
 	}
 
 	fn add_text(
@@ -734,6 +743,18 @@ impl Parser<'_> {
 		}
 	}
 }
+/// Slices a raw-text body zero-copy, decoding HTML character references —
+/// raw-text elements suppress markup, not character references, so producers
+/// embed untrusted text with standard entity escaping (matching HTML).
+fn decode_raw_body(source: &Str, body: &str) -> Str {
+	if !body.contains('&') {
+		return source.slice_ref(body);
+	}
+	let mut decoded = StrMut::with_capacity(body.len());
+	markdown::decode_entities(body, &mut decoded);
+	decoded.freeze()
+}
+
 /// Removes up to `indent` leading spaces from every line, so a body's
 /// Markdown indentation is measured from the tag that encloses it and a
 /// pretty-printed document does not read as a code block.
@@ -1127,7 +1148,6 @@ fn is_custom_tag_at(src: &str, name: &str, at: usize, close: usize) -> bool {
 		&& !is_markdown_html_tag(name)
 		&& (src[at..=close].trim_end().ends_with("/>") || has_matching_close(&src[close + 1..], name))
 }
-
 fn stray_md_close(at: usize) -> ParseError {
 	ParseError { message: "closing </md> does not match open <nothing>".into(), at }
 }
@@ -1661,19 +1681,25 @@ fn apply_attrs(
 	source: &Str,
 	ctx: &UiContext,
 	inherited: &Props,
+	recover: bool,
 ) -> Result<Props, ParseError> {
 	let mut props = inherited.clone();
 	for (key, value) in (AttrIter { rest: attrs }) {
 		if matches!(key, "gradient" | "dir") {
+			if recover {
+				continue;
+			}
 			return Err(ParseError {
 				message: format!("{key} was replaced by fg=/bg= and angle="),
 				at,
 			});
 		}
 		if value.is_none() && ctx.theme.token(key).is_some() {
-			props
-				.try_set(Prop::Fg, PropValue::Token(source.slice_ref(key)))
-				.map_err(|error| bad(key, &error.value, at))?;
+			if let Err(error) = props.try_set(Prop::Fg, PropValue::Token(source.slice_ref(key)))
+				&& !recover
+			{
+				return Err(bad(key, &error.value, at));
+			}
 		} else if let Some(prop) = Props::prop_of(key) {
 			let value = match (prop, value) {
 				(Prop::Title, Some(value)) => PropValue::Str(resolve_icons(ctx.charset, source, value)),
@@ -1681,9 +1707,11 @@ fn apply_attrs(
 				(_, Some(value)) => PropValue::Str(source.slice_ref(value)),
 				(_, None) => PropValue::Bool(true),
 			};
-			props
-				.try_set(prop, value)
-				.map_err(|error| bad(key, &error.value, at))?;
+			if let Err(error) = props.try_set(prop, value)
+				&& !recover
+			{
+				return Err(bad(key, &error.value, at));
+			}
 		} else {
 			let value =
 				value.map_or(PropValue::Bool(true), |value| PropValue::Str(source.slice_ref(value)));
@@ -1747,14 +1775,30 @@ mod tests {
 	}
 
 	#[test]
-	fn well_known_bad_values_are_parse_errors() {
+	fn well_known_bad_values_are_ignored() {
 		let ctx = UiContext::default();
-		assert!(parse(&Str::new("<text fg=nosuch>x</text>"), &ctx).is_err());
-		assert!(parse(&Str::new("<text fg=\"rgb(300,0)\">x</text>"), &ctx).is_err());
-		assert!(parse(&Str::new("<text fg=💥>x</text>"), &ctx).is_err());
-		assert!(parse(&Str::new("<text fg=\"rgb💥(1,2,3)\">x</text>"), &ctx).is_err());
-		assert!(parse(&Str::new("<text fg=#héx>x</text>"), &ctx).is_err());
+		for source in [
+			"<text fg=nosuch>x</text>",
+			"<text fg=\"rgb(300,0)\">x</text>",
+			"<text fg=💥>x</text>",
+			"<text fg=\"rgb💥(1,2,3)\">x</text>",
+			"<text fg=#héx>x</text>",
+		] {
+			let root = parse(&Str::new(source), &ctx).unwrap();
+			assert!(!child(&root, 0).comp().props().contains(Prop::Fg), "{source}");
+			let ui = Ui::from_markup(source, 20, UiContext::default()).unwrap();
+			assert_eq!(frame_row_text(ui.frame(), 0), "x");
+		}
 	}
+	#[test]
+	fn invalid_attributes_do_not_block_later_attributes() {
+		let ctx = UiContext::default();
+		let root = parse(&Str::new("<text fg=nosuch bold>x</text>"), &ctx).unwrap();
+		let props = child(&root, 0).comp().props();
+		assert!(!props.contains(Prop::Fg));
+		assert_eq!(props.style(&ctx.theme), Style::new().bold());
+	}
+
 	#[test]
 	fn long_semantic_color_aliases_parse_everywhere() {
 		let ctx = UiContext::default();
@@ -1880,7 +1924,8 @@ mod tests {
 		);
 		assert_eq!(pre.comp().props().angle(), 45);
 		for source in ["<pre gradient=\"accent..info\">x</pre>", "<pre dir=h>x</pre>"] {
-			assert!(parse(&Str::new(source), &ctx).is_err(), "{source}");
+			let root = parse(&Str::new(source), &ctx).unwrap();
+			assert!(!child(&root, 0).comp().props().contains(Prop::Fg), "{source}");
 		}
 	}
 
@@ -1894,6 +1939,80 @@ mod tests {
 
 		let literal = parse(&Str::new("before <panel> after"), &ctx).unwrap();
 		assert_eq!(literal.comp().children().len(), 1);
+	}
+
+	#[test]
+	fn mismatched_close_implicitly_closes_open_elements() {
+		let ctx = UiContext::default();
+		let root =
+			parse(&Str::new("<col><box><text>inside</text></col><text>after</text>"), &ctx).unwrap();
+		let col = child(&root, 0);
+		assert_eq!(col.comp().children().len(), 1);
+		assert_eq!(child(col, 0).comp().children().len(), 1);
+		assert_eq!(root.comp().children().len(), 2);
+		let ui = Ui::from_markup(
+			"<col><box><text>inside</text></col><text>after</text>",
+			20,
+			UiContext::default(),
+		)
+		.unwrap();
+		let rendered = (0..ui.height())
+			.map(|row| frame_row_text(ui.frame(), row))
+			.collect::<Vec<_>>()
+			.join("\n");
+		assert!(rendered.contains("inside"));
+		assert!(rendered.contains("after"));
+	}
+
+	#[test]
+	fn unclosed_named_tags_auto_close_at_end_of_input() {
+		for source in ["<text>inside", "<box><text>inside</text>", "<md>inside"] {
+			let ui = Ui::from_markup(source, 20, UiContext::default()).unwrap();
+			let rendered = (0..ui.height())
+				.map(|row| frame_row_text(ui.frame(), row))
+				.collect::<Vec<_>>()
+				.join("\n");
+			assert!(rendered.contains("inside"), "{source}");
+		}
+	}
+
+	#[test]
+	fn interactive_markup_inside_extension_markdown_is_rejected() {
+		let result = parse_with_origin(
+			&Str::new("<md>\n<button id=unsafe when=active>safe text</button>\n</md>"),
+			&UiContext::default(),
+			MarkupOrigin::Extension,
+		);
+		assert!(result.is_err());
+	}
+
+	#[test]
+	fn dynamic_markdown_rejects_id_and_when() {
+		let result = parse_md_fragment_inheriting(
+			&Str::new("<box id=unsafe when=active><text>safe</text></box>"),
+			&UiContext::default(),
+			&Props::new(),
+		);
+		assert!(result.is_err());
+	}
+
+	#[test]
+	fn stray_closing_tags_are_ignored() {
+		let ui = Ui::from_markup("before</md><text>after</text>", 20, UiContext::default()).unwrap();
+		let rendered = (0..ui.height())
+			.map(|row| frame_row_text(ui.frame(), row))
+			.collect::<Vec<_>>()
+			.join("\n");
+		assert!(rendered.contains("before"));
+		assert!(rendered.contains("after"));
+		assert!(!rendered.contains("</md>"));
+
+		let fragment = parse_md_fragment_inheriting(
+			&Str::new("before</md>after"),
+			&UiContext::default(),
+			&Props::new(),
+		);
+		assert!(fragment.is_err());
 	}
 
 	#[test]

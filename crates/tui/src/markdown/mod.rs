@@ -1668,7 +1668,9 @@ fn append_quote_prefix(output: &mut StrMut, depth: usize) {
 	}
 }
 
-fn decode_entities(text: &str, output: &mut StrMut) {
+/// Decodes HTML character references (`&amp;`, `&#x41;`, …), leaving unknown
+/// entities intact. Shared with raw-text markup bodies (`<text>`, `<pre>`).
+pub(crate) fn decode_entities(text: &str, output: &mut StrMut) {
 	let mut cursor = 0;
 	while let Some(relative) = text[cursor..].find('&') {
 		let at = cursor + relative;
