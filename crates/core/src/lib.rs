@@ -20,6 +20,8 @@ pub mod cow_bytes;
 pub mod dirs;
 pub mod display_time;
 pub mod encoding;
+/// Filesystem publication helpers.
+pub mod fs;
 pub mod hash32;
 pub mod location;
 pub mod open;
@@ -49,7 +51,7 @@ pub use location::{
 	AgentUrl, ArtifactAddress, ArtifactUrl, ClientPath, EnvPath, HistoryUrl, LocationError,
 	ToolPath, WorkspaceUri,
 };
-pub use path::NormalizePath;
+pub use path::{NormalizePath, shorten_home_path};
 pub use phase::{ActivateReason, InvocationPhase, LifecyclePhase, Point, PointSet, RestartReason};
 pub use principal::{
 	ArtifactDigest, ArtifactDigestError, CredentialTier, Principal, Provenance, RemotePrincipal,

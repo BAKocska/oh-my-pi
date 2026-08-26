@@ -357,20 +357,46 @@ impl GitModel {
 		let old = self.resolve_lfs(old.bytes).await?;
 		let new = self.resolve_lfs(new.bytes).await?;
 		let media = media_format(path, &old, &new);
+		let (old, new) = if media.as_deref() == Some("svg") {
+			tokio::join!(rasterize_svg_side(path, old), rasterize_svg_side(path, new))
+		} else {
+			(old, new)
+		};
 		let binary = is_binary(&old.bytes) || is_binary(&new.bytes);
+		let binary_asset = media.as_deref() == Some("binary");
+		let old_placeholder = old
+			.unavailable
+			.clone()
+			.or_else(|| (binary_asset && !old.bytes.is_empty()).then(binary_placeholder));
+		let new_placeholder = new
+			.unavailable
+			.clone()
+			.or_else(|| (binary_asset && !new.bytes.is_empty()).then(binary_placeholder));
 		let (old_text, new_text, old_bytes, new_bytes) = if media.is_some() {
 			(
 				Str::new_static(""),
 				Str::new_static(""),
-				(!old.bytes.is_empty() && !old.lfs_missing).then_some(old.bytes),
-				(!new.bytes.is_empty() && !new.lfs_missing).then_some(new.bytes),
+				(!binary_asset && !old.bytes.is_empty() && old.unavailable.is_none())
+					.then_some(old.bytes),
+				(!binary_asset && !new.bytes.is_empty() && new.unavailable.is_none())
+					.then_some(new.bytes),
 			)
 		} else if binary {
 			(Str::new_static(""), Str::new_static(""), None, None)
 		} else {
 			(decode_utf8(&old.bytes).to_str(), decode_utf8(&new.bytes).to_str(), None, None)
 		};
-		Ok(GitFileContents { old_text, new_text, binary, too_large, old_bytes, new_bytes, media })
+		Ok(GitFileContents {
+			old_text,
+			new_text,
+			binary,
+			too_large,
+			old_bytes,
+			new_bytes,
+			media,
+			old_placeholder,
+			new_placeholder,
+		})
 	}
 
 	async fn stream_side(
@@ -476,16 +502,21 @@ impl GitModel {
 		Ok(StreamedSide { bytes: bytes.freeze(), too_large: false })
 	}
 
-	/// Stages one file, or every change when no path is supplied.
+	/// Stages exact files, or every change when no path list is supplied.
 	pub async fn stage(
 		&self,
-		path: Option<&str>,
+		paths: Option<&[Str]>,
 		cancel: &CancellationToken,
 	) -> Result<Str, GitModelError> {
-		match path {
-			Some(path) => {
-				self.mutation.stage_files(&[path], cancel).await?;
-				Ok(omp_core::sf!("Staged {path}"))
+		match paths {
+			Some(paths) => {
+				let path_refs = paths.iter().map(Str::as_str).collect::<Vec<_>>();
+				self.mutation.stage_files(&path_refs, cancel).await?;
+				Ok(if let [path] = paths {
+					omp_core::sf!("Staged {path}")
+				} else {
+					omp_core::sf!("Staged {} files", paths.len())
+				})
 			},
 			None => {
 				self.mutation.stage_all(cancel).await?;
@@ -494,16 +525,25 @@ impl GitModel {
 		}
 	}
 
-	/// Unstages one file, or the complete index when no path is supplied.
+	/// Unstages exact files, or the complete index when no path list is
+	/// supplied.
 	pub async fn unstage(
 		&self,
-		path: Option<&str>,
+		paths: Option<&[Str]>,
 		cancel: &CancellationToken,
 	) -> Result<Str, GitModelError> {
-		match path {
-			Some(path) => {
-				self.mutation.reset_index_entries(&[path], cancel).await?;
-				Ok(omp_core::sf!("Unstaged {path}"))
+		match paths {
+			Some(paths) => {
+				let path_refs = paths.iter().map(Str::as_str).collect::<Vec<_>>();
+				self
+					.mutation
+					.reset_index_entries(&path_refs, cancel)
+					.await?;
+				Ok(if let [path] = paths {
+					omp_core::sf!("Unstaged {path}")
+				} else {
+					omp_core::sf!("Unstaged {} files", paths.len())
+				})
 			},
 			None => {
 				self.mutation.unstage_all(cancel).await?;
@@ -623,10 +663,10 @@ impl GitModel {
 
 	async fn resolve_lfs(&self, bytes: Bytes) -> Result<LoadedSide, GitModelError> {
 		let Some(pointer) = parse_lfs_pointer(&bytes) else {
-			return Ok(LoadedSide { bytes, lfs_missing: false });
+			return Ok(LoadedSide { bytes, unavailable: None });
 		};
 		if pointer.size > MAX_FILE_BYTES {
-			return Ok(LoadedSide { bytes, lfs_missing: true });
+			return Ok(LoadedSide { bytes, unavailable: Some(lfs_placeholder(&pointer.oid)) });
 		}
 		let path = self
 			.repository
@@ -639,14 +679,14 @@ impl GitModel {
 		let object = match tokio::fs::read(&path).await {
 			Ok(object) => object,
 			Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-				return Ok(LoadedSide { bytes, lfs_missing: true });
+				return Ok(LoadedSide { bytes, unavailable: Some(lfs_placeholder(&pointer.oid)) });
 			},
 			Err(source) => return Err(GitModelError::LfsIo { path, source }),
 		};
 		if u64::try_from(object.len()).ok() != Some(pointer.size) {
-			return Ok(LoadedSide { bytes, lfs_missing: true });
+			return Ok(LoadedSide { bytes, unavailable: Some(lfs_placeholder(&pointer.oid)) });
 		}
-		Ok(LoadedSide { bytes: Bytes::from(object), lfs_missing: false })
+		Ok(LoadedSide { bytes: Bytes::from(object), unavailable: None })
 	}
 }
 
@@ -811,7 +851,7 @@ fn path_looks_like_media(path: &str) -> bool {
 		.is_some_and(|extension| {
 			matches!(
 				extension.to_ascii_lowercase().as_str(),
-				"svg" | "svgz" | "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp"
+				"svg" | "svgz" | "png" | "jpg" | "jpeg" | "gif" | "webp"
 			)
 		})
 }
@@ -827,7 +867,42 @@ fn could_be_lfs_pointer(bytes: &[u8]) -> bool {
 
 struct LoadedSide {
 	bytes:       Bytes,
-	lfs_missing: bool,
+	unavailable: Option<Str>,
+}
+
+fn lfs_placeholder(oid: &Str) -> Str {
+	omp_core::sf!("Git LFS object unavailable · sha256:{}…", oid.slice(..oid.len().min(12)))
+}
+
+const fn binary_placeholder() -> Str {
+	Str::new_static("Binary object")
+}
+
+async fn rasterize_svg_side(path: &str, mut side: LoadedSide) -> LoadedSide {
+	if side.bytes.is_empty() || side.unavailable.is_some() {
+		return side;
+	}
+	let extension = Path::new(path)
+		.extension()
+		.and_then(|extension| extension.to_str());
+	let gzip = extension.is_some_and(|extension| extension.eq_ignore_ascii_case("svgz"));
+	if !gzip
+		&& !extension.is_some_and(|extension| extension.eq_ignore_ascii_case("svg"))
+		&& !looks_like_svg(&side.bytes)
+	{
+		return side;
+	}
+	let source = side.bytes.clone();
+	match tokio::task::spawn_blocking(move || omp_tools::read::image::rasterize_svg(&source, gzip))
+		.await
+	{
+		Ok(Ok(png)) => side.bytes = png,
+		Ok(Err(_)) | Err(_) => {
+			side.bytes = Bytes::new();
+			side.unavailable = Some(Str::new_static("SVG preview unavailable"));
+		},
+	}
+	side
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -863,29 +938,37 @@ fn parse_lfs_pointer(bytes: &[u8]) -> Option<LfsPointer> {
 }
 
 fn media_format(path: &str, old: &LoadedSide, new: &LoadedSide) -> Option<Str> {
-	let visible_side =
-		(!old.bytes.is_empty() && !old.lfs_missing) || (!new.bytes.is_empty() && !new.lfs_missing);
-	if !visible_side {
+	let visible_side = (!old.bytes.is_empty() && old.unavailable.is_none())
+		|| (!new.bytes.is_empty() && new.unavailable.is_none());
+	let missing_side = old.unavailable.is_some() || new.unavailable.is_some();
+	if !visible_side && !missing_side {
 		return None;
 	}
 	if looks_like_svg(&old.bytes) || looks_like_svg(&new.bytes) {
 		return Some(Str::new_static("svg"));
 	}
-	let extension = Path::new(path).extension()?.to_str()?.to_ascii_lowercase();
+	let Some(extension) = Path::new(path)
+		.extension()
+		.and_then(|extension| extension.to_str())
+		.map(str::to_ascii_lowercase)
+	else {
+		return missing_side.then(|| Str::new_static("binary"));
+	};
 	let (token, format) = match extension.as_str() {
-		"svg" => return Some(Str::new_static("svg")),
+		"svg" | "svgz" => return Some(Str::new_static("svg")),
 		"png" => ("png", image::ImageFormat::Png),
 		"jpg" | "jpeg" => ("jpeg", image::ImageFormat::Jpeg),
 		"gif" => ("gif", image::ImageFormat::Gif),
 		"webp" => ("webp", image::ImageFormat::WebP),
-		"bmp" => ("bmp", image::ImageFormat::Bmp),
-		_ => return None,
+		_ => return missing_side.then(|| Str::new_static("binary")),
 	};
-	(has_image_format(old, format) || has_image_format(new, format)).then(|| token.to_str())
+	(missing_side || has_image_format(old, format) || has_image_format(new, format))
+		.then(|| token.to_str())
 }
 
 fn has_image_format(side: &LoadedSide, expected: image::ImageFormat) -> bool {
-	!side.lfs_missing && image::guess_format(&side.bytes).is_ok_and(|format| format == expected)
+	side.unavailable.is_none()
+		&& image::guess_format(&side.bytes).is_ok_and(|format| format == expected)
 }
 
 fn looks_like_svg(bytes: &[u8]) -> bool {
@@ -1170,14 +1253,61 @@ mod tests {
 			.unwrap();
 		assert_eq!(contents.media, Some(Str::new_static("png")));
 		assert_eq!(contents.new_bytes.as_deref(), Some(&object[..]));
+		assert!(contents.new_placeholder.is_none());
+
+		fs::remove_file(object_dir.join(&oid)).expect("remove LFS object");
+		let missing = model
+			.contents(GitArea::Staged, "image.png", None, &cancel)
+			.await
+			.unwrap();
+		assert_eq!(missing.media, Some(Str::new_static("png")));
+		assert!(missing.new_bytes.is_none());
+		assert!(
+			missing
+				.new_placeholder
+				.is_some_and(|message| message.contains("Git LFS object unavailable"))
+		);
+	}
+
+	#[tokio::test]
+	async fn staged_svg_is_rasterized_for_terminal_preview() {
+		let fixture = tempfile::tempdir().expect("temporary repository");
+		fixture_git(fixture.path(), &["init", "-b", "main"]);
+		fixture_git(fixture.path(), &["config", "user.name", "OMP Test"]);
+		fixture_git(fixture.path(), &["config", "user.email", "omp@example.invalid"]);
+		fs::write(fixture.path().join("seed.txt"), "seed\n").expect("seed file");
+		fixture_git(fixture.path(), &["add", "seed.txt"]);
+		fixture_git(fixture.path(), &["commit", "-m", "seed"]);
+		fs::write(
+			fixture.path().join("image.svg"),
+			r#"<svg xmlns="http://www.w3.org/2000/svg" width="12" height="7"><rect width="12" height="7" fill="red"/></svg>"#,
+		)
+		.expect("SVG file");
+		fixture_git(fixture.path(), &["add", "image.svg"]);
+
+		let cancel = CancellationToken::new();
+		let mut model = GitModel::open(fixture.path(), None, &cancel).await.unwrap();
+		let _ = model.refresh(&cancel).await.unwrap();
+		let contents = model
+			.contents(GitArea::Staged, "image.svg", None, &cancel)
+			.await
+			.unwrap();
+		assert_eq!(contents.media, Some(Str::new_static("svg")));
+		assert!(
+			contents
+				.new_bytes
+				.as_deref()
+				.is_some_and(|bytes| bytes.starts_with(b"\x89PNG\r\n\x1a\n"))
+		);
+		assert!(contents.new_placeholder.is_none());
 	}
 
 	#[test]
 	fn media_sniff_classifies_extensions_svg_content_and_binary_headers() {
-		let empty = || LoadedSide { bytes: Bytes::new(), lfs_missing: false };
+		let empty = || LoadedSide { bytes: Bytes::new(), unavailable: None };
 		let side = |bytes: &'static [u8]| LoadedSide {
 			bytes:       Bytes::from_static(bytes),
-			lfs_missing: false,
+			unavailable: None,
 		};
 		assert_eq!(
 			media_format("art.JPG", &empty(), &side(b"\xff\xd8\xff")),

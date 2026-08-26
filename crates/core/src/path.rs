@@ -15,6 +15,44 @@
 //! ```
 
 use std::path::{Component, Path, PathBuf};
+/// Shortens an absolute display path under `home` to `~`.
+///
+/// Windows drive and UNC paths compare the home prefix case-insensitively and
+/// normalize the retained suffix to forward slashes. Other path styles retain
+/// case-sensitive prefix semantics.
+pub fn shorten_home_path(path: &str, home: &str) -> Option<String> {
+	if home.is_empty() || path.len() < home.len() {
+		return None;
+	}
+	let windows_style = is_windows_absolute(home);
+	let prefix = path.as_bytes().get(..home.len())?;
+	let matches = if windows_style {
+		path
+			.get(..home.len())?
+			.chars()
+			.flat_map(char::to_lowercase)
+			.eq(home.chars().flat_map(char::to_lowercase))
+	} else {
+		prefix == home.as_bytes()
+	};
+	if !matches {
+		return None;
+	}
+	let suffix = path.get(home.len()..)?;
+	if !suffix.is_empty() && !suffix.starts_with('/') && !suffix.starts_with('\\') {
+		return None;
+	}
+	Some(format!("~{}", suffix.replace('\\', "/")))
+}
+
+fn is_windows_absolute(path: &str) -> bool {
+	let bytes = path.as_bytes();
+	(bytes.len() >= 3
+		&& bytes[0].is_ascii_alphabetic()
+		&& bytes[1] == b':'
+		&& matches!(bytes[2], b'/' | b'\\'))
+		|| path.starts_with(r"\\")
+}
 
 /// Extends [`Path`] with purely lexical normalization.
 pub trait NormalizePath {
@@ -86,11 +124,19 @@ impl NormalizePath for Path {
 mod tests {
 	use std::path::{Path, PathBuf};
 
-	use super::NormalizePath as _;
+	use super::{NormalizePath as _, shorten_home_path};
 
 	#[test]
 	fn collapses_dot_dotdot_and_trailing_separators() {
 		assert_eq!(Path::new("alpha/./beta/../gamma//").normalize(), Path::new("alpha/gamma"));
+	}
+	#[test]
+	fn shortens_windows_home_case_insensitively_at_component_boundary() {
+		assert_eq!(
+			shorten_home_path(r"c:\users\alice\projects\demo", r"C:\Users\Alice",).as_deref(),
+			Some("~/projects/demo")
+		);
+		assert_eq!(shorten_home_path(r"C:\Users\Alice2\demo", r"C:\Users\Alice"), None);
 	}
 
 	#[cfg(unix)]

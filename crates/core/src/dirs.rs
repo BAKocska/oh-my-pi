@@ -55,6 +55,16 @@ pub fn native_directories(home: &Path) -> NativeDirectories {
 }
 
 static SELECTED_PROFILE: OnceLock<Option<Str>> = OnceLock::new();
+/// Returns the process owner's home directory from the platform environment.
+///
+/// `HOME` is preferred for Unix-compatible environments. `USERPROFILE`
+/// provides the native Windows fallback.
+pub fn home_dir() -> Option<PathBuf> {
+	env::var_os("HOME")
+		.filter(|value| !value.is_empty())
+		.or_else(|| env::var_os("USERPROFILE").filter(|value| !value.is_empty()))
+		.map(PathBuf::from)
+}
 
 /// Publishes the bootstrap-selected profile without mutating the environment.
 ///
@@ -75,8 +85,9 @@ pub fn selected_profile() -> Option<&'static str> {
 /// Failure to resolve the owner's private data directory.
 #[derive(Clone, Copy, Debug, Error)]
 pub enum DataDirError {
-	/// Neither an explicit path, `OMP_DATA_DIR`, nor `HOME` was available.
-	#[error("HOME or OMP_DATA_DIR must be set")]
+	/// Neither an explicit path, `OMP_DATA_DIR`, `HOME`, nor `USERPROFILE` was
+	/// available.
+	#[error("HOME, USERPROFILE, or OMP_DATA_DIR must be set")]
 	HomeUnset,
 }
 
@@ -95,8 +106,8 @@ pub fn data_dir(explicit: Option<PathBuf>) -> Result<PathBuf, DataDirError> {
 	let base = if let Some(path) = env::var_os("OMP_DATA_DIR").filter(|value| !value.is_empty()) {
 		PathBuf::from(path)
 	} else {
-		let home = env::var_os("HOME").ok_or(DataDirError::HomeUnset)?;
-		native_directories(&PathBuf::from(home)).data
+		let home = home_dir().ok_or(DataDirError::HomeUnset)?;
+		native_directories(&home).data
 	};
 	Ok(selected_profile().map_or(base.clone(), |profile| base.join("profiles").join(profile)))
 }

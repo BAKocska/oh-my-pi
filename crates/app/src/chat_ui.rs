@@ -1372,7 +1372,6 @@ where
 	let submission_state = agent.state().clone();
 	let regime_projection = modes.clone();
 	let (ui_tx, ui_rx) = flume::bounded::<UiCmd>(1);
-	let (error_tx, error_rx) = flume::unbounded::<String>();
 	let (ack_tx, ack_rx) = flume::bounded::<SubmitAck>(1);
 	let (maintenance_tx, maintenance_rx) = flume::unbounded::<MaintenanceEvent>();
 	let maintenance_registry = Arc::clone(&registry);
@@ -1387,10 +1386,9 @@ where
 					interrupted:     summary.interrupted,
 					committed_turns: summary.committed_turns,
 				},
-				Err(error) => {
-					let _ = error_tx.send(format!("Startup resume error: {error}"));
-					SubmitAck { interrupted: false, committed_turns: 0 }
-				},
+				// Failure presentation settles off the `AgentEvent::Failed` bus
+				// event; a caller-side notice would duplicate it.
+				Err(_) => SubmitAck { interrupted: false, committed_turns: 0 },
 			};
 			let _ = ack_tx.send(ack);
 		}
@@ -1404,10 +1402,9 @@ where
 							interrupted:     summary.interrupted,
 							committed_turns: summary.committed_turns,
 						},
-						Err(error) => {
-							let _ = error_tx.send(format!("Submit error: {error}"));
-							SubmitAck { interrupted: false, committed_turns: 0 }
-						},
+						// Failure presentation settles off the `AgentEvent::Failed`
+						// bus event; a caller-side notice would duplicate it.
+						Err(_) => SubmitAck { interrupted: false, committed_turns: 0 },
 					};
 					apply_turn_budget(&submission_state, None);
 					let _ = ack_tx.send(ack);
@@ -1777,9 +1774,6 @@ where
 								).await? {
 									break;
 								}
-							},
-							Ok(message) = error_rx.recv_async() => {
-								send_backend(&backend_tx, BackendEvent::Error(Str::from(message)));
 							},
 							Ok(notice) = advisor_notices.recv_async() => {
 								if let Some(notice) = notice {
@@ -2390,6 +2384,40 @@ async fn stop_mode_regime(
 		},
 	}
 }
+async fn stop_streaming_plan_regime(
+	backend: &flume::Sender<BackendEvent>,
+	control: &omp_agent::ControlSender,
+	modes: &RegimeHandle,
+	abort: &omp_agent::AbortHandle,
+	activation: Str,
+) -> bool {
+	match control.stop_regime_snapshot(activation.clone()).await {
+		Ok((true, records)) => {
+			modes.sync_records(&records);
+			// Abort only after the mode resource is durably released. Any queued
+			// producer that survives the caller abort then starts with the restored
+			// non-plan prompt and toolset.
+			abort.abort();
+			send_backend(
+				backend,
+				BackendEvent::Notice(sf!("Stopped plan activation `{activation}`.")),
+			);
+			true
+		},
+		Ok((false, records)) => {
+			modes.sync_records(&records);
+			send_backend(
+				backend,
+				BackendEvent::Error(sf!("Regime activation `{activation}` is not active.")),
+			);
+			false
+		},
+		Err(error) => {
+			send_backend(backend, BackendEvent::Error(Str::new(error.to_string())));
+			false
+		},
+	}
+}
 
 fn queued_flag(args: &str) -> (&str, bool) {
 	args
@@ -2400,7 +2428,10 @@ fn queued_flag(args: &str) -> (&str, bool) {
 async fn handle_plan_command(
 	backend: &flume::Sender<BackendEvent>,
 	commands: &flume::Sender<UiCmd>,
+	control: &omp_agent::ControlSender,
 	modes: &RegimeHandle,
+	abort: &omp_agent::AbortHandle,
+	turn_active: bool,
 	args: &str,
 ) {
 	let (args, queue) = queued_flag(args.trim());
@@ -2416,12 +2447,23 @@ async fn handle_plan_command(
 				return;
 			}
 			if let Some(activation) = modes.mode_activation() {
-				let _ = stop_mode_regime(backend, commands, "plan", activation).await;
+				if turn_active {
+					let _ = stop_streaming_plan_regime(backend, control, modes, abort, activation).await;
+				} else {
+					let _ = stop_mode_regime(backend, commands, "plan", activation).await;
+				}
 			}
 		},
 		_ if args.starts_with("stop ") => {
 			let activation = Str::new(args.trim_start_matches("stop ").trim());
-			let _ = stop_mode_regime(backend, commands, "plan", activation).await;
+			let active_plan = turn_active
+				&& modes.mode_holder().as_deref() == Some("plan")
+				&& modes.mode_activation().as_ref() == Some(&activation);
+			if active_plan {
+				let _ = stop_streaming_plan_regime(backend, control, modes, abort, activation).await;
+			} else {
+				let _ = stop_mode_regime(backend, commands, "plan", activation).await;
+			}
 		},
 		_ => send_backend(
 			backend,
@@ -3116,22 +3158,6 @@ where
 
 	fn branch_tree(&mut self) -> CommandFuture<'_> {
 		let result = (|| -> miette::Result<Str> {
-			fn render(node: &SessionTree, current: &str, depth: usize, output: &mut String) {
-				for _ in 0..depth {
-					output.push_str("  ");
-				}
-				output.push_str("- `");
-				output.push_str(node.id.as_str());
-				output.push('`');
-				if node.id == current {
-					output.push_str(" ← current");
-				}
-				output.push('\n');
-				for child in &node.children {
-					render(child, current, depth + 1, output);
-				}
-			}
-
 			let root = Path::new(self.state.workspace_root.as_str());
 			let sessions_dir = omp_env::project_state::directory(self.data_dir, root)
 				.into_diagnostic()?
@@ -3153,9 +3179,7 @@ where
 			};
 			let tree = SessionTree::load(&sessions_dir.join(sf!("{root_id}.jsonl").as_str()))
 				.map_err(|error| miette::miette!("{error}"))?;
-			let mut output = String::from("**Session lineage**\n\n");
-			render(&tree, current.0.as_str(), 0, &mut output);
-			Ok(Str::from(output))
+			Ok(Str::from(omp_driver::export::render_lineage(&tree, current.0.as_str())))
 		})();
 		Box::pin(async move { Ok(CommandResult::Consumed(ConsumedResult::status(result?))) })
 	}
@@ -4174,7 +4198,16 @@ where
 
 	fn plan(&mut self, args: Str) -> CommandFuture<'_> {
 		Box::pin(async move {
-			handle_plan_command(self.backend, self.commands_tx, self.modes, args.as_str()).await;
+			handle_plan_command(
+				self.backend,
+				self.commands_tx,
+				self.control,
+				self.modes,
+				self.abort,
+				chat_active(self.state.submit_pending, self.bus.phase()),
+				args.as_str(),
+			)
+			.await;
 			Ok(CommandResult::Consumed(ConsumedResult::silent()))
 		})
 	}
@@ -4722,7 +4755,7 @@ where
 							 redacted provider capture"
 						));
 					}
-					let dump = serde_json::to_string_pretty(&tree).into_diagnostic()?;
+					let dump = omp_driver::export::render_markdown(&tree);
 					send_backend(backend, BackendEvent::CopyToClipboard(Str::new(dump)));
 					Ok(CommandResult::Consumed(ConsumedResult::status("Copied sanitized session dump.")))
 				},
@@ -5653,7 +5686,16 @@ where
 				},
 				Ok(ChatCommand::Plan(args)) => {
 					let replanned = modes.plan().is_some();
-					handle_plan_command(backend, commands_tx, modes, args.as_str()).await;
+					handle_plan_command(
+						backend,
+						commands_tx,
+						control,
+						modes,
+						abort,
+						chat_active(state.submit_pending, bus.phase()),
+						args.as_str(),
+					)
+					.await;
 					state.title_replan_refresh_pending |= replanned;
 				},
 				Ok(ChatCommand::Goal(args)) => {
@@ -5867,13 +5909,21 @@ where
 			}
 			if modes.mode_holder().as_deref() == Some("plan")
 				&& let Some(activation) = modes.mode_activation()
-				&& !stop_mode_regime(backend, commands_tx, "plan", activation).await
 			{
-				send_backend(
-					backend,
-					BackendEvent::Error(sf!("Saved plan to `{path}`, but could not exit plan mode.",)),
-				);
-				return Ok(false);
+				let stopped = if chat_active(state.submit_pending, bus.phase()) {
+					stop_streaming_plan_regime(backend, control, modes, abort, activation).await
+				} else {
+					stop_mode_regime(backend, commands_tx, "plan", activation).await
+				};
+				if !stopped {
+					send_backend(
+						backend,
+						BackendEvent::Error(
+							sf!("Saved plan to `{path}`, but could not exit plan mode.",),
+						),
+					);
+					return Ok(false);
+				}
 			}
 			send_backend(backend, BackendEvent::Notice(sf!("Saved plan to `{path}`.")));
 			send_backend(backend, BackendEvent::NewSessionRequested);
@@ -6005,7 +6055,16 @@ where
 			} else {
 				"on"
 			};
-			handle_plan_command(backend, commands_tx, modes, operation).await;
+			handle_plan_command(
+				backend,
+				commands_tx,
+				control,
+				modes,
+				abort,
+				chat_active(state.submit_pending, bus.phase()),
+				operation,
+			)
+			.await;
 		},
 		Intent::ToggleLive => {
 			state.live_enabled = !state.live_enabled;
@@ -7064,6 +7123,31 @@ fn handle_agent_event(
 			);
 		},
 		AgentEvent::Failed { message, .. } => {
+			// The failed turn will never deliver `PartEnd`/`ToolFinished` for
+			// work that was still streaming; settle those widgets instead of
+			// leaving frozen spinners and half-drawn tool boxes behind.
+			for (_, id) in state.active_parts.drain() {
+				send_backend(backend, BackendEvent::AssistantEnd { id });
+			}
+			state.streaming_tools.clear();
+			for (call_id, tool) in mem::take(&mut state.tools) {
+				if !tool.started {
+					continue;
+				}
+				if state.active_ptys.remove(call_id.as_str()).is_some() {
+					send_backend(backend, BackendEvent::PtyFinished {
+						id:        call_id.clone(),
+						status:    omp_chat_ui::PtyStatus::Killed,
+						exit_code: None,
+					});
+				}
+				send_backend(backend, BackendEvent::ToolFinished {
+					id:   call_id,
+					ok:   false,
+					view: sf!("turn failed before this tool ran"),
+				});
+			}
+			state.active_ptys.clear();
 			state.part_serial = state.part_serial.saturating_add(1);
 			let stable_id = sf!("diagnostic-{}", state.part_serial);
 			send_retained_fact(
@@ -8495,7 +8579,7 @@ mod tests {
 	}
 
 	#[test]
-	fn active_turn_text_and_submit_errors_project_into_viewport_or_retirement_rows() {
+	fn active_turn_text_and_error_notices_project_into_viewport_or_retirement_rows() {
 		let scratch = tempfile::tempdir().expect("scratch directory");
 		let (tx, rx) = flume::unbounded();
 		let mut state = test_bridge_state(scratch.path());
@@ -8525,7 +8609,7 @@ mod tests {
 				0,
 			);
 		}
-		send_backend(&tx, BackendEvent::Error(sf!("Submit error: unauthorized")));
+		send_backend(&tx, BackendEvent::Error(sf!("Compaction failed: unauthorized")));
 
 		let mut chat = Chat::new(&UiContext::default());
 		let viewport = Size::new(80, 30);
@@ -8554,7 +8638,78 @@ mod tests {
 		let transcript = format!("{viewport_text}\n{retirement_text}");
 		assert!(transcript.contains("say banana"), "{transcript}");
 		assert!(transcript.contains("banana"), "{transcript}");
-		assert!(transcript.contains("Submit error: unauthorized"), "{transcript}");
+		assert!(transcript.contains("Compaction failed: unauthorized"), "{transcript}");
+	}
+
+	#[test]
+	fn turn_failure_settles_streaming_parts_and_tool_widgets() {
+		let scratch = tempfile::tempdir().expect("scratch directory");
+		let (tx, rx) = flume::unbounded();
+		let mut state = test_bridge_state(scratch.path());
+		let modes = RegimeHandle::new();
+		let registry = Registry::new();
+		let bus = omp_agent::EventBus::new();
+		for event in [
+			Event::PartStart(v1::PartStart {
+				index:        0,
+				kind:         part_start::Kind::Thinking as i32,
+				tool_call_id: String::new(),
+				tool_name:    String::new(),
+			}),
+			Event::PartStart(v1::PartStart {
+				index:        1,
+				kind:         part_start::Kind::ToolCall as i32,
+				tool_call_id: "toolu_1".to_owned(),
+				tool_name:    "shell".to_owned(),
+			}),
+			Event::PartDelta(v1::PartDelta {
+				index: 1,
+				chunk: Bytes::from_static(br#"{"command":"cd /w"#),
+			}),
+		] {
+			handle_agent_event(
+				&tx,
+				&mut state,
+				&AgentEvent::Turn {
+					turn_id: TurnId::new("failed-turn"),
+					event:   Box::new(v1::TurnEvent { event: Some(event) }),
+				},
+				&modes,
+				&registry,
+				&bus,
+				0,
+			);
+		}
+		assert!(state.tools.get("toolu_1").is_some_and(|tool| tool.started));
+		handle_agent_event(
+			&tx,
+			&mut state,
+			&AgentEvent::Failed {
+				turn_id: Some(TurnId::new("failed-turn")),
+				message: sf!("terminal turn error (Upstream)"),
+			},
+			&modes,
+			&registry,
+			&bus,
+			0,
+		);
+		assert!(state.active_parts.is_empty());
+		assert!(state.streaming_tools.is_empty());
+		assert!(state.tools.is_empty());
+		let events: Vec<_> = rx.drain().collect();
+		assert!(
+			events
+				.iter()
+				.any(|event| matches!(event, BackendEvent::AssistantEnd { .. })),
+			"open thinking part must be closed on turn failure"
+		);
+		assert!(
+			events.iter().any(|event| matches!(
+				event,
+				BackendEvent::ToolFinished { id, ok: false, .. } if id.as_str() == "toolu_1"
+			)),
+			"started tool widget must settle as failed on turn failure"
+		);
 	}
 
 	#[test]

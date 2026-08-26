@@ -6,13 +6,14 @@ pub mod model;
 use std::{
 	path::Path,
 	sync::{
-		Arc, Mutex as StdMutex,
+		Arc,
 		atomic::{AtomicBool, Ordering},
 	},
 };
 
 use omp_chat_ui::git::{GitIntent, GitUpdate};
 use omp_core::{IntoStr as _, Str};
+use parking_lot::Mutex as SyncMutex;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
@@ -37,7 +38,7 @@ pub struct GitSession {
 	avatar:      Option<AvatarLoader>,
 	busy:        Arc<AtomicBool>,
 	cancel:      CancellationToken,
-	load_cancel: Arc<StdMutex<CancellationToken>>,
+	load_cancel: Arc<SyncMutex<CancellationToken>>,
 }
 
 impl GitSession {
@@ -52,7 +53,7 @@ impl GitSession {
 			model: Arc::new(Mutex::new(model)),
 			avatar: AvatarLoader::new(),
 			busy: Arc::new(AtomicBool::new(false)),
-			load_cancel: Arc::new(StdMutex::new(cancel.child_token())),
+			load_cancel: Arc::new(SyncMutex::new(cancel.child_token())),
 			cancel,
 		})
 	}
@@ -107,8 +108,7 @@ impl GitSession {
 				{
 					let mut active = self
 						.load_cancel
-						.lock()
-						.unwrap_or_else(std::sync::PoisonError::into_inner);
+						.lock();
 					active.cancel();
 					*active = load_cancel.clone();
 				}
@@ -153,8 +153,8 @@ impl GitSession {
 		};
 		let mut model = self.model.lock().await;
 		let action = match intent {
-			GitIntent::StageFile(path) => model.stage(path.as_deref(), &self.cancel).await,
-			GitIntent::UnstageFile(path) => model.unstage(path.as_deref(), &self.cancel).await,
+			GitIntent::StageFiles(paths) => model.stage(paths.as_deref(), &self.cancel).await,
+			GitIntent::UnstageFiles(paths) => model.unstage(paths.as_deref(), &self.cancel).await,
 			GitIntent::ApplyLines { op, path, old, new } => {
 				model
 					.apply_lines(op, path.as_str(), old, new, &self.cancel)
