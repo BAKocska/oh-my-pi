@@ -3,6 +3,10 @@
 use std::{
 	collections::BTreeMap,
 	path::PathBuf,
+	sync::{
+		Arc,
+		atomic::{AtomicBool, Ordering},
+	},
 	time::{Duration, Instant},
 };
 
@@ -20,7 +24,7 @@ use super::{
 		AdvisorFailureClass, AdvisorFallbackChain, AdvisorRetryDecision, AdvisorRetryManager,
 	},
 	transcript::{
-		AdvisorTranscriptRecord, AdvisorTranscriptStore, AdvisorUsageTotals, NoopAdvisorStatistics,
+		AdvisorStatisticsSink, AdvisorTranscriptRecord, AdvisorTranscriptStore, AdvisorUsageTotals,
 	},
 };
 
@@ -142,12 +146,26 @@ pub struct AdvisorStatusRow {
 	pub messages:     u64,
 }
 
+#[derive(Clone, Default)]
+struct EngineAdvisorStatistics {
+	cost_changed: Arc<AtomicBool>,
+}
+
+impl AdvisorStatisticsSink for EngineAdvisorStatistics {
+	fn record_advisor_usage(&self, _: &str, _: &str, _: AdvisorUsageTotals) {}
+
+	fn advisor_cost_changed(&self, _: &str) {
+		self.cost_changed.store(true, Ordering::Release);
+	}
+}
+
 /// Coordinates configured advisor workers for one primary session.
 pub struct AdvisorEngine {
 	enabled:         bool,
 	workers:         Vec<AdvisorWorker>,
 	worker_index:    BTreeMap<Str, usize>,
-	transcripts:     Option<AdvisorTranscriptStore>,
+	transcripts:     Option<AdvisorTranscriptStore<EngineAdvisorStatistics>>,
+	cost_changed:    Arc<AtomicBool>,
 	primary_turn_id: u64,
 }
 
@@ -229,14 +247,22 @@ impl AdvisorEngine {
 			.enumerate()
 			.map(|(index, worker)| (worker.id.clone(), index))
 			.collect();
+		let cost_changed = Arc::new(AtomicBool::new(false));
 		let transcripts = AdvisorTranscriptStore::open(
 			&options.project_root,
 			options.primary_session,
-			NoopAdvisorStatistics,
+			EngineAdvisorStatistics { cost_changed: Arc::clone(&cost_changed) },
 		)
 		.map_err(|error| tracing::warn!(%error, "advisor transcript store could not be opened"))
 		.ok();
-		Self { enabled: options.enabled, workers, worker_index, transcripts, primary_turn_id: 0 }
+		Self {
+			enabled: options.enabled,
+			workers,
+			worker_index,
+			transcripts,
+			cost_changed,
+			primary_turn_id: 0,
+		}
 	}
 
 	/// Returns whether advisor dispatch is enabled.
@@ -305,6 +331,9 @@ impl AdvisorEngine {
 			};
 			worker.pending = false;
 			worker.guard.begin_update();
+			if let Some(transcripts) = self.transcripts.as_ref() {
+				transcripts.begin_turn(worker.id.as_str());
+			}
 			worker.queue.set_mid_turn(false);
 			worker.runtime.history_cursor = batch.next_cursor;
 			worker.messages = worker.messages.saturating_add(1);
@@ -408,6 +437,9 @@ impl AdvisorEngine {
 			},
 			AdvisorRetryDecision::Attempt { .. } => AdvisorRunState::Running,
 		};
+		if let Some(transcripts) = self.transcripts.as_ref() {
+			transcripts.abandon_turn(advisor_id);
+		}
 		decision
 	}
 
@@ -420,6 +452,22 @@ impl AdvisorEngine {
 				worker.state = AdvisorRunState::Running;
 			}
 		}
+		if let Some(transcripts) = self.transcripts.as_ref() {
+			transcripts.commit_turn(advisor_id);
+		}
+	}
+
+	/// Returns and clears the resume-cost completion notification.
+	pub fn take_cost_changed(&self) -> bool {
+		self.cost_changed.swap(false, Ordering::AcqRel)
+	}
+
+	/// Returns whether resume-time advisor cost restoration has settled.
+	pub fn cost_restore_finished(&self) -> bool {
+		self
+			.transcripts
+			.as_ref()
+			.is_none_or(AdvisorTranscriptStore::cost_restore_finished)
 	}
 
 	/// Returns a presentation-safe snapshot of all advisor workers.
@@ -434,7 +482,7 @@ impl AdvisorEngine {
 					display_name: worker.display_name.clone(),
 					model:        worker.model.clone(),
 					state:        worker.state,
-					usage:        worker.usage,
+					usage:        self.usage_for(worker),
 					messages:     worker.messages,
 				})
 				.collect(),
@@ -450,6 +498,7 @@ impl AdvisorEngine {
 			"# Advisors (disabled)\n"
 		});
 		for worker in &self.workers {
+			let usage = self.usage_for(worker);
 			if compact {
 				use std::fmt::Write as _;
 				let _ = writeln!(
@@ -459,7 +508,7 @@ impl AdvisorEngine {
 					worker.model,
 					worker.state,
 					worker.messages,
-					worker.usage.cost_micro_usd,
+					usage.cost_micro_usd,
 				);
 			} else {
 				use std::fmt::Write as _;
@@ -467,9 +516,9 @@ impl AdvisorEngine {
 				let _ = writeln!(output, "- Model: `{}`", worker.model);
 				let _ = writeln!(output, "- State: {}", worker.state);
 				let _ = writeln!(output, "- Messages: {}", worker.messages);
-				let _ = writeln!(output, "- Cost: {} µUSD", worker.usage.cost_micro_usd);
-				let _ = writeln!(output, "- Input tokens: {}", worker.usage.input_tokens);
-				let _ = writeln!(output, "- Output tokens: {}", worker.usage.output_tokens);
+				let _ = writeln!(output, "- Cost: {} µUSD", usage.cost_micro_usd);
+				let _ = writeln!(output, "- Input tokens: {}", usage.input_tokens);
+				let _ = writeln!(output, "- Output tokens: {}", usage.output_tokens);
 				let _ = writeln!(output, "- Tools: {}", worker.tools.join(", "));
 			}
 		}
@@ -479,6 +528,19 @@ impl AdvisorEngine {
 	/// Counts workers with a pending primary-session batch.
 	pub fn backlog(&self) -> usize {
 		self.workers.iter().filter(|worker| worker.pending).count()
+	}
+
+	fn usage_for(&self, worker: &AdvisorWorker) -> AdvisorUsageTotals {
+		self
+			.transcripts
+			.as_ref()
+			.map_or(worker.usage, |transcripts| {
+				if transcripts.cost_restore_finished() {
+					transcripts.totals(worker.id.as_str())
+				} else {
+					worker.usage
+				}
+			})
 	}
 
 	fn worker(&self, advisor_id: &str) -> Option<&AdvisorWorker> {
@@ -521,16 +583,22 @@ fn push_prompt_block(prompt: &mut StrMut, block: &Str) {
 
 #[cfg(test)]
 mod tests {
-	use std::sync::Arc;
+	use std::sync::{
+		Arc,
+		atomic::{AtomicU64, Ordering as AtomicOrdering},
+	};
 
 	use omp_agent::advisor::{AdvisorRoster, MAX_DELTA_COALESCE_ROUNDS};
 	use omp_catalog::snapshot::Catalog;
 
 	use super::*;
+	static NEXT_ENGINE_ROOT: AtomicU64 = AtomicU64::new(0);
 
 	fn options(enabled: bool) -> AdvisorEngineOptions {
+		let nonce = NEXT_ENGINE_ROOT.fetch_add(1, AtomicOrdering::Relaxed);
 		AdvisorEngineOptions {
-			project_root: std::env::temp_dir().join("omp-advisor-engine-tests"),
+			project_root: std::env::temp_dir()
+				.join(format!("omp-advisor-engine-tests-{}-{nonce}", std::process::id())),
 			primary_session: Str::new_static("primary"),
 			enabled,
 			immune_turns: 3,
@@ -566,6 +634,17 @@ mod tests {
 		assert_eq!(workers[0].id, "default");
 		assert_eq!(workers[0].tools, ["read", "grep", "glob"]);
 		assert!(workers[0].system_prompt.contains("Never address the user"));
+	}
+	#[test]
+	fn background_cost_restore_emits_one_engine_notification() {
+		let engine = make_engine(true);
+		let deadline = Instant::now() + Duration::from_secs(2);
+		while !engine.cost_restore_finished() {
+			assert!(Instant::now() < deadline, "advisor cost restore did not settle");
+			std::thread::sleep(Duration::from_millis(1));
+		}
+		assert!(engine.take_cost_changed());
+		assert!(!engine.take_cost_changed());
 	}
 
 	#[test]

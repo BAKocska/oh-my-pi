@@ -9,8 +9,8 @@ use std::{
 
 use bytes::Bytes;
 use omp_agent::{
-	AgentEvent, Broker, CancelOutcome, DeliveryMode, EventBus, JobBoard, JobError, PeerMessage,
-	PeerRelayObservation, TurnClient,
+	AgentEvent, AgentRecord, Broker, CancelOutcome, DeliveryMode, EventBus, JobBoard, JobError,
+	PeerMessage, PeerRelayObservation, RegistryStatus, TurnClient,
 };
 use omp_core::{Duration, DurationUnit, Str, sf};
 use omp_env::{EnvClient, ProcessAttachmentEvent};
@@ -26,7 +26,10 @@ use omp_proto::{
 	inference::v1::{Value, ValueMap, value},
 };
 use omp_tool::{ArtifactLifetime, ExpectedArtifact, JobKind, JobMetadata, JobOwner, JobRef, Tool};
-use omp_tools::hub::{Fault, HubBackend, HubRouter, Op, Params, Request, Response, RestartPolicy};
+use omp_tools::hub::{
+	DEFAULT_LIST_LIMIT, Fault, HubBackend, HubRouter, ListStatus, Op, Params, Request, Response,
+	RestartPolicy,
+};
 use parking_lot::Mutex;
 use serde_json::json;
 use tokio::{sync::broadcast::error::RecvError, task::JoinHandle, time};
@@ -37,6 +40,19 @@ static ROUTER: LazyLock<HubRouter<ChatHubBackend>> = LazyLock::new(HubRouter::ne
 const DEFAULT_ROUTE: &str = "*";
 const HUB_TERMINAL_COLUMNS: usize = 120;
 const HUB_TERMINAL_ROWS: usize = 40;
+#[derive(Debug, Eq, PartialEq, serde::Serialize)]
+struct RosterCounts {
+	running:   usize,
+	idle:      usize,
+	parked:    usize,
+	shown:     usize,
+	truncated: usize,
+}
+
+struct RosterPage {
+	peers:  Vec<serde_json::Value>,
+	counts: RosterCounts,
+}
 
 #[derive(Default)]
 enum TerminalParseState {
@@ -342,11 +358,15 @@ impl ChatHubBackend {
 			.map_err(|error| fault(error.to_string()))
 	}
 
-	fn roster_json(&self) -> Vec<serde_json::Value> {
-		self
-			.broker
-			.registry()
-			.roster(false)
+	fn roster_page(&self, status: Option<ListStatus>, limit: Option<u16>) -> RosterPage {
+		self.restore_persisted_roster();
+		let (records, counts) = select_roster(
+			self.broker.registry().roster(false),
+			self.agent_id.as_str(),
+			status,
+			limit.map_or(DEFAULT_LIST_LIMIT, usize::from),
+		);
+		let peers = records
 			.into_iter()
 			.map(|record| {
 				let unread = self.broker.unread_count(&record.id).unwrap_or(0);
@@ -370,7 +390,38 @@ impl ChatHubBackend {
 					"patch": record.history.patch_path.map(|path| path.display().to_string()),
 				})
 			})
-			.collect()
+			.collect();
+		RosterPage { peers, counts }
+	}
+
+	fn restore_persisted_roster(&self) {
+		let registry = self.broker.registry();
+		let mut current = self.agent_id.clone();
+		let mut root_file = None;
+		for _ in 0..64 {
+			let Some((record, _)) = registry.record(current.as_str()) else {
+				break;
+			};
+			if record.kind == omp_agent::AgentKind::Main {
+				root_file = record.transcript;
+				break;
+			}
+			let Some(parent) = record.parent else {
+				root_file = record.transcript;
+				break;
+			};
+			current = parent;
+		}
+		let Some(root_file) = root_file else {
+			return;
+		};
+		let Some(sessions) = root_file.parent() else {
+			return;
+		};
+		let directory = sessions.join("eval-agents");
+		if directory.is_dir() {
+			registry.restore_transcripts_once(&root_file, &directory);
+		}
 	}
 
 	async fn process_generation(&self, name: &str) -> Result<u64, Fault> {
@@ -968,16 +1019,17 @@ impl HubBackend for ChatHubBackend {
 			Op::Inbox => Self::response(
 				json!({ "messages": self.inbox.lock().await.inbox(params.peek).into_iter().map(message_json).collect::<Vec<_>>() }),
 			),
-			Op::List => Self::response(json!({ "peers": self.roster_json() })),
-			Op::Jobs => Self::response(json!({
-				"jobs": self.jobs.snapshot().into_iter().map(job_json).collect::<Vec<_>>(),
-				"agents": self.roster_json().into_iter().filter(|agent| {
-					matches!(
-						agent.get("status").and_then(serde_json::Value::as_str),
-						Some("running" | "idle")
-					)
-				}).collect::<Vec<_>>(),
-			})),
+			Op::List => {
+				let page = self.roster_page(params.status, params.limit);
+				Self::response(json!({ "peers": page.peers, "counts": page.counts }))
+			},
+			Op::Jobs => {
+				let roster = self.roster_page(None, None);
+				Self::response(json!({
+					"jobs": self.jobs.snapshot_consuming().into_iter().map(job_json).collect::<Vec<_>>(),
+					"agents": roster.peers,
+				}))
+			},
 			Op::Cancel => self.cancel_jobs(&params).await,
 			Op::Start => self.start(&params).await,
 			Op::Ps => {
@@ -1221,6 +1273,55 @@ fn append_key(data: &mut Vec<u8>, key: &str) {
 	}
 }
 
+fn select_roster(
+	mut records: Vec<AgentRecord>,
+	self_id: &str,
+	status: Option<ListStatus>,
+	limit: usize,
+) -> (Vec<AgentRecord>, RosterCounts) {
+	records.retain(|record| record.id != self_id);
+	let mut counts = RosterCounts {
+		running:   records
+			.iter()
+			.filter(|record| record.status == RegistryStatus::Running)
+			.count(),
+		idle:      records
+			.iter()
+			.filter(|record| record.status == RegistryStatus::Idle)
+			.count(),
+		parked:    records
+			.iter()
+			.filter(|record| record.status == RegistryStatus::Parked)
+			.count(),
+		shown:     0,
+		truncated: 0,
+	};
+	records.retain(|record| match status {
+		Some(ListStatus::Running) => record.status == RegistryStatus::Running,
+		Some(ListStatus::Idle) => record.status == RegistryStatus::Idle,
+		Some(ListStatus::Parked) => record.status == RegistryStatus::Parked,
+		None => matches!(record.status, RegistryStatus::Running | RegistryStatus::Idle),
+	});
+	records.sort_by(|left, right| {
+		roster_status_order(left.status)
+			.cmp(&roster_status_order(right.status))
+			.then_with(|| right.last_activity_ms.cmp(&left.last_activity_ms))
+			.then_with(|| left.id.cmp(&right.id))
+	});
+	counts.truncated = records.len().saturating_sub(limit);
+	records.truncate(limit);
+	counts.shown = records.len();
+	(records, counts)
+}
+
+const fn roster_status_order(status: RegistryStatus) -> u8 {
+	match status {
+		RegistryStatus::Running => 0,
+		RegistryStatus::Idle => 1,
+		RegistryStatus::Parked => 2,
+	}
+}
+
 fn now_ms() -> u64 {
 	SystemTime::now()
 		.duration_since(UNIX_EPOCH)
@@ -1235,7 +1336,11 @@ fn fault(message: impl Into<Str>) -> Fault {
 }
 #[cfg(test)]
 mod tests {
-	use super::TerminalRowReplay;
+	use omp_agent::{AgentHistory, AgentKind, AgentRecord, RegistryStatus};
+	use omp_core::{Str, sf};
+	use omp_tools::hub::ListStatus;
+
+	use super::{DEFAULT_LIST_LIMIT, TerminalRowReplay, select_roster};
 
 	#[test]
 	fn terminal_row_replay_applies_cursor_motion_and_carriage_return() {
@@ -1244,5 +1349,56 @@ mod tests {
 		let lines = replay.into_lines();
 		assert_eq!(lines[0], "XWO");
 		assert_eq!(lines[1], "three");
+	}
+	#[test]
+	fn default_roster_is_live_bounded_and_reports_parked_count() {
+		let mut records = (0..40)
+			.map(|index| record(index, RegistryStatus::Running))
+			.collect::<Vec<_>>();
+		records.extend((40..45).map(|index| record(index, RegistryStatus::Parked)));
+
+		let (shown, counts) = select_roster(records, "self", None, DEFAULT_LIST_LIMIT);
+
+		assert_eq!(shown.len(), DEFAULT_LIST_LIMIT);
+		assert!(
+			shown
+				.iter()
+				.all(|record| record.status == RegistryStatus::Running)
+		);
+		assert_eq!(counts.running, 40);
+		assert_eq!(counts.idle, 0);
+		assert_eq!(counts.parked, 5);
+		assert_eq!(counts.shown, DEFAULT_LIST_LIMIT);
+		assert_eq!(counts.truncated, 8);
+	}
+
+	#[test]
+	fn parked_roster_requires_explicit_filter() {
+		let records = vec![record(1, RegistryStatus::Running), record(2, RegistryStatus::Parked)];
+		let (shown, counts) = select_roster(records, "self", Some(ListStatus::Parked), 100);
+		assert_eq!(shown.len(), 1);
+		assert_eq!(shown[0].status, RegistryStatus::Parked);
+		assert_eq!(counts.shown, 1);
+		assert_eq!(counts.truncated, 0);
+	}
+
+	fn record(index: u64, status: RegistryStatus) -> AgentRecord {
+		AgentRecord {
+			id: sf!("agent-{index}"),
+			name: sf!("Agent{index}"),
+			kind: AgentKind::Subagent,
+			parent: Some(sf!("self")),
+			session: sf!("session"),
+			depth: 1,
+			status,
+			activity: Str::default(),
+			last_activity_ms: index,
+			transcript: None,
+			definition: None,
+			model: None,
+			serving_model: None,
+			task: None,
+			history: AgentHistory::default(),
+		}
 	}
 }

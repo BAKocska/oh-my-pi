@@ -284,13 +284,14 @@ pub(crate) async fn spawn<C: TurnClient + Clone + Send + 'static>(
 			Budget::default(),
 		)
 		.map_err(|source| AdvisorChildError::Admission { id: id.clone(), source })?;
-	let child = Agent::new(
+	let mut child = Agent::new(
 		context.client,
 		context.env.clone(),
 		AgentState::new(snapshot),
 		journal,
 		CHAT_CAPS_BASE,
 	);
+	child.enable_advisor_tool_loop_guard();
 	let events = child.events().subscribe_lossless();
 	context
 		.broker

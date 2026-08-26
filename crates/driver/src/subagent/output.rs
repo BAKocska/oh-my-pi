@@ -6,6 +6,8 @@ use omp_agent::SubagentDisposition;
 use omp_core::{Str, sf};
 use thiserror::Error;
 
+use super::artifacts::{ArtifactWriteError, write_verified};
+
 /// Maximum caller-returned output bytes.
 pub const MAX_OUTPUT_BYTES: usize = 500_000;
 /// Maximum caller-returned output lines.
@@ -21,12 +23,9 @@ pub enum OutputError {
 	/// The output parent directory could not be created.
 	#[error("subagent artifact directory could not be created")]
 	CreateDirectory(#[source] io::Error),
-	/// The complete output could not be written.
-	#[error("subagent artifact could not be written")]
-	Write(#[source] io::Error),
-	/// The temporary artifact could not be atomically published.
-	#[error("subagent artifact could not be published")]
-	Publish(#[source] io::Error),
+	/// The complete output could not be staged, verified, and published.
+	#[error(transparent)]
+	Persist(#[from] ArtifactWriteError),
 }
 
 /// Persists complete output atomically and returns a bounded disposition.
@@ -39,9 +38,7 @@ pub fn persist_bounded(
 ) -> Result<SubagentDisposition, OutputError> {
 	let parent = path.parent().unwrap_or_else(|| Path::new("."));
 	fs::create_dir_all(parent).map_err(OutputError::CreateDirectory)?;
-	let temporary = path.with_extension("tmp");
-	fs::write(&temporary, full.as_bytes()).map_err(OutputError::Write)?;
-	fs::rename(&temporary, path).map_err(OutputError::Publish)?;
+	write_verified(path, full.as_bytes())?;
 	let (bounded, output_truncated) = bounded_tail(full);
 	let preview = if cancelled {
 		flattened_salvage(bounded.as_str())

@@ -568,6 +568,17 @@ mod tests {
 		assert_eq!(regime.drain(Point::Idle, 125).len(), 1);
 	}
 	#[test]
+	fn external_interrupt_preserves_streaming_advice_without_steering() {
+		let context = DeliveryContext {
+			streaming: true,
+			externally_interrupted: true,
+			..DeliveryContext::default()
+		};
+		assert_eq!(advisor_delivery(AdviceSeverity::Concern, context), AdviceDelivery::Preserve);
+		assert_eq!(advisor_delivery(AdviceSeverity::Blocker, context), AdviceDelivery::Preserve);
+	}
+
+	#[test]
 	fn advisor_retry_reaches_chain_owned_by_last_fallback() {
 		let primary =
 			AdvisorFallbackChain::new([Str::new_static("provider/a"), Str::new_static("provider/b")])

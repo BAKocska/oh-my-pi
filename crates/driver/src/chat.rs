@@ -1367,10 +1367,13 @@ impl<C: TurnClient + Clone + Send + 'static> ChatParentHost<C> {
 		if !directory.is_dir() {
 			return;
 		}
-		if let Err(error) = self.broker.registry().discover_transcripts(&directory) {
-			tracing::warn!(%error, "durable child transcript discovery failed");
-			return;
-		}
+		let root_file = context
+			.sessions_dir
+			.join(format!("{}.jsonl", context.session_id));
+		self
+			.broker
+			.registry()
+			.restore_transcripts_once(&root_file, &directory);
 		let blob_root = context
 			.sessions_dir
 			.parent()

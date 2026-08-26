@@ -1,6 +1,8 @@
 //! Durable session exports from one canonical live-journal projection.
 
 use std::{
+	borrow::Cow,
+	fmt::Write as _,
 	fs, io,
 	path::{Path, PathBuf},
 };
@@ -16,6 +18,7 @@ use omp_storage::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
+use xutf::IntoAnsiStripped as _;
 
 const MAX_EMBEDDED_ARTIFACT: u64 = 8 * 1024 * 1024;
 
@@ -315,19 +318,257 @@ pub fn render_yaml(tree: &SessionTree) -> Result<String, ExportError> {
 	Ok(serde_yaml::to_string(tree)?)
 }
 
+const CUSTOM_TYPE_ACRONYMS: [(&str, &str); 9] = [
+	("acp", "ACP"),
+	("irc", "IRC"),
+	("lsp", "LSP"),
+	("mcp", "MCP"),
+	("rpc", "RPC"),
+	("ttsr", "TTSR"),
+	("tui", "TUI"),
+	("xdev", "XDev"),
+	("xml", "XML"),
+];
+
+fn custom_type(entry: &Value) -> Option<&str> {
+	entry.get("customType").and_then(Value::as_str).or_else(|| {
+		(entry.get("k").and_then(Value::as_str) == Some("custom")
+			|| entry.get("type").and_then(Value::as_str) == Some("custom_message"))
+		.then(|| entry.get("kind").and_then(Value::as_str))
+		.flatten()
+	})
+}
+
+fn custom_message_text(entry: &Value) -> Option<Cow<'_, str>> {
+	fn block_text(value: &Value) -> Option<&str> {
+		if let Some(text) = value.get("text").and_then(Value::as_str) {
+			Some(text)
+		} else if matches!(
+			value
+				.get("type")
+				.or_else(|| value.get("t"))
+				.and_then(Value::as_str),
+			Some("image")
+		) {
+			Some("[Image]")
+		} else {
+			None
+		}
+	}
+
+	let content = entry
+		.get("content")
+		.filter(|value| !value.is_null())
+		.or_else(|| entry.get("context"))?;
+	if let Some(text) = content.as_str() {
+		return Some(Cow::Borrowed(text));
+	}
+	let mut parts = content.as_array()?.iter().filter_map(block_text);
+	let first = parts.next()?;
+	let Some(second) = parts.next() else {
+		return Some(Cow::Borrowed(first));
+	};
+	let mut joined =
+		String::with_capacity(first.len().saturating_add(second.len()).saturating_add(1));
+	joined.push_str(first);
+	joined.push('\n');
+	joined.push_str(second);
+	for part in parts {
+		joined.push('\n');
+		joined.push_str(part);
+	}
+	Some(Cow::Owned(joined))
+}
+
+fn is_system_notice(content: &str) -> bool {
+	let Some(rest) = content.trim_start().strip_prefix("<system-notice") else {
+		return false;
+	};
+	rest.starts_with('>') || rest.chars().next().is_some_and(char::is_whitespace)
+}
+
+fn system_notice_title(custom_type: &str) -> String {
+	let mut words = custom_type
+		.split(|character: char| !character.is_ascii_alphanumeric())
+		.filter(|word| !word.is_empty())
+		.peekable();
+	let mut title = String::from("System Notice");
+	let mut has_label = false;
+	while let Some(word) = words.next() {
+		if words.peek().is_none() && word.eq_ignore_ascii_case("notice") {
+			break;
+		}
+		title.push_str(if has_label { " " } else { ": " });
+		has_label = true;
+		if let Some((_, acronym)) = CUSTOM_TYPE_ACRONYMS
+			.iter()
+			.find(|(name, _)| word.eq_ignore_ascii_case(name))
+		{
+			title.push_str(acronym);
+			continue;
+		}
+		let mut characters = word.chars();
+		if let Some(first) = characters.next() {
+			title.extend(first.to_uppercase());
+			title.push_str(characters.as_str());
+		}
+	}
+	title
+}
+
+fn backtick_fence(content: &str) -> String {
+	let mut longest = 0_usize;
+	let mut current = 0;
+	for byte in content.bytes() {
+		if byte == b'`' {
+			current += 1;
+			longest = longest.max(current);
+		} else {
+			current = 0;
+		}
+	}
+	"`".repeat(longest.saturating_add(1).max(3))
+}
+
+fn sanitize_advisor_field(value: &str) -> String {
+	let stripped = value.to_owned().into_ansi_stripped();
+	let mut sanitized = String::with_capacity(stripped.len());
+	let mut pending_space = false;
+	for character in stripped.chars() {
+		if character.is_whitespace() {
+			pending_space = !sanitized.is_empty();
+		} else if !character.is_control() {
+			if pending_space {
+				sanitized.push(' ');
+				pending_space = false;
+			}
+			sanitized.push(character);
+		}
+	}
+	sanitized
+}
+
+fn advisor_row(entry: &Value) -> Option<String> {
+	if custom_type(entry) != Some("advisor") {
+		return None;
+	}
+	let details = entry
+		.get("details")
+		.filter(|value| !value.is_null())
+		.or_else(|| entry.get("data"));
+	let notes = details
+		.and_then(|details| details.get("notes"))
+		.and_then(Value::as_array);
+	let mut bodies = Vec::new();
+	let mut advisors = Vec::new();
+	let mut severities = Vec::new();
+	for note in notes.into_iter().flatten() {
+		if let Some(body) = note.get("note").and_then(Value::as_str) {
+			let body = sanitize_advisor_field(body);
+			if !body.is_empty() {
+				bodies.push(body);
+			}
+		}
+		if let Some(advisor) = note.get("advisor").and_then(Value::as_str) {
+			let advisor = sanitize_advisor_field(advisor);
+			if !advisor.is_empty()
+				&& advisor != "default"
+				&& !advisors.iter().any(|existing| existing == &advisor)
+			{
+				advisors.push(advisor);
+			}
+		}
+		if let Some(severity) = note.get("severity").and_then(Value::as_str) {
+			let severity = sanitize_advisor_field(severity);
+			if !severity.is_empty() && !severities.iter().any(|existing| existing == &severity) {
+				severities.push(severity);
+			}
+		}
+	}
+	let mut row = String::from("advisor");
+	if !advisors.is_empty() || !severities.is_empty() {
+		row.push_str(" (");
+		for (index, qualifier) in advisors.iter().chain(&severities).enumerate() {
+			if index > 0 {
+				row.push_str(", ");
+			}
+			row.push_str(qualifier);
+		}
+		row.push(')');
+	}
+	row.push_str(": ");
+	for (index, body) in bodies.iter().enumerate() {
+		if index > 0 {
+			row.push(' ');
+		}
+		row.push_str(body);
+	}
+	Some(row)
+}
+
+/// Renders durable session lineage with advisor notes nested under their owning
+/// session.
+pub fn render_lineage(tree: &SessionTree, current: &str) -> String {
+	fn append_tree(output: &mut String, tree: &SessionTree, current: &str, depth: usize) {
+		for _ in 0..depth {
+			output.push_str("  ");
+		}
+		output.push_str("- `");
+		output.push_str(tree.id.as_str());
+		output.push('`');
+		if tree.id == current {
+			output.push_str(" ← current");
+		}
+		output.push('\n');
+		for entry in &tree.entries {
+			let Some(row) = advisor_row(entry) else {
+				continue;
+			};
+			for _ in 0..depth.saturating_add(1) {
+				output.push_str("  ");
+			}
+			output.push_str("- ");
+			output.push_str(&row);
+			output.push('\n');
+		}
+		for child in &tree.children {
+			append_tree(output, child, current, depth.saturating_add(1));
+		}
+	}
+
+	let mut output = String::from("**Session lineage**\n\n");
+	append_tree(&mut output, tree, current, 0);
+	output
+}
+
 /// Renders presentable text from the session hierarchy as Markdown headings.
 pub fn render_markdown(tree: &SessionTree) -> String {
 	fn append_tree(output: &mut String, tree: &SessionTree, depth: usize) {
-		let heading = "#".repeat(depth.saturating_add(1).min(6));
-		output.push_str(&format!("{heading} Session {}\n\n", tree.id));
+		let session_heading = "#".repeat(depth.saturating_add(1).min(6));
+		let _ = writeln!(output, "{session_heading} Session {}\n", tree.id);
+		let entry_heading = "#".repeat(depth.saturating_add(2).min(6));
 		for entry in &tree.entries {
+			if let Some(custom_type) = custom_type(entry)
+				&& let Some(content) = custom_message_text(entry)
+			{
+				if is_system_notice(&content) {
+					let title = system_notice_title(custom_type);
+					let fence = backtick_fence(&content);
+					let _ =
+						writeln!(output, "{entry_heading} {title}\n\n{fence}xml\n{content}\n{fence}\n");
+				} else {
+					let _ = writeln!(output, "{entry_heading} {custom_type}\n\n{content}\n");
+				}
+				continue;
+			}
+
 			let kind = entry.get("k").and_then(Value::as_str).unwrap_or("event");
 			let mut text = Vec::new();
 			collect_visible_text(entry, &mut text);
 			if text.is_empty() {
 				continue;
 			}
-			output.push_str(&format!("{} {}\n\n", "#".repeat((depth + 2).min(6)), kind));
+			let _ = writeln!(output, "{entry_heading} {kind}\n");
 			for value in text {
 				output.push_str(value);
 				output.push_str("\n\n");
@@ -401,4 +642,81 @@ pub fn export_session_as(
 	};
 	fs::write(output, rendered)?;
 	Ok(output.to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+	use serde_json::{Value, json};
+
+	use super::{SessionTree, render_lineage, render_markdown};
+
+	fn tree(entry: Value) -> SessionTree {
+		SessionTree {
+			id:       "root".to_owned(),
+			created:  0,
+			entries:  vec![entry],
+			children: Vec::new(),
+		}
+	}
+
+	#[test]
+	fn system_notice_detection_requires_a_tag_boundary() {
+		let content = "<system-noticeable>ordinary custom content</system-noticeable>";
+		let rendered = render_markdown(&tree(json!({
+			"k": "custom",
+			"kind": "plugin-message",
+			"context": [{ "t": "text", "text": content }],
+		})));
+
+		assert!(rendered.contains("## plugin-message"));
+		assert!(rendered.contains(content));
+		assert!(!rendered.contains("## System Notice"));
+		assert!(!rendered.contains("```xml"));
+	}
+
+	#[test]
+	fn system_notice_titles_preserve_known_acronyms_and_expand_the_fence() {
+		let content = "<system-notice>\n````inside\n</system-notice>";
+		let rendered = render_markdown(&tree(json!({
+			"k": "custom",
+			"kind": "acp_async_mcp-progress-ttsr-notice",
+			"context": [{ "t": "text", "text": content }],
+		})));
+
+		assert!(rendered.contains("## System Notice: ACP Async MCP Progress TTSR"));
+		assert!(rendered.contains(&format!("`````xml\n{content}\n`````")));
+	}
+
+	#[test]
+	fn advisor_rows_hide_xml_and_sanitize_qualifiers() {
+		let rendered = render_lineage(
+			&tree(json!({
+				"k": "custom",
+				"kind": "advisor",
+				"data": {
+					"notes": [{
+						"note": "Check error\nhandling.",
+						"advisor": "\u{1b}[31msec\u{1b}[0m\tteam\nlead",
+						"severity": "\u{1b}[1mblocker\u{1b}[0m",
+					}],
+				},
+				"context": [{
+					"t": "text",
+					"text": "<advisory severity=\"blocker\">Check error handling.</advisory>",
+				}],
+			})),
+			"root",
+		);
+
+		assert!(rendered.contains("advisor (sec team lead, blocker): Check error handling."));
+		assert!(!rendered.contains("<advisory"));
+		assert!(!rendered.contains('\u{1b}'));
+		assert_eq!(
+			rendered
+				.lines()
+				.filter(|line| line.contains("advisor ("))
+				.count(),
+			1
+		);
+	}
 }

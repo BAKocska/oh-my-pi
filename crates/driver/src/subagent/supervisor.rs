@@ -19,7 +19,7 @@ use omp_agent::{
 };
 use omp_core::{Str, sf};
 use omp_proto::{
-	inference::v1::turn_event,
+	inference::v1::{Outcome, turn_event},
 	thread::v1::{self as thread, Item, item},
 };
 use omp_tool::{ArtifactLifetime, ExpectedArtifact, JobKind, JobMetadata, JobOwner, JobRef};
@@ -927,11 +927,12 @@ async fn supervised_submit<C: TurnClient + Clone + Send + 'static>(
 	tokio::pin!(submission);
 	let deadline = Instant::now() + Duration::from_millis(settings.max_runtime_ms.max(1));
 	let mut runtime_limit_active = settings.max_runtime_ms != 0;
+	let mut observed_outcomes = 0;
 	let mut pending_terminal_yield = None;
+	let mut committed_terminal_yield = None;
 	loop {
 		tokio::select! {
 			biased;
-			result = &mut submission => return result.map_err(SupervisorError::Agent),
 			event = events.recv() => {
 				let Ok(event) = event else {
 					continue;
@@ -942,7 +943,9 @@ async fn supervised_submit<C: TurnClient + Clone + Send + 'static>(
 					&mailbox,
 					settings,
 					abort,
+					&mut observed_outcomes,
 					&mut pending_terminal_yield,
+					&mut committed_terminal_yield,
 				)? {
 					return Err(SupervisorError::RequestBudget {
 						requests: state.progress().requests,
@@ -952,6 +955,10 @@ async fn supervised_submit<C: TurnClient + Clone + Send + 'static>(
 				if state.yield_committed() {
 					runtime_limit_active = false;
 				}
+			},
+			result = &mut submission => {
+				return preserve_committed_yield(result, committed_terminal_yield)
+					.map_err(SupervisorError::Agent);
 			},
 			() = tokio::time::sleep_until(deadline), if runtime_limit_active => {
 				if !runtime_limit_should_abort(state) {
@@ -970,13 +977,34 @@ async fn supervised_submit<C: TurnClient + Clone + Send + 'static>(
 	}
 }
 
+struct PendingTerminalYield {
+	call_id:         Str,
+	outcome:         Outcome,
+	committed_turns: u32,
+}
+
+/// Keeps a tool-confirmed terminal yield authoritative over later teardown
+/// failures while preserving an explicit caller abort.
+fn preserve_committed_yield(
+	result: Result<AgentRunSummary, AgentError>,
+	committed_terminal_yield: Option<AgentRunSummary>,
+) -> Result<AgentRunSummary, AgentError> {
+	match (result, committed_terminal_yield) {
+		(Err(AgentError::Interrupted), _) => Err(AgentError::Interrupted),
+		(Err(_), Some(summary)) => Ok(summary),
+		(result, _) => result,
+	}
+}
+
 fn handle_event(
 	state: &SubagentRunState,
 	event: &AgentEvent,
 	mailbox: &omp_agent::MailboxSender,
 	settings: &TaskSettings,
 	abort: &RwLock<Option<AbortHandle>>,
-	pending_terminal_yield: &mut Option<Str>,
+	observed_outcomes: &mut u32,
+	pending_terminal_yield: &mut Option<PendingTerminalYield>,
+	committed_terminal_yield: &mut Option<AgentRunSummary>,
 ) -> Result<bool, SupervisorError> {
 	match event {
 		AgentEvent::Turn { event, .. } => match event.event.as_ref() {
@@ -1020,8 +1048,13 @@ fn handle_event(
 				}
 			},
 			Some(turn_event::Event::Outcome(outcome)) => {
+				*observed_outcomes = observed_outcomes.saturating_add(1);
 				if let Some(call_id) = outcome.output.iter().find_map(terminal_yield_call) {
-					*pending_terminal_yield = Some(call_id);
+					*pending_terminal_yield = Some(PendingTerminalYield {
+						call_id,
+						outcome: outcome.clone(),
+						committed_turns: *observed_outcomes,
+					});
 				}
 				let usage = outcome.usage.as_ref();
 				state.record_activity(SubagentActivity {
@@ -1049,15 +1082,21 @@ fn handle_event(
 			_ => {},
 		},
 		AgentEvent::ToolFinished { call_id, item, .. } => {
-			if pending_terminal_yield.as_deref() == Some(call_id.as_str()) {
+			if pending_terminal_yield
+				.as_ref()
+				.is_some_and(|pending| pending.call_id.as_str() == call_id.as_str())
+			{
 				let succeeded = matches!(
 					item.kind.as_ref(),
 					Some(omp_proto::thread::v1::item::Kind::ToolResult(result))
 						if result.name == "yield" && !result.is_error
 				);
-				*pending_terminal_yield = None;
+				let pending = pending_terminal_yield.take();
 				if succeeded {
+					let pending = pending.expect("matching terminal yield is retained");
 					state.commit_yield();
+					*committed_terminal_yield =
+						Some(AgentRunSummary::settled(pending.outcome, pending.committed_turns, false));
 				}
 			}
 		},
@@ -1289,6 +1328,30 @@ mod tests {
 				.is_none()
 		);
 		assert!(terminal_yield_call(&yield_call(br#"{}"#)).is_none());
+	}
+
+	#[test]
+	fn post_yield_failure_does_not_replace_committed_outcome() {
+		let summary = AgentRunSummary::settled(Outcome::default(), 3, false);
+		let preserved = preserve_committed_yield(
+			Err(AgentError::Protocol("post-run cleanup failed")),
+			Some(summary),
+		)
+		.expect("committed yield is authoritative");
+		assert_eq!(preserved.committed_turns, 3);
+		assert!(!preserved.interrupted);
+
+		assert!(matches!(
+			preserve_committed_yield(Err(AgentError::Protocol("run failed before yielding")), None,),
+			Err(AgentError::Protocol("run failed before yielding"))
+		));
+		assert!(matches!(
+			preserve_committed_yield(
+				Err(AgentError::Interrupted),
+				Some(AgentRunSummary::settled(Outcome::default(), 3, false)),
+			),
+			Err(AgentError::Interrupted)
+		));
 	}
 
 	#[test]
