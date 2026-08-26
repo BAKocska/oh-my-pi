@@ -1966,7 +1966,7 @@ mod builtin_tests {
 	}
 
 	#[test]
-	fn quiescence_completes_when_the_last_job_settles() {
+	fn quiescence_holds_until_the_settled_result_is_consumed() {
 		let mailbox = Mailbox::new();
 		let (env, _transport) = EnvClient::in_process(0);
 		let board = Arc::new(JobBoard::new(env, mailbox.sender()));
@@ -1983,6 +1983,10 @@ mod builtin_tests {
 		let mut regime = QuiescenceBarrier::new(Arc::clone(&board));
 		assert!(matches!(apply(&mut regime, Point::Settle).control, Some(RegimeControl::Reject(_))));
 		board.settle("job-1", Item::default()).unwrap();
+		// A settled body is retained until a consumer claims it; the barrier
+		// must keep vetoing stop so the result cannot be dropped.
+		assert!(matches!(apply(&mut regime, Point::Settle).control, Some(RegimeControl::Reject(_))));
+		let _ = board.snapshot_consuming();
 		assert!(matches!(apply(&mut regime, Point::Settle).control, Some(RegimeControl::Complete)));
 	}
 

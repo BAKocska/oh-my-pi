@@ -47,6 +47,7 @@ use crate::{
 	PROMPT_CACHE_WARM_SUFFIX_TOKENS, ProjectionError, PromptMemoryQuery, PromptMemorySnapshotSource,
 	SnapcompactPreparation, StreamingEditGuard, TtsrMatch, TtsrRegistry, TtsrSource, TurnClient,
 	TurnInput, TurnSession, YieldPayload, YieldPayloadError, YieldPayloadValidator,
+	advisor::{ADVISOR_TOOL_LOOP_THRESHOLD, AdvisorToolLoopAction, AdvisorToolLoopGuard},
 	arbiter::{
 		Arbiter, PointCx,
 		context::{compaction_instruction, recover_checkpoint_state, rewind_background_warning},
@@ -478,7 +479,6 @@ pub struct Agent<C: TurnClient> {
 	abort_tx: Arc<watch::Sender<u64>>,
 	abort_rx: Receiver<u64>,
 	phase: AgentPhase,
-	control_serviced_during_turn: bool,
 	context: Option<ContextRef>,
 	cumulative_usage: pb::Usage,
 	pending_reasoning_demotion: bool,
@@ -504,6 +504,7 @@ pub struct Agent<C: TurnClient> {
 	unexpected_stop_classifier: Option<Arc<dyn UnexpectedStopClassifier>>,
 	unexpected_stop_retries: u8,
 	streaming_edit_guard: Option<Arc<StreamingEditGuard>>,
+	advisor_tool_loop: Option<AdvisorToolLoopGuard>,
 }
 
 impl<C: TurnClient + Clone> Agent<C> {
@@ -587,7 +588,6 @@ impl<C: TurnClient + Clone> Agent<C> {
 			abort_tx: Arc::new(abort_tx),
 			abort_rx,
 			phase: AgentPhase::Idle,
-			control_serviced_during_turn: false,
 			context,
 			cumulative_usage: pb::Usage::default(),
 			pending_reasoning_demotion: false,
@@ -613,6 +613,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 			unexpected_stop_classifier: None,
 			unexpected_stop_retries: 0,
 			streaming_edit_guard: None,
+			advisor_tool_loop: None,
 		}
 	}
 
@@ -808,6 +809,14 @@ impl<C: TurnClient + Clone> Agent<C> {
 		self.streaming_edit_guard = Some(Arc::new(StreamingEditGuard::new(cwd, enabled)));
 	}
 
+	/// Enables the repeated-tool-call safety ladder for an advisor agent.
+	///
+	/// Hosts must call this only for agents registered as
+	/// [`crate::AgentKind::Advisor`].
+	pub fn enable_advisor_tool_loop_guard(&mut self) {
+		self.advisor_tool_loop = Some(AdvisorToolLoopGuard::new(ADVISOR_TOOL_LOOP_THRESHOLD));
+	}
+
 	/// Returns the shared non-blocking telemetry fan-out handle.
 	pub fn firehose(&self) -> Arc<Firehose> {
 		Arc::clone(&self.firehose)
@@ -895,7 +904,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 			let rewritten = self
 				.journal
 				.rewrite_prompt_head(now_ms(), prompt_hash, &items, &[])?;
-			self.context = None;
+			self.clear_provider_context();
 			self.prompt_hash = None;
 			self.prompt_head_events.clone_from(&rewritten);
 			self.last_toolset_hash = None;
@@ -948,7 +957,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 		let rewritten = self
 			.journal
 			.rewrite_prompt_head(now_ms(), prompt_hash, &items, &[])?;
-		self.context = None;
+		self.clear_provider_context();
 		self.prompt_head_events.clone_from(&rewritten);
 		Ok(ManualShakeOutcome {
 			mode,
@@ -1149,7 +1158,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 			.as_ref()
 			.map_or(0, |archive| archive.frames.len());
 		let event = self.journal.compact(now_ms(), compact)?;
-		self.context = None;
+		self.clear_provider_context();
 		self.prompt_hash = None;
 		self.prompt_head_events.clear();
 		self
@@ -1188,7 +1197,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 			to_entry:   Some(event),
 		}));
 		self.mailbox.discard_producer_interrupts();
-		self.context = None;
+		self.clear_provider_context();
 		self.prompt_hash = None;
 		self.prompt_head_events.clear();
 		self.last_toolset_hash = None;
@@ -1270,6 +1279,9 @@ impl<C: TurnClient + Clone> Agent<C> {
 		root_turn_id: TurnId,
 	) -> Result<AgentRunSummary, AgentError> {
 		let starting_prompt_slot = self.prompt_slot().unwrap_or("standard").to_str();
+		if let Some(guard) = self.advisor_tool_loop.as_mut() {
+			guard.begin_update();
+		}
 		if let Some(controller) = self.autolearn.as_mut() {
 			controller.begin_primary(starting_prompt_slot.as_str());
 		}
@@ -1302,10 +1314,47 @@ impl<C: TurnClient + Clone> Agent<C> {
 				.as_mut()
 				.map_or(CaptureDecision::None, |controller| controller.finish_capture(capture_aborted));
 		}
-		if result.is_err() {
+		if let Err(error) = &result {
+			// Hosts (chat transcript, print stderr, ACP) settle in-flight
+			// presentation off this bus event; the submit `Err` alone reaches
+			// only the submitting caller. Interrupts are a caller action, not
+			// a failure.
+			if !matches!(error, AgentError::Interrupted) {
+				self.events.publish(AgentEvent::Failed {
+					turn_id: Some(capture_root),
+					message: sf!("{error}"),
+				});
+			}
 			self.transition(AgentPhase::Idle);
 		}
 		result
+	}
+
+	fn clear_provider_context(&mut self) {
+		self.context = None;
+		if let Some(guard) = self.advisor_tool_loop.as_mut() {
+			guard.reset();
+		}
+	}
+
+	fn settle_advisor_tool_loop_abort(
+		&mut self,
+		outcome: Outcome,
+		committed_turns: u32,
+		next: Vec<Item>,
+		mut immediate: Vec<Interrupt>,
+		mut boundary: Vec<Interrupt>,
+	) -> Result<AgentRunSummary, AgentError> {
+		for item in next {
+			self
+				.journal
+				.append_optimistic(now_ms(), item, self.prompt_hash)?;
+		}
+		immediate.append(&mut boundary);
+		self.mailbox.requeue_front(immediate);
+		self.publish_live_history()?;
+		self.transition(AgentPhase::Idle);
+		Ok(run_summary(Some(outcome), committed_turns, false))
 	}
 
 	async fn submit_inner(
@@ -1423,11 +1472,17 @@ impl<C: TurnClient + Clone> Agent<C> {
 					turn
 				},
 				Ok(RunTurnResult::Ttsr(trigger)) => {
+					self.journal.append_aborted_assistant(
+						now_ms(),
+						turn_id.as_str(),
+						ttsr_silent_abort_item(&trigger.matches),
+						self.prompt_hash,
+					)?;
 					self
 						.journal
 						.abort_turn(now_ms(), turn_id.as_str(), AbortDisposition::Continue)?;
 					self.arbiter.flush(&mut self.journal, now_ms())?;
-					self.context = None;
+					self.clear_provider_context();
 					let next_turn_id = follow_up_id(&turn_id, committed_turns);
 					let reminder_text = ttsr_reminder_text(&trigger.matches);
 					let reminder = ttsr_reminder_item(reminder_text.clone());
@@ -1446,7 +1501,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 						.journal
 						.abort_turn(now_ms(), turn_id.as_str(), AbortDisposition::Exhausted)?;
 					self.arbiter.flush(&mut self.journal, now_ms())?;
-					self.context = None;
+					self.clear_provider_context();
 					self.pending_reasoning_demotion = true;
 					abort_generation = *self.abort_rx.borrow_and_update();
 					self.drain_control();
@@ -1465,9 +1520,6 @@ impl<C: TurnClient + Clone> Agent<C> {
 						continue;
 					}
 					self.transition(AgentPhase::Idle);
-					if self.control_serviced_during_turn {
-						return Err(AgentError::Interrupted);
-					}
 					return Ok(run_summary(last_outcome, committed_turns, true));
 				},
 				Err(AgentError::Turn(TurnError::Terminal(mut error)))
@@ -1480,7 +1532,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 							AbortDisposition::Exhausted,
 						)?;
 						self.arbiter.flush(&mut self.journal, now_ms())?;
-						self.context = None;
+						self.clear_provider_context();
 						return Err(AgentError::Turn(TurnError::Terminal(error)));
 					}
 					self
@@ -1504,7 +1556,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 						.journal
 						.abort_turn(now_ms(), turn_id.as_str(), disposition)?;
 					self.arbiter.flush(&mut self.journal, now_ms())?;
-					self.context = None;
+					self.clear_provider_context();
 					if exhausted {
 						error.detail = EmptyOutputRetry::cap_detail(&error);
 						return Err(AgentError::Turn(TurnError::Terminal(error)));
@@ -1538,7 +1590,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 						.journal
 						.abort_turn(now_ms(), turn_id.as_str(), disposition)?;
 					self.arbiter.flush(&mut self.journal, now_ms())?;
-					self.context = None;
+					self.clear_provider_context();
 					if routes.is_empty() {
 						// Keep the terminal explanation in the canonical
 						// transcript while project_journal excludes this marked
@@ -1569,7 +1621,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 						.journal
 						.abort_turn(now_ms(), turn_id.as_str(), AbortDisposition::Exhausted)?;
 					self.arbiter.flush(&mut self.journal, now_ms())?;
-					self.context = None;
+					self.clear_provider_context();
 					let order = self.state.snapshot().compaction.clone();
 					if self.recover_context_overflow(&order).await {
 						let next_turn_id = follow_up_id(&turn_id, committed_turns);
@@ -1594,7 +1646,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 						.journal
 						.abort_turn(now_ms(), turn_id.as_str(), disposition)?;
 					self.arbiter.flush(&mut self.journal, now_ms())?;
-					self.context = None;
+					self.clear_provider_context();
 					if routes.is_empty() {
 						return Err(AgentError::Turn(error));
 					}
@@ -1618,7 +1670,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 							AbortDisposition::Continue,
 						)?;
 						self.arbiter.flush(&mut self.journal, now_ms())?;
-						self.context = None;
+						self.clear_provider_context();
 						self.arbiter.set_retry_chain(routes);
 						let next_turn_id = follow_up_id(&turn_id, committed_turns);
 						pending_indexes = self.append_pending(&next_turn_id, [recovery_prompt_item(
@@ -1704,6 +1756,10 @@ impl<C: TurnClient + Clone> Agent<C> {
 					.iter()
 					.any(|call| effects_mutate_environment(call.effects()));
 				let call_digest = tool_call_digest(&outcome.output);
+				let advisor_tool_loop = self
+					.advisor_tool_loop
+					.as_mut()
+					.map_or(AdvisorToolLoopAction::Continue, |guard| guard.observe(call_digest.clone()));
 				let call_ids: Vec<Str> = outcome
 					.output
 					.iter()
@@ -1791,7 +1847,6 @@ impl<C: TurnClient + Clone> Agent<C> {
 							command = self.receivers.host_commands.recv_async() => {
 								if let Ok(command) = command {
 									self.handle_host_control(command);
-									self.control_serviced_during_turn = true;
 								}
 							},
 							event = self.control_mailbox.handle_next(&mut self.journal) => {
@@ -1865,23 +1920,40 @@ impl<C: TurnClient + Clone> Agent<C> {
 				if let Some(reminder) = self.take_deferred_ttsr(turn_id.as_str())? {
 					next.insert(0, reminder);
 				}
-				self.loop_signal.observe(
-					call_digest,
-					made_environment_effect,
-					self.arbiter.empty_output_retry_spent(),
-				);
-				if self.loop_signal.repeats >= 3 {
-					next.insert(
-						0,
-						tool_loop_redirect_item(
-							self.loop_signal.repeats,
-							self
-								.loop_signal
-								.digest
-								.as_deref()
-								.unwrap_or("identical arguments"),
-						),
-					);
+				match advisor_tool_loop {
+					AdvisorToolLoopAction::Continue if self.advisor_tool_loop.is_none() => {
+						self.loop_signal.observe(
+							call_digest,
+							made_environment_effect,
+							self.arbiter.empty_output_retry_spent(),
+						);
+						if self.loop_signal.repeats >= 3 {
+							next.insert(
+								0,
+								tool_loop_redirect_item(
+									self.loop_signal.repeats,
+									self
+										.loop_signal
+										.digest
+										.as_deref()
+										.unwrap_or("identical arguments"),
+								),
+							);
+						}
+					},
+					AdvisorToolLoopAction::Redirect { count, digest } => {
+						next.insert(0, tool_loop_redirect_item(count, digest.as_str()));
+					},
+					AdvisorToolLoopAction::Abort { .. } => {
+						return self.settle_advisor_tool_loop_abort(
+							outcome,
+							committed_turns,
+							next,
+							immediate,
+							boundary,
+						);
+					},
+					AdvisorToolLoopAction::Continue => {},
 				}
 				if self.execute_scheduled_rewinds()? {
 					self.transition(AgentPhase::Idle);
@@ -2219,7 +2291,16 @@ impl<C: TurnClient + Clone> Agent<C> {
 		let mut indexes = Vec::new();
 		for interrupt in interrupts {
 			if let InterruptSource::Job { id } = &interrupt.source {
-				indexes.push(self.journal.settle_job(ts, id.as_str(), interrupt.item)?);
+				let Some(settlement) = self.jobs.lease_delivery(id.as_str()) else {
+					continue;
+				};
+				indexes.push(
+					self
+						.journal
+						.settle_job(ts, id.as_str(), settlement.item.clone())?,
+				);
+				let claimed = settlement.lease.claim();
+				debug_assert!(claimed.is_ok(), "delivery lease must remain exclusive through commit");
 				self
 					.events
 					.publish(AgentEvent::JobSettled { job_id: id.clone() });
@@ -2261,7 +2342,6 @@ impl<C: TurnClient + Clone> Agent<C> {
 		turn_id: TurnId,
 		pending: Vec<u64>,
 	) -> Result<RunTurnResult, AgentError> {
-		self.control_serviced_during_turn = false;
 		let _activity = self.run_activity.as_ref().map(|activity| {
 			activity.enter();
 			RunActivityGuard(Arc::clone(activity))
@@ -2745,7 +2825,6 @@ impl<C: TurnClient + Clone> Agent<C> {
 				command = self.receivers.host_commands.recv_async() => {
 					if let Ok(command) = command {
 						self.handle_host_control(command);
-						self.control_serviced_during_turn = true;
 					}
 				},
 				event = self.control_mailbox.handle_next(&mut self.journal) => {
@@ -2805,7 +2884,6 @@ impl<C: TurnClient + Clone> Agent<C> {
 						match command {
 							Ok(command) => {
 								self.handle_host_control(command);
-								self.control_serviced_during_turn = true;
 								continue;
 							},
 							Err(_) => std::future::pending().await,
@@ -2815,12 +2893,10 @@ impl<C: TurnClient + Clone> Agent<C> {
 						match event {
 							ControlMailboxEvent::Closed => std::future::pending().await,
 							ControlMailboxEvent::JournalHandled => {
-								self.control_serviced_during_turn = true;
 								continue;
 							},
 							ControlMailboxEvent::Rewind(rewind) => {
 								self.pending_rewinds.push_back(rewind);
-								self.control_serviced_during_turn = true;
 								continue;
 							},
 							ControlMailboxEvent::Regime(regime) => {
@@ -2829,7 +2905,6 @@ impl<C: TurnClient + Clone> Agent<C> {
 									&mut self.journal,
 									regime,
 								);
-								self.control_serviced_during_turn = true;
 								continue;
 							},
 						}
@@ -2859,7 +2934,6 @@ impl<C: TurnClient + Clone> Agent<C> {
 							match command {
 								Ok(command) => {
 									self.handle_host_control(command);
-									self.control_serviced_during_turn = true;
 									continue;
 								},
 								Err(_) => std::future::pending().await,
@@ -2869,21 +2943,18 @@ impl<C: TurnClient + Clone> Agent<C> {
 							match event {
 								ControlMailboxEvent::Closed => std::future::pending().await,
 								ControlMailboxEvent::JournalHandled => {
-									self.control_serviced_during_turn = true;
 									continue;
 								},
 								ControlMailboxEvent::Rewind(rewind) => {
 									self.pending_rewinds.push_back(rewind);
-									self.control_serviced_during_turn = true;
 									continue;
 								},
 								ControlMailboxEvent::Regime(regime) => {
 									Self::handle_regime_control(
-									&mut self.arbiter,
-									&mut self.journal,
-									regime,
-								);
-									self.control_serviced_during_turn = true;
+										&mut self.arbiter,
+										&mut self.journal,
+										regime,
+									);
 									continue;
 								},
 							}
@@ -3184,7 +3255,7 @@ impl<C: TurnClient + Clone> Agent<C> {
 		};
 		if authority.redeem(evidence).await {
 			authority.reseed_history().await;
-			self.context = None;
+			self.clear_provider_context();
 		}
 	}
 
@@ -3498,6 +3569,13 @@ impl<C: TurnClient + Clone> Agent<C> {
 			RegimeControl::Stop { activation, now_ms, reply } => {
 				let result = arbiter
 					.stop(activation.as_str(), now_ms, journal)
+					.map_err(ControlError::from);
+				let _ = reply.send(result);
+			},
+			RegimeControl::StopSnapshot { activation, now_ms, reply } => {
+				let result = arbiter
+					.stop(activation.as_str(), now_ms, journal)
+					.map(|stopped| (stopped, arbiter.regimes().records()))
 					.map_err(ControlError::from);
 				let _ = reply.send(result);
 			},
@@ -4366,6 +4444,31 @@ fn terminal_error_item(error: &pb::TurnError) -> Item {
 		}),
 	}
 }
+fn ttsr_silent_abort_item(matches: &[TtsrMatch]) -> Item {
+	let names = matches
+		.iter()
+		.map(|matched| matched.name.as_str())
+		.collect::<Vec<_>>()
+		.join(", ");
+	Item {
+		seq:           0,
+		created_at_ms: now_ms(),
+		kind:          Some(item::Kind::Message(thread::Message {
+			role:  thread::Role::Assistant as i32,
+			parts: Vec::new(),
+		})),
+		props:         Some(pb::ValueMap {
+			fields: BTreeMap::from([
+				(crate::journal_kinds::SILENT_ABORT_PROP.to_owned(), pb::Value {
+					kind: Some(value::Kind::Bool(true)),
+				}),
+				(crate::journal_kinds::ABORT_REASON_PROP.to_owned(), pb::Value {
+					kind: Some(value::Kind::String(format!("TTSR matched rule: {names}"))),
+				}),
+			]),
+		}),
+	}
+}
 
 fn tool_loop_redirect_item(count: u32, digest: &str) -> Item {
 	let mut content = String::new();
@@ -5003,6 +5106,48 @@ mod tests {
 		fs::remove_file(path).expect("remove journal");
 	}
 	#[tokio::test]
+	async fn plan_regime_exit_mid_turn_is_a_caller_abort() {
+		let (journal, path) = test_journal("plan-exit-abort");
+		let opened = Arc::new(Mutex::new(Vec::new()));
+		let client = ScriptedClient {
+			scripts: Arc::new(Mutex::new(VecDeque::from([pending_text_script()]))),
+			opened:  Arc::clone(&opened),
+		};
+		let (env, _transport) = EnvClient::in_process(1);
+		let mut agent =
+			Agent::new(client, env, AgentState::new(AgentSnapshot::default()), journal, test_caps());
+		let (spec, machine) = crate::core_regime("plan").expect("plan regime");
+		let receipt = agent
+			.start_regime(spec, machine, StartOptions { now_ms: now_ms(), queue: false })
+			.expect("start plan regime");
+		let control = agent.control();
+		let abort = agent.abort_handle();
+		let exiting = async {
+			wait_for_opened(&opened, 1).await;
+			assert!(
+				control
+					.stop_regime_snapshot(receipt.activation)
+					.await
+					.expect("stop live plan regime")
+					.0
+			);
+			abort.abort();
+		};
+		let (summary, ()) = tokio::join!(
+			agent.submit([message(thread::Role::User, "plan this")], TurnId::new("plan-exit-turn"),),
+			exiting,
+		);
+		let summary = summary.expect("plan exit returns a caller-abort summary");
+		assert!(summary.interrupted);
+		assert_eq!(summary.settlement, RunSettlement::CallerAbort);
+		assert_eq!(agent.phase, AgentPhase::Idle);
+		assert!(agent.pending_reasoning_demotion);
+		assert!(agent.journal().pending_turn().is_none());
+		drop(agent);
+		fs::remove_file(path).expect("remove journal");
+	}
+
+	#[tokio::test]
 	async fn caller_abort_interrupts_tool_batch_and_stages_results() {
 		let (journal, path) = test_journal("batch-abort");
 		let identity = ToolIdentity { name: sf!("pending"), rev: Rev { family: sf!("test"), n: 1 } };
@@ -5220,7 +5365,9 @@ mod tests {
 		assert!(rows.is_empty());
 		abort.abort();
 		let (agent, result) = active.await.expect("active turn task");
-		assert!(matches!(result, Err(AgentError::Interrupted)));
+		let summary = result.expect("caller abort settles the active turn");
+		assert!(summary.interrupted);
+		assert_eq!(summary.settlement, RunSettlement::CallerAbort);
 		drop(agent);
 		fs::remove_file(path).expect("remove journal");
 	}
@@ -5331,6 +5478,72 @@ mod tests {
 		let result = sleep_with_deadline(Duration::from_secs(60), Some(deadline)).await;
 		assert!(matches!(result, Err(AgentError::Deadline)));
 	}
+	#[test]
+	fn advisor_tool_loop_abort_settles_without_terminal_failure() {
+		let (journal, path) = test_journal("advisor-tool-loop-abort");
+		let client = ScriptedClient {
+			scripts: Arc::new(Mutex::new(VecDeque::new())),
+			opened:  Arc::new(Mutex::new(Vec::new())),
+		};
+		let (env, _transport) = EnvClient::in_process(1);
+		let mut agent =
+			Agent::new(client, env, AgentState::new(AgentSnapshot::default()), journal, test_caps());
+		agent.enable_advisor_tool_loop_guard();
+		let result = agent
+			.settle_advisor_tool_loop_abort(
+				Outcome { stop: pb::StopReason::StopToolUse as i32, ..Outcome::default() },
+				6,
+				vec![message(thread::Role::User, "bounded advisor stop")],
+				Vec::new(),
+				Vec::new(),
+			)
+			.expect("advisor loop bound settles cleanly");
+		assert!(!result.interrupted);
+		assert_eq!(result.settlement, RunSettlement::Warning);
+		assert_eq!(agent.phase, AgentPhase::Idle);
+		assert!(agent.journal().pending_turn().is_none());
+		let items = agent
+			.journal()
+			.items_at(&agent.journal().live_item_events().expect("live events"))
+			.expect("live items");
+		assert!(items.iter().any(|item| {
+			matches!(
+				item.kind.as_ref(),
+				Some(item::Kind::Message(message))
+					if message.parts.iter().any(|part| {
+						matches!(
+							part.kind.as_ref(),
+							Some(part::Kind::Text(text)) if text == "bounded advisor stop"
+						)
+					})
+			)
+		}));
+		drop(agent);
+		fs::remove_file(path).expect("remove journal");
+	}
+	#[test]
+	fn ttsr_abort_item_carries_structural_suppression_and_reason() {
+		let item = ttsr_silent_abort_item(&[TtsrMatch {
+			name:           sf!("no-unwrap"),
+			content:        sf!("avoid unwrap"),
+			interrupt_mode: crate::TtsrInterruptMode::Always,
+		}]);
+		let props = item.props.expect("TTSR abort item has properties");
+		assert_eq!(
+			props
+				.fields
+				.get(crate::journal_kinds::SILENT_ABORT_PROP)
+				.and_then(|value| value.kind.as_ref()),
+			Some(&value::Kind::Bool(true))
+		);
+		assert_eq!(
+			props
+				.fields
+				.get(crate::journal_kinds::ABORT_REASON_PROP)
+				.and_then(|value| value.kind.as_ref()),
+			Some(&value::Kind::String("TTSR matched rule: no-unwrap".to_owned()))
+		);
+	}
 
 	#[test]
 	fn run_summary_classifies_terminal_outcomes_and_projects_assistant() {
@@ -5344,6 +5557,9 @@ mod tests {
 			false,
 		);
 		assert_eq!(maximum.settlement, RunSettlement::MaxTokens);
+		let plan_exit = AgentRunSummary::settled(end_outcome("partial"), 0, true);
+		assert!(plan_exit.interrupted);
+		assert_eq!(plan_exit.settlement, RunSettlement::CallerAbort);
 		assert_eq!(
 			AgentRunSummary::silent_compaction_transition(None, 1).settlement,
 			RunSettlement::SilentCompactionTransition

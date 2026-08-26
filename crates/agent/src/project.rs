@@ -153,6 +153,18 @@ fn is_terminal_error_item(item: &thread_pb::Item) -> bool {
 		.and_then(|value| value.kind.as_ref())
 		.is_some_and(|kind| matches!(kind, value::Kind::Bool(true)))
 }
+fn is_silent_abort_item(item: &thread_pb::Item) -> bool {
+	matches!(
+		item.kind.as_ref(),
+		Some(item::Kind::Message(message))
+			if message.role == thread_pb::Role::Assistant as i32
+	) && item
+		.props
+		.as_ref()
+		.and_then(|props| props.fields.get(journal_kinds::SILENT_ABORT_PROP))
+		.and_then(|value| value.kind.as_ref())
+		.is_some_and(|kind| matches!(kind, value::Kind::Bool(true)))
+}
 ///
 /// Rewinds are already resolved in `live`. Sequence amendments update only the
 /// working copy; original item events remain untouched.
@@ -172,7 +184,7 @@ pub fn project_journal(
 		};
 		match &event.kind {
 			Kind::Item(record) => {
-				if is_terminal_error_item(&record.item) {
+				if is_terminal_error_item(&record.item) || is_silent_abort_item(&record.item) {
 					continue;
 				}
 				let position = items.len();
@@ -662,6 +674,69 @@ mod tests {
 		assert!(rendered.contains("<summary>"));
 		assert!(rendered.contains("portable state"));
 		assert!(!rendered.contains("<handoff>"));
+	}
+	#[test]
+	fn silent_abort_marker_is_durable_but_absent_from_replay_projection() {
+		let path = env::temp_dir().join(format!(
+			"omp-agent-project-silent-abort-{}-{}.jsonl",
+			std::process::id(),
+			NEXT_PATH.fetch_add(1, Ordering::Relaxed)
+		));
+		let mut writer = Writer::create(&path, &Header {
+			v:       4,
+			id:      SessionId(sf!("silent-abort")),
+			created: 1,
+			cwd:     env::temp_dir(),
+		})
+		.expect("create transcript");
+		let item = thread_pb::Item {
+			kind: Some(item::Kind::Message(thread_pb::Message {
+				role:  thread_pb::Role::Assistant as i32,
+				parts: Vec::new(),
+			})),
+			props: Some(pb::ValueMap {
+				fields: BTreeMap::from([
+					(crate::journal_kinds::SILENT_ABORT_PROP.to_owned(), pb::Value {
+						kind: Some(value::Kind::Bool(true)),
+					}),
+					(crate::journal_kinds::ABORT_REASON_PROP.to_owned(), pb::Value {
+						kind: Some(value::Kind::String("TTSR matched rule: no-unwrap".to_owned())),
+					}),
+				]),
+			}),
+			..Default::default()
+		};
+		writer
+			.append(&Event {
+				ts:   2,
+				kind: Kind::Item(ItemRecord {
+					item:        item.clone(),
+					turn_id:     None,
+					prompt_hash: None,
+				}),
+			})
+			.expect("append aborted assistant");
+		drop(writer);
+
+		let log = load(&path).expect("load transcript");
+		let Some(omp_storage::transcript::Entry::Ok(event)) = log.get(0) else {
+			panic!("durable entry is an assistant item");
+		};
+		let Event { kind: Kind::Item(record), .. } = event.as_ref() else {
+			panic!("durable entry is an assistant item");
+		};
+		assert_eq!(record.item, item);
+		let mut live = LiveSet::new();
+		log.live_into(&mut live);
+		let projected = project_journal(&log, &live, &omp_tool::Registry::new(), &CapsBase {
+			maximum_parts:      1,
+			maximum_text_bytes: 1,
+			media:              false,
+			model_class:        ModelClass::Standard,
+		})
+		.expect("project transcript");
+		assert!(projected.items.is_empty());
+		fs::remove_file(path).expect("remove transcript");
 	}
 
 	#[test]

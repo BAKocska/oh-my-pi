@@ -11,8 +11,9 @@ pub use advise::{
 	AdvisorAdviceQueue, QueuedAdvice, tool as advise_tool,
 };
 pub use guard::{
-	ADVICE_DEDUPE_LIMIT, AdvisorEmissionGuard, AdvisorQuarantineReason, AdvisorSuppression,
-	GuardedAdvice, normalize_advice, quarantine_advisor_turn,
+	ADVICE_DEDUPE_LIMIT, ADVISOR_TOOL_LOOP_THRESHOLD, AdvisorEmissionGuard, AdvisorQuarantineReason,
+	AdvisorSuppression, AdvisorToolLoopAction, AdvisorToolLoopGuard, GuardedAdvice,
+	normalize_advice, quarantine_advisor_turn,
 };
 pub use rules::{
 	AdvisorRoster, AdvisorRule, AdvisorRuleError, AdvisorRuleWarning, DEFAULT_ADVISOR_TOOLS,

@@ -340,6 +340,7 @@ async fn fourth_empty_output_hits_cap_after_exactly_three_reminders() {
 		terminal(omp_proto::inference::v1::turn_error::Kind::EmptyOutput),
 		Ok(success()),
 	]);
+	let observed = agent.events().subscribe_lossless();
 	let error = agent
 		.submit([user_text("original")], TurnId::new("root"))
 		.await
@@ -348,6 +349,17 @@ async fn fourth_empty_output_hits_cap_after_exactly_three_reminders() {
 		panic!("expected terminal turn error")
 	};
 	assert_eq!(error.detail, CAP_DETAIL);
+	// Hosts settle in-flight transcript widgets off this bus event; the
+	// submit `Err` alone reaches only the submitting caller.
+	let mut failed = None;
+	while let Ok(event) = observed.try_recv() {
+		if let omp_agent::AgentEvent::Failed { turn_id, message } = event.as_ref() {
+			failed = Some((turn_id.clone(), message.clone()));
+		}
+	}
+	let (failed_turn, failed_message) = failed.expect("terminal cap publishes AgentEvent::Failed");
+	assert_eq!(failed_turn.as_ref().map(|id| id.as_str().to_owned()), Some("root".to_owned()));
+	assert!(failed_message.contains("terminal turn error"), "{failed_message}");
 	{
 		let inputs = opened.lock();
 		assert_eq!(inputs.len(), 4);

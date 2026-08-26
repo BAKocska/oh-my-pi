@@ -81,6 +81,7 @@ struct JobEntry {
 	settlement:        Option<thread::Item>,
 	suppressions:      usize,
 	leased:            bool,
+	delivery_queued:   bool,
 	delivery_attempts: u8,
 }
 
@@ -186,6 +187,7 @@ impl JobBoard {
 					settlement:        None,
 					suppressions:      0,
 					leased:            false,
+					delivery_queued:   false,
 					delivery_attempts: 0,
 				});
 			},
@@ -257,6 +259,86 @@ impl JobBoard {
 			.collect()
 	}
 
+	/// Copies all job rows while atomically consuming each currently recoverable
+	/// terminal body.
+	///
+	/// A body claimed here is removed from automatic delivery. Later snapshots
+	/// retain the terminal row but omit its already-consumed body.
+	pub fn snapshot_consuming(&self) -> Vec<JobRef> {
+		self.inner.prune_recent();
+		let mut pending = self.inner.pending.lock();
+		let mut snapshots = Vec::with_capacity(pending.len());
+		let recoverable = pending
+			.iter()
+			.filter_map(|(id, entry)| {
+				if entry.settlement.is_some() && !entry.leased {
+					Some(id.clone())
+				} else {
+					snapshots.push(entry.job.clone());
+					None
+				}
+			})
+			.collect::<Vec<_>>();
+		for id in recoverable {
+			let Some(entry) = pending.remove(&id) else {
+				continue;
+			};
+			let mut recovered = entry.job.clone();
+			if let Some(item) = entry.settlement.as_ref()
+				&& let Some(body) = settlement_body(item)
+			{
+				let mut metadata = (*recovered.metadata).clone();
+				if metadata.status == JobStatus::Failed {
+					metadata.error = Some(body);
+				} else {
+					metadata.result = Some(body);
+				}
+				recovered.metadata = Arc::new(metadata);
+			}
+			snapshots.push(recovered);
+			self.inner.finish_consumed(id, entry.job);
+		}
+		drop(pending);
+		let seen = snapshots
+			.iter()
+			.map(|job| job.id.clone())
+			.collect::<BTreeSet<_>>();
+		let recent = self.inner.recent.lock();
+		snapshots.extend(
+			recent
+				.values()
+				.filter(|job| !seen.contains(job.id.as_str()))
+				.cloned(),
+		);
+		snapshots.sort_by(|left, right| left.id.cmp(&right.id));
+		self.inner.bump();
+		snapshots
+	}
+
+	/// Acquires the queued automatic delivery immediately before its durable
+	/// session insertion.
+	///
+	/// `None` means a foreground snapshot or another consumer already claimed
+	/// the body. Dropping the returned lease retries normal delivery.
+	pub fn lease_delivery(&self, job_id: &str) -> Option<JobSettlement> {
+		let mut pending = self.inner.pending.lock();
+		let entry = pending.get_mut(job_id)?;
+		if entry.settlement.is_none() || entry.leased || !entry.delivery_queued {
+			return None;
+		}
+		entry.leased = true;
+		entry.delivery_queued = false;
+		Some(JobSettlement {
+			job:   entry.job.clone(),
+			item:  entry.settlement.clone()?,
+			lease: SettlementLease {
+				inner:   Arc::downgrade(&self.inner),
+				job_id:  Str::new(job_id),
+				claimed: false,
+			},
+		})
+	}
+
 	/// Releases provisional delivery leases for this session when an
 	/// authoritative process listing proves the owned generation is absent.
 	pub fn release_missing_process_leases(&self, owner_session: &str, live: &BTreeSet<(Str, u64)>) {
@@ -312,6 +394,12 @@ impl JobBoard {
 	/// Copies bounded terminal deliveries that exhausted their retry budget.
 	pub fn dead_letters(&self) -> Vec<JobRef> {
 		self.inner.dead_letters.lock().values().cloned().collect()
+	}
+
+	/// Returns whether a terminal body was delivered, recovered, or discarded
+	/// and therefore must not be replayed.
+	pub fn is_result_consumed(&self, id: &str) -> bool {
+		self.inner.settled.lock().contains(id)
 	}
 
 	/// Suppresses automatic delivery for selected jobs until a settlement is
@@ -400,17 +488,18 @@ impl JobBoard {
 		Ok(CancelOutcome::Accepted)
 	}
 
-	/// Borrows pending jobs in stable identifier order without allocating.
+	/// Borrows unsettled and not-yet-consumed jobs in stable identifier order
+	/// without allocating.
 	pub fn pending(&self) -> PendingJobs<'_> {
 		PendingJobs { guard: self.inner.pending.lock() }
 	}
 
-	/// Returns the number of jobs awaiting settlement.
+	/// Returns the number of unsettled or not-yet-consumed jobs.
 	pub fn len(&self) -> usize {
 		self.inner.pending.lock().len()
 	}
 
-	/// Returns whether no jobs await settlement.
+	/// Returns whether no unsettled or not-yet-consumed jobs remain.
 	pub fn is_empty(&self) -> bool {
 		self.inner.pending.lock().is_empty()
 	}
@@ -534,24 +623,22 @@ impl JobBoardInner {
 		let Some(entry) = pending.get(job_id) else {
 			return Ok(());
 		};
-		if entry.suppressions != 0 || entry.leased {
+		if entry.suppressions != 0 || entry.leased || entry.delivery_queued {
 			return Ok(());
 		}
 		let Some(item) = entry.settlement.clone() else {
 			return Ok(());
 		};
 		let id = entry.job.id.clone();
-		let completed = entry.job.clone();
 		self.mailbox.try_enqueue(Interrupt {
 			class: InterruptClass::TurnBoundary,
 			item,
 			source: InterruptSource::Job { id: id.clone() },
 		})?;
-		pending.remove(job_id);
-		self.settled.lock().insert(id.clone());
-		if !self.retention.is_zero() {
-			self.recent.lock().insert(id, completed);
-		}
+		pending
+			.get_mut(job_id)
+			.expect("queued job retained under lock")
+			.delivery_queued = true;
 		Ok(())
 	}
 
@@ -566,19 +653,24 @@ impl JobBoardInner {
 		let id = entry.job.id.clone();
 		let completed = entry.job.clone();
 		pending.remove(job_id);
+		self.finish_consumed(id, completed);
+		drop(pending);
+		self.bump();
+		Ok(())
+	}
+
+	fn finish_consumed(&self, id: Str, completed: JobRef) {
 		self.settled.lock().insert(id.clone());
 		if !self.retention.is_zero() {
 			self.recent.lock().insert(id, completed);
 		}
-		drop(pending);
-		self.bump();
-		Ok(())
 	}
 
 	fn release_lease(&self, job_id: &str) {
 		let mut pending = self.pending.lock();
 		if let Some(entry) = pending.get_mut(job_id) {
 			entry.leased = false;
+			entry.delivery_queued = false;
 		}
 		let _ = self.flush_locked(job_id, &mut pending);
 		drop(pending);
@@ -613,7 +705,7 @@ impl JobBoardInner {
 	}
 }
 
-/// Locked, allocation-free view of jobs awaiting settlement.
+/// Locked, allocation-free view of unsettled and not-yet-consumed jobs.
 pub struct PendingJobs<'a> {
 	guard: MutexGuard<'a, BTreeMap<Str, JobEntry>>,
 }
@@ -818,6 +910,7 @@ impl JobWatch {
 				id.and_then(|id| {
 					let entry = pending.get_mut(&id)?;
 					entry.leased = true;
+					entry.delivery_queued = false;
 					entry.suppressions = entry.suppressions.saturating_sub(1);
 					Some((id, entry.job.clone(), entry.settlement.clone()?))
 				})
@@ -886,7 +979,11 @@ fn schedule_delivery_retry(inner: Weak<JobBoardInner>, job_id: Str) {
 		let Some(entry) = pending.get_mut(&job_id) else {
 			return;
 		};
-		if entry.suppressions != 0 || entry.leased || entry.settlement.is_none() {
+		if entry.suppressions != 0
+			|| entry.leased
+			|| entry.delivery_queued
+			|| entry.settlement.is_none()
+		{
 			return;
 		}
 		if entry.delivery_attempts >= DELIVERY_RETRY_LIMIT {
@@ -1128,6 +1225,24 @@ fn settlement_error_item(job: &JobRef, reason: &JobSettlementError) -> thread::I
 		))),
 	}])
 }
+fn settlement_body(item: &thread::Item) -> Option<Str> {
+	let parts = match item.kind.as_ref()? {
+		item::Kind::Message(message) => message.parts.as_slice(),
+		item::Kind::ToolResult(result) => result.parts.as_slice(),
+		item::Kind::ToolCall(_) => return None,
+	};
+	let mut body = String::new();
+	for text in parts.iter().filter_map(|part| match part.kind.as_ref() {
+		Some(thread::part::Kind::Text(text)) => Some(text.as_str()),
+		_ => None,
+	}) {
+		if !body.is_empty() {
+			body.push('\n');
+		}
+		body.push_str(text);
+	}
+	(!body.is_empty()).then(|| Str::from(body))
+}
 
 const fn system_item(parts: Vec<thread::Part>) -> thread::Item {
 	thread::Item {
@@ -1247,7 +1362,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn concurrent_settlement_enqueues_once_and_removes_pending_state() {
+	async fn concurrent_settlement_enqueues_once_and_retains_until_commit() {
 		let mut mailbox = Mailbox::new();
 		let (env, _transport) = EnvClient::in_process(0);
 		let board = JobBoard::new(env, mailbox.sender());
@@ -1270,14 +1385,34 @@ mod tests {
 		});
 
 		assert_eq!(settled.load(Ordering::Relaxed), 1);
-		assert!(board.is_empty());
+		assert!(!board.is_empty(), "queued delivery remains recoverable before commit");
 		assert_eq!(mailbox.len(), 1);
 		let interrupts = mailbox.drain(DrainPoint::TurnBoundary, false);
 		assert_eq!(interrupts.len(), 1);
 		assert_eq!(interrupts[0].class, InterruptClass::TurnBoundary);
 		assert_eq!(interrupts[0].source, InterruptSource::Job { id: sf!("job-1") });
+		let settlement = board
+			.lease_delivery("job-1")
+			.expect("queued delivery lease");
+		settlement.lease.claim().expect("committed delivery");
+		assert!(board.is_empty());
 		assert!(!board.settle("job-1", thread::Item::default()).unwrap());
 		assert!(mailbox.is_empty());
+	}
+
+	#[tokio::test]
+	async fn later_deliveries_enqueue_while_an_earlier_receipt_is_pending() {
+		let mailbox = Mailbox::new();
+		let (env, _transport) = EnvClient::in_process(0);
+		let board = JobBoard::new(env, mailbox.sender());
+		assert!(board.register(job("first", ArtifactLifetime::Session)));
+		assert!(board.register(job("second", ArtifactLifetime::Session)));
+
+		assert!(board.settle("first", thread::Item::default()).unwrap());
+		assert!(board.settle("second", thread::Item::default()).unwrap());
+
+		assert_eq!(mailbox.len(), 2);
+		assert_eq!(board.snapshot().len(), 2);
 	}
 
 	#[tokio::test]
@@ -1311,6 +1446,37 @@ mod tests {
 					.unwrap()
 			);
 		}
+	}
+
+	#[tokio::test]
+	async fn consuming_snapshot_returns_a_result_body_at_most_once() {
+		let mailbox = Mailbox::new();
+		let (env, _transport) = EnvClient::in_process(0);
+		let board = JobBoard::new(env, mailbox.sender());
+		assert!(board.register(job("once", ArtifactLifetime::Session)));
+		assert!(
+			board
+				.settle(
+					"once",
+					system_item(vec![thread::Part {
+						kind: Some(thread::part::Kind::Text("complete body".to_owned())),
+					}]),
+				)
+				.unwrap()
+		);
+
+		let first = board.snapshot_consuming();
+		assert_eq!(first.len(), 1);
+		assert_eq!(first[0].metadata.result.as_deref(), Some("complete body"));
+		assert!(board.is_result_consumed("once"));
+		let second = board.snapshot_consuming();
+		assert_eq!(second.len(), 1);
+		assert_eq!(second[0].metadata.result, None);
+		assert_eq!(second[0].metadata.error, None);
+		assert!(
+			board.lease_delivery("once").is_none(),
+			"stale queued injection cannot replay a recovered body"
+		);
 	}
 
 	#[tokio::test]
@@ -1378,6 +1544,11 @@ mod watch_tests {
 		assert!(mailbox.is_empty());
 		drop(watch);
 		assert_eq!(mailbox.len(), 1);
+		assert!(!board.is_empty(), "mailbox receipt is not a committed delivery");
+		let settlement = board
+			.lease_delivery("released")
+			.expect("queued delivery lease");
+		settlement.lease.claim().expect("commit queued delivery");
 		assert!(board.is_empty());
 	}
 }

@@ -70,6 +70,21 @@ impl RegimeFact {
 			wait_count: u32::try_from(resolution.waits.len()).unwrap_or(u32::MAX),
 		}
 	}
+
+	/// Whether the fact records any regime activity worth persisting.
+	///
+	/// Uncontested resolutions (no participants, no control, zero committed
+	/// effects) resolve on every stream delta; journaling them writes two
+	/// no-op lines per chunk. Only material facts are durable.
+	pub fn is_material(&self) -> bool {
+		!self.participants.is_empty()
+			|| self.control != "none"
+			|| self.controlling_activation.is_some()
+			|| self.rewrite_count > 0
+			|| self.append_count > 0
+			|| self.rejection_count > 0
+			|| self.wait_count > 0
+	}
 }
 
 #[derive(Clone, Debug)]
@@ -86,6 +101,7 @@ pub struct Arbiter {
 	checkpoint_notice:  context::CheckpointNotice,
 	retry_chain:        Option<settle::RetryChainRegime>,
 	pending_facts:      Vec<RegimeFact>,
+	pending_records:    Vec<RegimeRecord>,
 	subscribed:         PointSet,
 	fact_tx:            flume::Sender<RegimeFact>,
 	fact_rx:            Receiver<RegimeFact>,
@@ -101,6 +117,7 @@ impl Default for Arbiter {
 			checkpoint_notice: context::CheckpointNotice::default(),
 			retry_chain: None,
 			pending_facts: Vec::new(),
+			pending_records: Vec::new(),
 			subscribed: PointSet::EMPTY,
 			fact_tx,
 			fact_rx,
@@ -188,6 +205,11 @@ impl Arbiter {
 	}
 
 	/// Stops one activation after minimum duration and journals the transition.
+	///
+	/// While a durable turn is pending, the in-memory activation is released
+	/// immediately (so the next turn starts outside the regime) and the
+	/// terminal record is buffered for [`Arbiter::flush`] at settlement; the
+	/// journal rejects extension writes mid-turn.
 	pub fn stop(
 		&mut self,
 		activation: &str,
@@ -206,6 +228,10 @@ impl Arbiter {
 			return Ok(false);
 		}
 		terminal.status = RegimeStatus::Stopped;
+		if journal.pending_turn().is_some() {
+			self.pending_records.push(terminal);
+			return Ok(self.regimes.cancel(activation));
+		}
 		journal.append_regime_record(now_ms, &terminal)?;
 		let removed = self.regimes.cancel(activation);
 		if removed {
@@ -215,6 +241,9 @@ impl Arbiter {
 	}
 
 	/// Cancels one activation immediately and journals the transition.
+	///
+	/// Mid-turn cancellations release the activation now and buffer the
+	/// terminal record for [`Arbiter::flush`], mirroring [`Arbiter::stop`].
 	pub fn cancel(
 		&mut self,
 		activation: &str,
@@ -230,6 +259,10 @@ impl Arbiter {
 			return Ok(false);
 		};
 		terminal.status = RegimeStatus::Stopped;
+		if journal.pending_turn().is_some() {
+			self.pending_records.push(terminal);
+			return Ok(self.regimes.cancel(activation));
+		}
 		journal.append_regime_record(now_ms, &terminal)?;
 		let removed = self.regimes.cancel(activation);
 		self.checkpoint(journal, now_ms)?;
@@ -348,6 +381,9 @@ impl Arbiter {
 	}
 
 	/// Resolves and atomically appends the forensic fact to the journal.
+	///
+	/// Immaterial facts (see [`RegimeFact::is_material`]) are resolved and
+	/// reported on the telemetry channel but never journaled.
 	pub(crate) fn resolve_and_record(
 		&mut self,
 		point: Point,
@@ -356,6 +392,9 @@ impl Arbiter {
 		journal: &mut Journal,
 	) -> Result<ResolvedEvent, JournalError> {
 		let resolved = self.resolve(point, cx, tool_choices);
+		if !resolved.fact.is_material() {
+			return Ok(resolved);
+		}
 		if journal.pending_turn().is_some() {
 			self.pending_facts.push(resolved.fact.clone());
 		} else {
@@ -367,9 +406,14 @@ impl Arbiter {
 	}
 
 	/// Flushes facts buffered while a durable turn was pending.
+	///
+	/// Also lands terminal records for regimes stopped or cancelled mid-turn.
 	pub fn flush(&mut self, journal: &mut Journal, now_ms: u64) -> Result<(), JournalError> {
 		for fact in mem::take(&mut self.pending_facts) {
 			journal.append_regime_fact(now_ms, &fact)?;
+		}
+		for record in mem::take(&mut self.pending_records) {
+			journal.append_regime_record(now_ms, &record)?;
 		}
 		self.checkpoint(journal, now_ms)
 	}
@@ -1092,5 +1136,89 @@ pub(crate) mod stream {
 			})),
 			props:         None,
 		}
+	}
+}
+#[cfg(test)]
+mod tests {
+	use std::{env, fs};
+
+	use omp_core::sf;
+	use omp_storage::transcript::{Header, SessionId};
+
+	use super::*;
+	use crate::regime::{Next, RegimeContext, RegimeError, RegimeLifetime};
+
+	struct Noop;
+
+	impl Regime for Noop {
+		fn apply(&mut self, _: &mut RegimeContext<'_>, _: Next<'_>) -> Result<(), RegimeError> {
+			Ok(())
+		}
+
+		fn state(&self) -> Str {
+			Str::new_static("{}")
+		}
+
+		fn restore(&mut self, _: &str) -> Result<(), RegimeStateError> {
+			Ok(())
+		}
+	}
+
+	fn fact_lines(path: &std::path::Path) -> usize {
+		fs::read_to_string(path).map_or(0, |text| {
+			text
+				.lines()
+				.filter(|line| line.contains("dev.omp.core.regime-fact"))
+				.count()
+		})
+	}
+
+	#[test]
+	fn immaterial_resolutions_are_not_journaled() {
+		let path = env::temp_dir().join(format!(
+			"omp-agent-arbiter-facts-{}-{}.jsonl",
+			std::process::id(),
+			omp_core::Ulid::generate()
+		));
+		let mut journal = Journal::create(&path, &Header {
+			v:       4,
+			id:      SessionId(sf!("arbiter-facts")),
+			created: 1,
+			cwd:     env::temp_dir(),
+		})
+		.expect("create journal");
+		let mut arbiter = Arbiter::new();
+		let cx = PointCx { turn_id: Some("turn-1"), now_ms: 1, ..PointCx::default() };
+		for _ in 0..3 {
+			arbiter
+				.resolve_and_record(Point::Stream, &cx, None, &mut journal)
+				.expect("resolve immaterial stream point");
+		}
+		assert_eq!(fact_lines(&path), 0, "no-op resolutions must not journal facts");
+
+		let spec = sync::Arc::new(RegimeSpec {
+			id: sf!("noop"),
+			events: PointSet::from(Point::Stream),
+			precedence: 0,
+			max_steps: None,
+			committed_step_interval_ms: None,
+			on_limit: false,
+			lifetime: RegimeLifetime::Run,
+			family_rev: sf!("test@1"),
+			when: None,
+			owns: sync::Arc::from([]),
+			sets: sync::Arc::from([]),
+			minimum_duration_ms: None,
+		});
+		arbiter
+			.start(spec, Box::new(Noop), &mut journal, StartOptions { now_ms: 2, queue: false })
+			.expect("start regime");
+		let resolved = arbiter
+			.resolve_and_record(Point::Stream, &cx, None, &mut journal)
+			.expect("resolve material stream point");
+		assert!(resolved.fact.is_material(), "participating regime makes the fact material");
+		assert_eq!(fact_lines(&path), 1, "material resolutions stay durable");
+		drop(journal);
+		fs::remove_file(path).expect("remove journal");
 	}
 }

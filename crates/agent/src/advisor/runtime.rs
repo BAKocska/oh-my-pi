@@ -543,4 +543,15 @@ mod tests {
 		assert!(rewritten.reset);
 		assert_eq!(rewritten.entries[0].value, "replacement");
 	}
+	#[test]
+	fn external_interrupt_preserves_advice_after_immunity_expires() {
+		let account = ImmuneTurnAccount::new(0);
+		let context = DeliveryContext {
+			streaming: true,
+			externally_interrupted: true,
+			..DeliveryContext::default()
+		};
+		assert_eq!(account.evaluate(AdviceSeverity::Concern, context), AdviceDelivery::Preserve);
+		assert_eq!(account.evaluate(AdviceSeverity::Blocker, context), AdviceDelivery::Preserve);
+	}
 }

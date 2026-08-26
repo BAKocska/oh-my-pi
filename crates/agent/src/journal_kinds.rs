@@ -12,6 +12,8 @@ pub(crate) const REWIND_REPORT_KIND: &str = "dev.omp.core.rewind-report";
 pub(crate) const TTSR_INJECTION_KIND: &str = "dev.omp.core.ttsr-injection";
 pub(crate) const REGIME_FACT_KIND: &str = "dev.omp.core.regime-fact";
 pub(crate) const REGIME_RECORD_KIND: &str = "dev.omp.core.regime-record";
+pub(crate) const SILENT_ABORT_PROP: &str = "omp/silent-abort";
+pub(crate) const ABORT_REASON_PROP: &str = "omp/abort-reason";
 pub(crate) const TERMINAL_ERROR_PROP: &str = "omp/terminal-error";
 pub(crate) const CORE_REVISION: &str = "core.1";
 

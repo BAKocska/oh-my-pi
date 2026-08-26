@@ -12,6 +12,8 @@ use super::AdviceSeverity;
 
 /// Maximum accepted normalized notes retained by one advisor session.
 pub const ADVICE_DEDUPE_LIMIT: usize = 4096;
+/// Default consecutive identical-call threshold for an advisor update.
+pub const ADVISOR_TOOL_LOOP_THRESHOLD: u32 = 3;
 static HAZARD_PATTERNS: LazyLock<RegexSet> = LazyLock::new(|| {
 	RegexSet::new([
 		r"(?i)\buser\b.{0,80}\b(?:deleted|erased)\b.{0,80}\baccount\b",
@@ -25,6 +27,96 @@ const ACCOUNT_DELETION: usize = 0;
 const INSTRUCTION_OVERRIDE: usize = 1;
 const DESTRUCTIVE_SHELL: usize = 2;
 const DENIAL_INSTRUCTION: usize = 3;
+/// Escalation selected after observing one advisor tool-call turn.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AdvisorToolLoopAction {
+	/// The update has not reached its repeated-call threshold.
+	Continue,
+	/// Inject one corrective user-role message, then re-arm repetition
+	/// detection.
+	Redirect {
+		/// Number of consecutive equivalent calls that tripped the threshold.
+		count:  u32,
+		/// Stable digest of the repeated tool name and arguments.
+		digest: Str,
+	},
+	/// Cleanly terminate an update that ignored its first corrective.
+	Abort {
+		/// Number of post-corrective equivalent calls that tripped the threshold.
+		count:  u32,
+		/// Stable digest of the repeated tool name and arguments.
+		digest: Str,
+	},
+}
+
+/// Per-update ladder bounding repeated identical calls in an advisor's private
+/// loop.
+#[derive(Debug)]
+pub struct AdvisorToolLoopGuard {
+	threshold:       u32,
+	digest:          Option<Str>,
+	repeats:         u32,
+	redirect_issued: bool,
+}
+
+impl AdvisorToolLoopGuard {
+	/// Creates a guard, clamping a zero threshold to one completed call.
+	pub fn new(threshold: u32) -> Self {
+		Self {
+			threshold:       threshold.max(1),
+			digest:          None,
+			repeats:         0,
+			redirect_issued: false,
+		}
+	}
+
+	/// Starts a new externally submitted advisor update.
+	pub fn begin_update(&mut self) {
+		self.reset();
+	}
+
+	/// Clears detector and escalation state after an advisor context
+	/// replacement.
+	pub fn reset(&mut self) {
+		self.digest = None;
+		self.repeats = 0;
+		self.redirect_issued = false;
+	}
+
+	/// Records one completed tool-call shape and selects the next ladder action.
+	///
+	/// `digest` must cover the tool name and structured arguments. `None` marks
+	/// a non-tool turn and breaks a consecutive sequence. The first threshold
+	/// returns [`AdvisorToolLoopAction::Redirect`] and re-arms the counter; the
+	/// second threshold in the same update returns
+	/// [`AdvisorToolLoopAction::Abort`].
+	pub fn observe(&mut self, digest: Option<Str>) -> AdvisorToolLoopAction {
+		let Some(digest) = digest else {
+			self.digest = None;
+			self.repeats = 0;
+			return AdvisorToolLoopAction::Continue;
+		};
+		self.repeats = if self.digest.as_ref() == Some(&digest) {
+			self.repeats.saturating_add(1)
+		} else {
+			1
+		};
+		self.digest = Some(digest.clone());
+		if self.repeats < self.threshold {
+			return AdvisorToolLoopAction::Continue;
+		}
+		let count = self.repeats;
+		self.digest = None;
+		self.repeats = 0;
+		if self.redirect_issued {
+			self.redirect_issued = false;
+			AdvisorToolLoopAction::Abort { count, digest }
+		} else {
+			self.redirect_issued = true;
+			AdvisorToolLoopAction::Redirect { count, digest }
+		}
+	}
+}
 
 /// Why an advisor emission was not admitted to the primary mailbox.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, strum::Display)]
@@ -230,6 +322,54 @@ fn content_free(note: &str) -> bool {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	fn observe_repeats(
+		guard: &mut AdvisorToolLoopGuard,
+		digest: &'static str,
+		count: u32,
+	) -> AdvisorToolLoopAction {
+		let mut action = AdvisorToolLoopAction::Continue;
+		for _ in 0..count {
+			action = guard.observe(Some(Str::new_static(digest)));
+		}
+		action
+	}
+
+	#[test]
+	fn advisor_tool_loop_redirects_then_aborts() {
+		let mut guard = AdvisorToolLoopGuard::new(3);
+		assert_eq!(
+			observe_repeats(&mut guard, "read:missing.rs", 3),
+			AdvisorToolLoopAction::Redirect { count: 3, digest: Str::new_static("read:missing.rs") }
+		);
+		assert_eq!(observe_repeats(&mut guard, "read:missing.rs", 3), AdvisorToolLoopAction::Abort {
+			count:  3,
+			digest: Str::new_static("read:missing.rs"),
+		});
+	}
+
+	#[test]
+	fn advisor_tool_loop_resets_at_update_and_context_boundaries() {
+		let mut guard = AdvisorToolLoopGuard::new(3);
+		assert_eq!(
+			observe_repeats(&mut guard, "read:missing.rs", 2),
+			AdvisorToolLoopAction::Continue
+		);
+		guard.begin_update();
+		assert_eq!(
+			observe_repeats(&mut guard, "read:missing.rs", 2),
+			AdvisorToolLoopAction::Continue
+		);
+		guard.reset();
+		assert_eq!(
+			observe_repeats(&mut guard, "read:missing.rs", 2),
+			AdvisorToolLoopAction::Continue
+		);
+		assert_eq!(guard.observe(Some(Str::new_static("bash:pwd"))), AdvisorToolLoopAction::Continue);
+		assert_eq!(
+			observe_repeats(&mut guard, "read:missing.rs", 2),
+			AdvisorToolLoopAction::Continue
+		);
+	}
 
 	#[test]
 	fn one_concrete_note_per_update_and_session_dedupe() {

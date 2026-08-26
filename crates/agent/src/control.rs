@@ -175,6 +175,15 @@ pub enum RegimeControl {
 		/// Correlated result.
 		reply:      flume::Sender<Result<bool, ControlError>>,
 	},
+	/// Stop one activation and atomically project the resulting regime set.
+	StopSnapshot {
+		/// Activation identity.
+		activation: ActivationId,
+		/// Current epoch milliseconds.
+		now_ms:     u64,
+		/// Correlated stop result and post-stop records.
+		reply:      flume::Sender<Result<(bool, Vec<RegimeRecord>), ControlError>>,
+	},
 	/// Advance one activation's committed-step count.
 	Advance {
 		/// Activation identity.
@@ -213,6 +222,9 @@ impl RegimeControl {
 				let _ = reply.send(Err(ControlError::Closed));
 			},
 			Self::Stop { reply, .. } => {
+				let _ = reply.send(Err(ControlError::Closed));
+			},
+			Self::StopSnapshot { reply, .. } => {
 				let _ = reply.send(Err(ControlError::Closed));
 			},
 			Self::Advance { reply, .. } => {
@@ -733,6 +745,26 @@ impl ControlSender {
 		self
 			.commands
 			.send(ControlCommand::Regime(RegimeControl::Stop { activation, now_ms, reply }))
+			.map_err(|_| ControlError::Closed)?;
+		response
+			.recv_async()
+			.await
+			.map_err(|_| ControlError::Closed)?
+	}
+
+	/// Stops one regime and returns the authoritative post-stop projection.
+	///
+	/// # Errors
+	/// Returns a closed-owner, minimum-duration, or durable arbitration failure.
+	pub async fn stop_regime_snapshot(
+		&self,
+		activation: ActivationId,
+	) -> Result<(bool, Vec<RegimeRecord>), ControlError> {
+		let now_ms = r#loop::now_ms();
+		let (reply, response) = flume::bounded(1);
+		self
+			.commands
+			.send(ControlCommand::Regime(RegimeControl::StopSnapshot { activation, now_ms, reply }))
 			.map_err(|_| ControlError::Closed)?;
 		response
 			.recv_async()

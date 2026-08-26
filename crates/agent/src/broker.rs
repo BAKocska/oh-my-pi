@@ -1,7 +1,7 @@
 //! Process-global agent registry and project-scoped IRC routing.
 
 use std::{
-	collections::{HashMap, VecDeque},
+	collections::{HashMap, HashSet, VecDeque},
 	ffi, fs, io,
 	io::{BufRead as _, Read as _},
 	path::{Path, PathBuf},
@@ -249,9 +249,10 @@ struct RegistryEntry {
 }
 
 struct RegistryInner {
-	records:     Mutex<HashMap<Str, RegistryEntry>>,
-	diagnostics: Mutex<VecDeque<DiscoveryDiagnostic>>,
-	generation:  watch::Sender<u64>,
+	records:        Mutex<HashMap<Str, RegistryEntry>>,
+	diagnostics:    Mutex<VecDeque<DiscoveryDiagnostic>>,
+	restored_roots: Mutex<HashSet<PathBuf>>,
+	generation:     watch::Sender<u64>,
 }
 
 /// Process-global CAS registry for live, parked, and disk-recovered agents.
@@ -281,6 +282,7 @@ impl AgentRegistry {
 			inner: Arc::new(RegistryInner {
 				records: Mutex::new(HashMap::new()),
 				diagnostics: Mutex::new(VecDeque::with_capacity(DISCOVERY_DIAGNOSTIC_CAPACITY)),
+				restored_roots: Mutex::new(HashSet::new()),
 				generation,
 			}),
 		}
@@ -548,6 +550,41 @@ impl AgentRegistry {
 			}
 		}
 		Ok(imported)
+	}
+
+	/// Restores parked transcripts at most once for one canonical root session
+	/// file.
+	///
+	/// Root lookup and transcript discovery failures are warned and remain
+	/// retryable instead of failing the caller's roster request.
+	pub fn restore_transcripts_once(&self, root_file: &Path, directory: &Path) -> usize {
+		let root = match fs::canonicalize(root_file) {
+			Ok(root) => root,
+			Err(error) => {
+				tracing::warn!(
+					path = %root_file.display(),
+					%error,
+					"failed to resolve persisted agent roster root"
+				);
+				return 0;
+			},
+		};
+		if !self.inner.restored_roots.lock().insert(root.clone()) {
+			return 0;
+		}
+		match self.discover_transcripts(directory) {
+			Ok(imported) => imported,
+			Err(error) => {
+				self.inner.restored_roots.lock().remove(&root);
+				tracing::warn!(
+					root = %root.display(),
+					path = %directory.display(),
+					%error,
+					"failed to restore persisted agent roster"
+				);
+				0
+			},
+		}
 	}
 
 	/// Returns retained bounded-prefix diagnostics, oldest first.
@@ -1845,6 +1882,8 @@ fn valid_artifact_component(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+	use std::fs;
+
 	use omp_core::sf;
 
 	use super::*;
@@ -2016,5 +2055,21 @@ mod tests {
 				.await,
 			Err(WaitError::PeerDead)
 		);
+	}
+	#[test]
+	fn persisted_roster_restore_latches_per_root_file() {
+		let scratch = tempfile::tempdir().expect("temporary directory");
+		let transcripts = scratch.path().join("eval-agents");
+		fs::create_dir(&transcripts).expect("transcript directory");
+		let first = scratch.path().join("first.jsonl");
+		let second = scratch.path().join("second.jsonl");
+		fs::write(&first, b"").expect("first root");
+		fs::write(&second, b"").expect("second root");
+		let registry = AgentRegistry::new();
+
+		assert_eq!(registry.restore_transcripts_once(&first, &transcripts), 0);
+		assert_eq!(registry.restore_transcripts_once(&first, &transcripts), 0);
+		assert_eq!(registry.restore_transcripts_once(&second, &transcripts), 0);
+		assert_eq!(registry.inner.restored_roots.lock().len(), 2);
 	}
 }

@@ -2426,7 +2426,32 @@ impl Journal {
 	pub fn append_optimistic(
 		&mut self,
 		ts: u64,
+		item: Item,
+		prompt_hash: Option<PromptHash>,
+	) -> Result<u64, JournalError> {
+		self.append_item_record(ts, item, None, prompt_hash)
+	}
+
+	/// Persists the structurally marked assistant record of an internally
+	/// aborted turn.
+	pub(crate) fn append_aborted_assistant(
+		&mut self,
+		ts: u64,
+		turn_id: &str,
+		item: Item,
+		prompt_hash: Option<PromptHash>,
+	) -> Result<u64, JournalError> {
+		if !self.starts.contains_key(turn_id) {
+			return Err(JournalError::MissingTurnStart(Str::new(turn_id)));
+		}
+		self.append_item_record(ts, item, Some(Str::new(turn_id)), prompt_hash)
+	}
+
+	fn append_item_record(
+		&mut self,
+		ts: u64,
 		mut item: Item,
+		turn_id: Option<Str>,
 		prompt_hash: Option<PromptHash>,
 	) -> Result<u64, JournalError> {
 		item.seq = 0;
@@ -2435,7 +2460,7 @@ impl Journal {
 			ts,
 			kind: Kind::Item(ItemRecord {
 				item,
-				turn_id: None,
+				turn_id,
 				prompt_hash: prompt_hash.map(PromptHash::digest),
 			}),
 		};
