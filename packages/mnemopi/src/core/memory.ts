@@ -323,6 +323,7 @@ function toRecallOptions(options: RecallFacadeOptions): BeamRecallFacadeOptions 
 		contentPreviewChars: options.contentPreviewChars,
 		lengthNormalization: options.lengthNormalization,
 		scoreFloor: options.scoreFloor,
+		poolFloor: options.poolFloor,
 	};
 	// Preserve the three-state semantics (`undefined` = auto-derive, `null` = explicitly
 	// FTS-only, `number[]` = caller-supplied) so callers can opt out of `recall()`'s

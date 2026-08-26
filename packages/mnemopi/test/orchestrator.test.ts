@@ -265,4 +265,36 @@ describe("cacheDiscriminator visibility widening", () => {
 			beam.close();
 		}
 	});
+
+	it("separates cache buckets by poolFloor, so an A/B never serves the other arm's rows", async () => {
+		// poolFloor was added as a forwarded orchestrateRecall option without a discriminator term,
+		// so two calls differing ONLY in poolFloor shared a bucket and the second was served the
+		// first arm's rows — silently wrong in exactly the A/B comparison the knob exists for.
+		process.env.MNEMOPI_ENHANCED_RECALL = "1";
+		process.env.MNEMOPI_POLYPHONIC_RECALL = "1";
+		const beam = visibilityBeam("session-pool");
+		try {
+			insertWorking(beam, "pool-a", "quokka protocol primary answer row", {
+				sessionId: "session-pool",
+				scope: "session",
+			});
+			insertWorking(beam, "pool-b", "quokka protocol secondary answer row", {
+				sessionId: "session-pool",
+				scope: "session",
+			});
+			const common = { queryEmbedding: null } as const;
+
+			await orchestrateRecall(beam, "quokka protocol", 2, { ...common } as never);
+			await orchestrateRecall(beam, "quokka protocol", 2, { ...common, poolFloor: 0.05 } as never);
+			await orchestrateRecall(beam, "quokka protocol", 2, { ...common, poolFloor: 0.2 } as never);
+			// An explicit 0 must land in the SAME bucket as absent: 0 is the inert value.
+			await orchestrateRecall(beam, "quokka protocol", 2, { ...common, poolFloor: 0 } as never);
+
+			const cache = beam.caches.queryCache;
+			if (!(cache instanceof OrchestratorQueryCache)) throw new Error("expected an OrchestratorQueryCache");
+			expect(cache.stats().size).toBe(3);
+		} finally {
+			beam.close();
+		}
+	});
 });

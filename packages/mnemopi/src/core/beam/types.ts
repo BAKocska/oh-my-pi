@@ -204,6 +204,16 @@ export interface RecallOptions {
 	lengthNormalization?: RecallLengthNormalization;
 	/** Minimum normalized score required before final MMR/topK. <=0/undefined disables abstention. */
 	scoreFloor?: number;
+	/**
+	 * Pool floor for the diversity (MMR) stage: candidates below it are held out of the MMR pool
+	 * while the RETURNED COUNT stays identical to `poolFloor: 0` (below-floor rows are appended as
+	 * filler after selection). Never abstains, never truncates — `scoreFloor` remains the only
+	 * knob that changes how many rows come back. Absent/0 = inert.
+	 *
+	 * Declared `readonly` to match {@link PolyphonicRecallOptions.poolFloor}; a mutable declaration
+	 * here made `OrchestrateRecallOptions`'s two parents structurally incompatible.
+	 */
+	readonly poolFloor?: number;
 }
 
 export interface RecallEnhancedOptions extends RecallOptions {

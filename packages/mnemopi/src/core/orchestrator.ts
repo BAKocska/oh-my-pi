@@ -143,14 +143,19 @@ function cacheDiscriminator(
 	// plain `recall` does not -- their result shapes are not interchangeable.
 	const mode = polyphonic ? "poly" : options.enhanced === true ? "enh" : "lin";
 	const includeFacts = options.includeFacts === true ? "1" : "0";
-	// Length mode and score floor both alter the final candidate set for the same
-	// query/topK; never serve a cache entry across either A/B boundary.
+	// Length mode, score floor and pool floor all alter the final candidate set for the same
+	// query/topK; never serve a cache entry across any of those A/B boundaries. poolFloor was
+	// added as a forwarded option without a discriminator term, so two calls differing only in
+	// poolFloor shared a bucket and the second was served the first arm's rows -- silently wrong
+	// in exactly the A/B comparison the knob exists for.
 	const lengthNormalization = options.lengthNormalization ?? "none";
 	const scoreFloor =
 		typeof options.scoreFloor === "number" && Number.isFinite(options.scoreFloor)
 			? Math.max(0, options.scoreFloor)
 			: 0;
-	return `${mode}|k=${topK}|facts=${includeFacts}|len=${lengthNormalization}|floor=${scoreFloor}|${visibilityDiscriminator(options)}|sess=${beam.sessionId}|voices=${voiceEnvMask()}`;
+	const poolFloor =
+		typeof options.poolFloor === "number" && Number.isFinite(options.poolFloor) ? Math.max(0, options.poolFloor) : 0;
+	return `${mode}|k=${topK}|facts=${includeFacts}|len=${lengthNormalization}|floor=${scoreFloor}|pool=${poolFloor}|${visibilityDiscriminator(options)}|sess=${beam.sessionId}|voices=${voiceEnvMask()}`;
 }
 
 /**
