@@ -12,13 +12,15 @@ use omp_catalog::{
 	policy::{
 		self, ImageEncodingFormat, MaxTokensField as CatalogMaxTokensField,
 		ReasoningDisableMode as CatalogReasoningDisableMode,
-		ReasoningWireFormat as CatalogReasoningWireFormat, ThinkingToolChoiceConflict,
-		ToolCallIdProfile as CatalogToolCallIdProfile, ToolStrictMode, VeniceParameters,
+		ReasoningWireFormat as CatalogReasoningWireFormat, ThinkingFormat as CatalogThinkingFormat,
+		ThinkingToolChoiceConflict, ToolCallIdProfile as CatalogToolCallIdProfile, ToolStrictMode,
+		VeniceParameters,
 	},
 };
 use omp_core::{IntoStr, Str, encoding::base64, sf};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, value::RawValue};
+use strum::EnumString;
 
 use crate::{
 	body::BodySource,
@@ -70,6 +72,8 @@ pub enum ReasoningWireFormat {
 	Qwen,
 	/// NVIDIA `chat_template_kwargs.enable_thinking` boolean.
 	Nvidia,
+	/// Generic `chat_template_kwargs.thinking` boolean.
+	ChatTemplate,
 	/// Endpoint has no reasoning request shape.
 	Unsupported,
 }
@@ -298,6 +302,9 @@ impl OpenAiChatProfile {
 				_ => ReasoningWireFormat::Unsupported,
 			};
 		}
+		if matches!(policy.reasoning.thinking_format, Some(CatalogThinkingFormat::ChatTemplate)) {
+			self.reasoning = ReasoningWireFormat::ChatTemplate;
+		}
 		self.reasoning_disable = policy.reasoning.disable_mode;
 		self.venice_parameters = match policy.reasoning.extra_body {
 			Some(body) => body.venice_parameters,
@@ -491,7 +498,7 @@ impl OpenAiChatCodec {
 			reasoning: reasoning.openrouter,
 			thinking: reasoning.zai,
 			enable_thinking: reasoning.qwen,
-			chat_template_kwargs: reasoning.nvidia,
+			chat_template_kwargs: reasoning.chat_template,
 			venice_parameters: reasoning.venice,
 			service_tier,
 			prompt_cache_key,
@@ -860,6 +867,8 @@ struct ChatTemplateKwargs {
 	#[serde(skip_serializing_if = "Option::is_none")]
 	enable_thinking:  Option<bool>,
 	#[serde(skip_serializing_if = "Option::is_none")]
+	thinking:         Option<bool>,
+	#[serde(skip_serializing_if = "Option::is_none")]
 	reasoning_effort: Option<WireEffort>,
 }
 #[derive(Clone, Copy, Serialize)]
@@ -893,12 +902,12 @@ struct GatewayOptions {
 }
 
 struct ReasoningFields {
-	effort:     Option<WireEffort>,
-	openrouter: Option<OpenRouterReasoning>,
-	zai:        Option<ZaiThinking>,
-	qwen:       Option<bool>,
-	nvidia:     Option<ChatTemplateKwargs>,
-	venice:     Option<WireVeniceParameters>,
+	effort:        Option<WireEffort>,
+	openrouter:    Option<OpenRouterReasoning>,
+	zai:           Option<ZaiThinking>,
+	qwen:          Option<bool>,
+	chat_template: Option<ChatTemplateKwargs>,
+	venice:        Option<WireVeniceParameters>,
 }
 
 fn lower_messages(
@@ -1475,12 +1484,12 @@ fn lower_reasoning(
 	let reasoning = match reasoning {
 		Setting::Unset => {
 			return Ok(ReasoningFields {
-				effort:     None,
-				openrouter: None,
-				zai:        None,
-				qwen:       None,
-				nvidia:     None,
-				venice:     lower_venice_parameters(profile, false),
+				effort:        None,
+				openrouter:    None,
+				zai:           None,
+				qwen:          None,
+				chat_template: None,
+				venice:        lower_venice_parameters(profile, false),
 			});
 		},
 		Setting::Require(value) | Setting::Prefer(value) => value,
@@ -1489,12 +1498,12 @@ fn lower_reasoning(
 		&& profile.reasoning_disable == Some(CatalogReasoningDisableMode::VeniceDisableThinking);
 	if explicit_venice_off {
 		return Ok(ReasoningFields {
-			effort:     None,
-			openrouter: None,
-			zai:        None,
-			qwen:       None,
-			nvidia:     None,
-			venice:     lower_venice_parameters(profile, true),
+			effort:        None,
+			openrouter:    None,
+			zai:           None,
+			qwen:          None,
+			chat_template: None,
+			venice:        lower_venice_parameters(profile, true),
 		});
 	}
 	let effort = reasoning.effort.map(lower_effort);
@@ -1503,8 +1512,13 @@ fn lower_reasoning(
 		ReasoningWireFormat::OpenAiEffort if reasoning.max_tokens.is_some() => {
 			return Err(capability_error());
 		},
-		ReasoningWireFormat::OpenAiEffort => {
-			ReasoningFields { effort, openrouter: None, zai: None, qwen: None, nvidia: None, venice }
+		ReasoningWireFormat::OpenAiEffort => ReasoningFields {
+			effort,
+			openrouter: None,
+			zai: None,
+			qwen: None,
+			chat_template: None,
+			venice,
 		},
 		ReasoningWireFormat::OpenRouter => ReasoningFields {
 			effort: None,
@@ -1515,7 +1529,7 @@ fn lower_reasoning(
 			}),
 			zai: None,
 			qwen: None,
-			nvidia: None,
+			chat_template: None,
 			venice,
 		},
 		ReasoningWireFormat::Zai => ReasoningFields {
@@ -1523,7 +1537,7 @@ fn lower_reasoning(
 			openrouter: None,
 			zai: Some(ZaiThinking { r#type: ThinkingType::Enabled, effort }),
 			qwen: None,
-			nvidia: None,
+			chat_template: None,
 			venice,
 		},
 		ReasoningWireFormat::Qwen => {
@@ -1536,11 +1550,12 @@ fn lower_reasoning(
 				openrouter: None,
 				zai: None,
 				qwen: Some(true),
-				nvidia: (!profile.template_effort_top_level_only)
+				chat_template: (!profile.template_effort_top_level_only)
 					.then_some(template_effort)
 					.flatten()
 					.map(|effort| ChatTemplateKwargs {
 						enable_thinking:  None,
+						thinking:         None,
 						reasoning_effort: Some(effort),
 					}),
 				venice,
@@ -1554,7 +1569,11 @@ fn lower_reasoning(
 			openrouter: None,
 			zai: None,
 			qwen: None,
-			nvidia: Some(ChatTemplateKwargs { enable_thinking: Some(true), reasoning_effort: None }),
+			chat_template: Some(ChatTemplateKwargs {
+				enable_thinking:  Some(true),
+				thinking:         None,
+				reasoning_effort: None,
+			}),
 			venice,
 		},
 		ReasoningWireFormat::Nvidia => ReasoningFields {
@@ -1562,10 +1581,25 @@ fn lower_reasoning(
 			openrouter: None,
 			zai: None,
 			qwen: None,
-			nvidia: Some(ChatTemplateKwargs {
+			chat_template: Some(ChatTemplateKwargs {
 				enable_thinking:  Some(true),
+				thinking:         None,
 				reasoning_effort: profile
 					.template_reasoning_effort
+					.then_some(effort)
+					.flatten(),
+			}),
+			venice,
+		},
+		ReasoningWireFormat::ChatTemplate => ReasoningFields {
+			effort: None,
+			openrouter: None,
+			zai: None,
+			qwen: None,
+			chat_template: Some(ChatTemplateKwargs {
+				enable_thinking:  None,
+				thinking:         Some(reasoning.effort != Some(ReasoningEffort::Off)),
+				reasoning_effort: (reasoning.effort != Some(ReasoningEffort::Off))
 					.then_some(effort)
 					.flatten(),
 			}),
@@ -2028,19 +2062,21 @@ struct WireReasoningDetail {
 #[derive(Deserialize)]
 struct WireUsage {
 	#[serde(default)]
-	prompt_tokens:             u64,
+	prompt_tokens:              u64,
 	#[serde(default)]
-	completion_tokens:         u64,
+	completion_tokens:          u64,
 	#[serde(default)]
-	cached_tokens:             u64,
+	cached_tokens:              u64,
 	#[serde(default)]
-	prompt_cache_hit_tokens:   u64,
+	prompt_cache_hit_tokens:    u64,
+	#[serde(default, rename = "cachedContentTokenCount")]
+	cached_content_token_count: u64,
 	#[serde(default)]
-	prompt_cache_miss_tokens:  u64,
+	prompt_cache_miss_tokens:   u64,
 	#[serde(default)]
-	prompt_tokens_details:     WirePromptDetails,
+	prompt_tokens_details:      WirePromptDetails,
 	#[serde(default)]
-	completion_tokens_details: WireCompletionDetails,
+	completion_tokens_details:  WireCompletionDetails,
 }
 
 impl WireUsage {
@@ -2049,7 +2085,8 @@ impl WireUsage {
 			.prompt_tokens_details
 			.cached_tokens
 			.max(self.cached_tokens)
-			.max(self.prompt_cache_hit_tokens);
+			.max(self.prompt_cache_hit_tokens)
+			.max(self.cached_content_token_count);
 		let cache_write =
 			self
 				.prompt_tokens_details
@@ -2060,7 +2097,7 @@ impl WireUsage {
 					0
 				});
 		Usage {
-			input_tokens: self.prompt_tokens,
+			input_tokens: self.prompt_tokens.saturating_sub(cache_read),
 			output_tokens: self.completion_tokens,
 			reasoning_tokens: self.completion_tokens_details.reasoning_tokens,
 			cache_read_tokens: cache_read,
@@ -2085,8 +2122,8 @@ struct WireCompletionDetails {
 	reasoning_tokens: u64,
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(EnumString)]
+#[strum(serialize_all = "snake_case", ascii_case_insensitive)]
 enum WireFinishReason {
 	Stop,
 	End,
@@ -2100,6 +2137,17 @@ enum WireFinishReason {
 	ContentFilter,
 	Safety,
 	InsufficientSystemResource,
+}
+
+impl<'de> Deserialize<'de> for WireFinishReason {
+	fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+	where
+		D: serde::Deserializer<'de>,
+	{
+		Str::deserialize(deserializer)?
+			.parse()
+			.map_err(serde::de::Error::custom)
+	}
 }
 
 impl WireFinishReason {
@@ -2429,7 +2477,8 @@ mod tests {
 
 	use super::{
 		ErrorCode, OpenAiChatCodec, OpenAiChatDecoder, OpenAiChatProfile, ReasoningWireFormat,
-		ToolIdWireProfile, WireError, classify_error, flatten_exclusive_required_root_union,
+		ToolIdWireProfile, WireError, WireFinishReason, WireUsage, classify_error,
+		flatten_exclusive_required_root_union,
 	};
 	use crate::{
 		call::{
@@ -2833,6 +2882,26 @@ mod tests {
 		assert_eq!(complete.name.as_str(), "lookup_weather");
 		assert_eq!(complete.arguments.as_ref(), arguments);
 		assert_eq!(finish, Some(FinishReason::ToolCalls));
+	}
+
+	#[test]
+	fn uppercase_finish_reasons_and_vertex_cache_usage_decode() {
+		let stop: WireFinishReason = serde_json::from_str(r#""STOP""#).expect("uppercase stop");
+		let length: WireFinishReason =
+			serde_json::from_str(r#""MAX_TOKENS""#).expect("uppercase token limit");
+		assert_eq!(stop.normalize(), FinishReason::Stop);
+		assert_eq!(length.normalize(), FinishReason::Length);
+
+		let usage: WireUsage = serde_json::from_value(serde_json::json!({
+			"prompt_tokens": 33_006,
+			"completion_tokens": 110,
+			"cachedContentTokenCount": 28_639
+		}))
+		.expect("Vertex usage decodes");
+		let usage = usage.canonical();
+		assert_eq!(usage.input_tokens, 4_367);
+		assert_eq!(usage.output_tokens, 110);
+		assert_eq!(usage.cache_read_tokens, 28_639);
 	}
 
 	#[test]
@@ -3365,6 +3434,42 @@ mod tests {
 		assert!(wire.get("reasoning_effort").is_none());
 		assert_eq!(wire["venice_parameters"]["disable_thinking"], true);
 		assert_eq!(wire["venice_parameters"]["include_venice_system_prompt"], false);
+	}
+
+	#[test]
+	fn generic_chat_template_policy_emits_enabled_effort_and_explicit_off() {
+		let mut profile = OpenAiChatProfile::default();
+		let mut policy = policy::WirePolicy::baseline();
+		policy.reasoning.thinking_format = Some(policy::ThinkingFormat::ChatTemplate);
+		profile.apply_policy(&policy);
+
+		let body = OpenAiChatCodec::new(profile.clone(), None)
+			.encode_chat("deepseek-flash-v4", &thinking_request(ReasoningEffort::Medium))
+			.expect("enabled request encodes");
+		let wire: serde_json::Value = serde_json::from_slice(&body).expect("wire body is JSON");
+		assert_eq!(wire["chat_template_kwargs"]["thinking"], true);
+		assert_eq!(wire["chat_template_kwargs"]["reasoning_effort"], "medium");
+		assert!(wire.get("reasoning_effort").is_none());
+		assert!(
+			wire["chat_template_kwargs"]
+				.as_object()
+				.expect("kwargs object")
+				.get("enable_thinking")
+				.is_none()
+		);
+
+		let body = OpenAiChatCodec::new(profile, None)
+			.encode_chat("deepseek-flash-v4", &thinking_request(ReasoningEffort::Off))
+			.expect("explicit-off request encodes");
+		let wire: serde_json::Value = serde_json::from_slice(&body).expect("wire body is JSON");
+		assert_eq!(wire["chat_template_kwargs"]["thinking"], false);
+		assert!(
+			wire["chat_template_kwargs"]
+				.as_object()
+				.expect("kwargs object")
+				.get("reasoning_effort")
+				.is_none()
+		);
 	}
 
 	#[test]

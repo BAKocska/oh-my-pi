@@ -5,7 +5,7 @@ use omp_core::{Str, sf};
 
 use super::{RecoveryError, Stage};
 use crate::{
-	event::{BlockKind, ChatEvent},
+	event::ChatEvent,
 	receipt::{ReasonId, RecoveryKind, RecoveryRecord},
 };
 
@@ -182,11 +182,8 @@ impl Stage<EmptyInput, EmptyEvent> for EmptyCompletionStage {
 				}
 				self.committed |= event.commits_output();
 				match event.as_ref() {
-					ChatEvent::BlockStarted { kind, .. } => {
+					ChatEvent::BlockStarted { .. } => {
 						self.saw_block = true;
-						if *kind == BlockKind::Thinking {
-							self.saw_thinking = true;
-						}
 					},
 					ChatEvent::TextDelta { text, .. } => {
 						self.saw_text = true;
@@ -231,6 +228,7 @@ impl EmptyCompletionKind {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::event::BlockKind;
 
 	#[test]
 	fn unexpected_stop_candidate_excludes_tool_calls_and_unsigned_thinking() {
@@ -265,6 +263,52 @@ mod tests {
 		assert_eq!(empty.kind, EmptyCompletionKind::NoContent);
 		assert!(!empty.committed);
 		stage.finish(&mut |_| {}).unwrap();
+	}
+
+	#[test]
+	fn empty_open_block_does_not_commit_but_whitespace_delta_does() {
+		let mut empty_block = EmptyCompletionStage::new(WirePolicyId::new("wire"), 1);
+		let mut output = Vec::new();
+		empty_block
+			.push(
+				EmptyInput::Event(Box::new(ChatEvent::BlockStarted {
+					index: 0,
+					kind:  BlockKind::Thinking,
+				})),
+				&mut |event| output.push(event),
+			)
+			.unwrap();
+		empty_block
+			.push(EmptyInput::Completed, &mut |event| output.push(event))
+			.unwrap();
+		assert!(output.into_iter().any(|event| matches!(
+			event,
+			EmptyEvent::Empty(EmptyCompletion {
+				kind: EmptyCompletionKind::EmptyBlocks,
+				committed: false,
+				..
+			})
+		)));
+
+		let mut whitespace = EmptyCompletionStage::new(WirePolicyId::new("wire"), 1);
+		let mut output = Vec::new();
+		whitespace
+			.push(
+				EmptyInput::Event(Box::new(ChatEvent::TextDelta { index: 0, text: sf!(" \n") })),
+				&mut |event| output.push(event),
+			)
+			.unwrap();
+		whitespace
+			.push(EmptyInput::Completed, &mut |event| output.push(event))
+			.unwrap();
+		assert!(output.into_iter().any(|event| matches!(
+			event,
+			EmptyEvent::Empty(EmptyCompletion {
+				kind: EmptyCompletionKind::WhitespaceOnly,
+				committed: true,
+				..
+			})
+		)));
 	}
 
 	#[test]

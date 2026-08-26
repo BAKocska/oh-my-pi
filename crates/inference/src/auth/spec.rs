@@ -732,15 +732,20 @@ pub struct OAuthCustomSpec {
 
 impl OAuthCustomSpec {
 	fn validate(&self) -> Result<(), AuthSpecError> {
-		// API-key paste performs no standard token exchange: the catalog
-		// legitimately omits the OAuth client id and token endpoint (the shared
-		// OpenCode console spec carries both empty), so only the credential
-		// sources and key placement are structural for that exchange.
-		if self.exchange == OAuthExchangeKind::ApiKeyPaste {
-			validate_sources(&self.client.sources)?;
-			self.client.placement.validate()?;
-		} else {
-			self.client.validate()?;
+		// API-key paste performs no standard token exchange, while OpenRouter
+		// binds its clientless exchange exclusively through PKCE. Validate the
+		// fields each protocol actually sends instead of inventing a client id.
+		match self.exchange {
+			OAuthExchangeKind::ApiKeyPaste => {
+				validate_sources(&self.client.sources)?;
+				self.client.placement.validate()?;
+			},
+			OAuthExchangeKind::OpenRouterApiKey => {
+				validate_sources(&self.client.sources)?;
+				valid_url(&self.client.token_url, "OAuth token URL")?;
+				self.client.placement.validate()?;
+			},
+			_ => self.client.validate()?,
 		}
 		valid_url(&self.authorize_url, "custom OAuth authorization URL")?;
 		if let Some(polling) = self.polling
@@ -1009,10 +1014,11 @@ mod tests {
 	}
 
 	#[test]
-	fn clientless_custom_spec_validates_only_for_api_key_paste() {
+	fn clientless_custom_spec_validation_matches_exchange_requirements() {
 		// The catalog's shared OpenCode console spec carries an empty client id
 		// and token endpoint: api-key paste performs no token exchange, so only
-		// that exchange kind may omit the OAuth client.
+		// that exchange may omit both fields. OpenRouter is also clientless,
+		// but still requires its PKCE key-provisioning endpoint.
 		let spec = |exchange| {
 			AuthSpec::OAuthCustom(OAuthCustomSpec {
 				client: OAuthClientSpec {
@@ -1032,6 +1038,12 @@ mod tests {
 			})
 		};
 		assert_eq!(spec(OAuthExchangeKind::ApiKeyPaste).validate(), Ok(()));
+		let mut openrouter = spec(OAuthExchangeKind::OpenRouterApiKey);
+		let AuthSpec::OAuthCustom(openrouter) = &mut openrouter else {
+			unreachable!("constructed custom spec")
+		};
+		openrouter.client.token_url = "https://openrouter.ai/api/v1/auth/keys".into();
+		assert_eq!(openrouter.validate(), Ok(()));
 		assert_eq!(
 			spec(OAuthExchangeKind::PerplexityEmailOtp).validate(),
 			Err(AuthSpecError::EmptyField("OAuth client id"))

@@ -19,6 +19,7 @@ use omp_core::{Hash32, SparseMap, Str, hash32::Hasher, sf};
 use omp_inference::{
 	Adjustment, FeatureId, OpaqueJson, ReasonId, ToolDefinition, ToolGrammar, ToolGrammarSyntax,
 	ToolInputConstraint,
+	recovery::tools::{ToolAssemblyLimits, schema_within_strict_subset},
 };
 use omp_proto::inference::{v1, v1::InvokeInput};
 use parking_lot::{Mutex, RwLock};
@@ -2414,6 +2415,34 @@ fn lower(entry: &dyn ErasedTool, caps: LoweringCaps) -> Result<LoweredTool, Regi
 			None,
 			None,
 		),
+		Constraint::Schema { priority, on_unsupported }
+			if caps.strict_schema
+				&& !schema_within_strict_subset(
+					entry.schema().as_value(),
+					ToolAssemblyLimits::default(),
+				) =>
+		{
+			// Strict runtime validation rejects any call the moment it visits a
+			// keyword outside the supported subset, so an out-of-subset schema
+			// must degrade to best-effort validation instead of failing every
+			// invocation.
+			if *on_unsupported == v1::Fallback::Error {
+				return Err(RegistryError::UnsupportedConstraint {
+					name:    spec.name.clone(),
+					rev:     spec.rev.clone(),
+					feature: "strict-schema-subset",
+				});
+			}
+			adjustments.push(dropped(&spec.name, "schema", "tool.schema-outside-strict-subset"));
+			(
+				ToolInputConstraint::JsonSchema {
+					parameters: entry.schema().clone(),
+					strict:     false,
+				},
+				Some(ConstraintDisposition::Prefer),
+				Some(*priority),
+			)
+		},
 		Constraint::Schema { priority, .. } if caps.strict_schema => (
 			ToolInputConstraint::JsonSchema { parameters: entry.schema().clone(), strict: true },
 			Some(ConstraintDisposition::Required),

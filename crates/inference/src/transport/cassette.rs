@@ -1046,16 +1046,24 @@ const fn websocket_payload_len(message: &WebSocketMessage) -> usize {
 	}
 }
 
-pub(crate) const fn is_commit_candidate(event: &RawEvent) -> bool {
-	matches!(
-		event,
-		RawEvent::Chat(_)
-			| RawEvent::Completion(_)
-			| RawEvent::Answer(_)
-			| RawEvent::Control(_)
-			| RawEvent::NativeChunk(_)
-			| RawEvent::DiscoveredModels { .. }
-	)
+pub(crate) fn is_commit_candidate(event: &RawEvent) -> bool {
+	match event {
+		RawEvent::Chat(event) => event.commits_output(),
+		RawEvent::Completion(_)
+		| RawEvent::Answer(_)
+		| RawEvent::Control(_)
+		| RawEvent::NativeChunk(_)
+		| RawEvent::DiscoveredModels { .. } => true,
+		RawEvent::ToolCallComplete { .. }
+		| RawEvent::ProviderState(_)
+		| RawEvent::ImageGeneration(_)
+		| RawEvent::VideoGeneration(_)
+		| RawEvent::Audio(_)
+		| RawEvent::Transcript(_)
+		| RawEvent::Metadata(_)
+		| RawEvent::Telemetry(_)
+		| RawEvent::Failure(_) => false,
+	}
 }
 
 const fn precommit(mut error: Error) -> Error {
@@ -1228,5 +1236,35 @@ impl Drop for CassetteEventStream {
 		if !self.finished && !self.items.is_empty() {
 			self.cancel.cancel();
 		}
+	}
+}
+#[cfg(test)]
+mod tests {
+	use omp_core::sf;
+
+	use super::is_commit_candidate;
+	use crate::{
+		codec::RawEvent,
+		event::{BlockKind, ChatEvent},
+	};
+
+	#[test]
+	fn empty_open_blocks_remain_replay_safe_but_whitespace_deltas_commit() {
+		assert!(!is_commit_candidate(&RawEvent::Chat(ChatEvent::BlockStarted {
+			index: 0,
+			kind:  BlockKind::Text,
+		})));
+		assert!(!is_commit_candidate(&RawEvent::Chat(ChatEvent::TextDelta {
+			index: 0,
+			text:  sf!(""),
+		})));
+		assert!(is_commit_candidate(&RawEvent::Chat(ChatEvent::TextDelta {
+			index: 0,
+			text:  sf!(" \n"),
+		})));
+		assert!(is_commit_candidate(&RawEvent::Chat(ChatEvent::ThinkingDelta {
+			index: 1,
+			text:  sf!("thought"),
+		})));
 	}
 }

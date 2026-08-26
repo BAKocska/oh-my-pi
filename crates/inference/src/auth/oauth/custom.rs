@@ -10,6 +10,7 @@ mod cursor;
 mod devin;
 mod gitlab;
 mod google_antigravity;
+mod openrouter;
 mod perplexity;
 mod zai;
 
@@ -24,6 +25,7 @@ pub(super) fn register_all(
 	devin::register(dispatcher, http.clone(), clock.clone())?;
 	gitlab::register(dispatcher, http.clone(), clock.clone())?;
 	google_antigravity::register(dispatcher, http.clone(), clock.clone())?;
+	openrouter::register(dispatcher, http.clone(), clock.clone())?;
 	perplexity::register(dispatcher, http.clone(), clock.clone())?;
 	zai::register(dispatcher, http, clock)
 }

@@ -86,7 +86,7 @@ pub struct RetrySettings {
 	pub max_retries:          u32,
 	/// First exponential retry ceiling in milliseconds.
 	pub base_delay_ms:        u64,
-	/// Largest accepted retry delay in milliseconds.
+	/// Largest accepted retry delay in milliseconds; `0` disables the cap.
 	pub max_delay_ms:         u64,
 	/// Enables model fallback candidates.
 	pub model_fallback:       bool,
@@ -228,7 +228,17 @@ impl SettingsDomain for RetrySettings {
 		field("retry.enabled", "Retry Enabled", SettingKind::Boolean, 10),
 		field("retry.max_retries", "Maximum Retries", SettingKind::Integer, 20),
 		field("retry.base_delay_ms", "Base Retry Delay", SettingKind::Integer, 30),
-		field("retry.max_delay_ms", "Maximum Retry Delay", SettingKind::Integer, 40),
+		FieldDescriptor {
+			path:        "retry.max_delay_ms",
+			label:       "Maximum Retry Delay",
+			description: "Largest retry wait in milliseconds; 0 disables the cap.",
+			kind:        SettingKind::Integer,
+			scopes:      PERSISTED,
+			order:       40,
+			options:     None,
+			condition:   None,
+			secret:      false,
+		},
 		field("retry.model_fallback", "Model Fallback", SettingKind::Boolean, 50),
 		field("retry.usage_aware_fallback", "Usage-Aware Fallback", SettingKind::Boolean, 60),
 		field("retry.usage_reserve_pct", "Usage Reserve", SettingKind::Integer, 70),
@@ -257,7 +267,7 @@ impl SettingsDomain for RetrySettings {
 				})
 		});
 		if self.max_retries <= 100
-			&& self.base_delay_ms <= self.max_delay_ms
+			&& (self.max_delay_ms == 0 || self.base_delay_ms <= self.max_delay_ms)
 			&& self.max_delay_ms <= 3_600_000
 			&& self.usage_reserve_pct <= 100
 			&& chains_valid
@@ -602,6 +612,14 @@ omp_settings::inventory::submit! {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn zero_max_retry_delay_is_a_valid_uncapped_sentinel() {
+		let settings =
+			RetrySettings { base_delay_ms: 500, max_delay_ms: 0, ..RetrySettings::default() };
+		assert!(settings.validate().is_ok());
+		assert_eq!(settings.backoff().maximum, Duration::ZERO);
+	}
 
 	#[test]
 	fn fallback_walk_reaches_chain_owned_by_last_fallback_within_budget() {

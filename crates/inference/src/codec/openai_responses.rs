@@ -1376,30 +1376,11 @@ impl OpenAiResponsesDecoder {
 	}
 
 	fn committed_output(&self) -> bool {
-		self.outputs.values().any(|slot| {
-			matches!(
-				slot,
-				OutputSlot::Text { .. }
-					| OutputSlot::Thinking { .. }
-					| OutputSlot::Tool { .. }
-					| OutputSlot::Computer { .. }
-			)
+		self.outputs.values().any(|slot| match slot {
+			OutputSlot::Text { text, .. } | OutputSlot::Thinking { text, .. } => !text.is_empty(),
+			OutputSlot::Tool { .. } | OutputSlot::Computer { .. } => true,
+			OutputSlot::Hosted { .. } | OutputSlot::Image { .. } => false,
 		})
-	}
-
-	fn has_reasoning_only_output(&self) -> bool {
-		let mut saw_reasoning = false;
-		for slot in self.outputs.values() {
-			match slot {
-				OutputSlot::Thinking { .. } => saw_reasoning = true,
-				OutputSlot::Text { .. }
-				| OutputSlot::Tool { .. }
-				| OutputSlot::Computer { .. }
-				| OutputSlot::Hosted { .. }
-				| OutputSlot::Image { .. } => return false,
-			}
-		}
-		saw_reasoning && !self.saw_visible_output && !self.saw_completed_hosted_tool
 	}
 
 	/// Returns whether an authoritative terminal event was received.
@@ -3194,16 +3175,15 @@ impl ResponsesDecoderAdapter {
 				self.wire_model.as_deref(),
 				evidence.message.as_str(),
 			);
-		let bounded_thinking_close = evidence.code.as_deref() == Some("premature_end")
-			&& self.thinking_close_max_retries.is_some()
-			&& self.inner.has_reasoning_only_output();
+		let committed = self.inner.committed_output();
+		let premature_end = evidence.code.as_deref() == Some("premature_end");
 		let (kind, action) = if model_policy_denial {
 			(ErrorKind::Authorization, RetryAction::RotateAccount)
-		} else if let Some(max_retries) = self
-			.thinking_close_max_retries
-			.filter(|_| bounded_thinking_close)
-		{
-			(ErrorKind::Protocol, RetryAction::SameRouteLimited { after: Duration::ZERO, max_retries })
+		} else if premature_end && !committed {
+			(ErrorKind::Protocol, RetryAction::SameRouteLimited {
+				after:       Duration::ZERO,
+				max_retries: self.thinking_close_max_retries.unwrap_or(1),
+			})
 		} else {
 			match evidence.continuation {
 				ResponsesContinuationFailure::StalePreviousResponse
@@ -3221,7 +3201,6 @@ impl ResponsesDecoderAdapter {
 		} else {
 			evidence.code
 		};
-		let committed = !bounded_thinking_close && self.inner.committed_output();
 		Error::new(kind, ErrorPhase::Streaming, action, ExecutionReceipt::default())
 			.provider(self.provider.clone())
 			.route(self.route.clone())
@@ -4054,6 +4033,26 @@ mod tests {
 	}
 
 	#[test]
+	fn continuation_anchor_is_published_only_after_response_completion() {
+		let mut decoder = OpenAiResponsesDecoder::default();
+		let created =
+			decoder.push_json(br#"{"type":"response.created","response":{"id":"resp_in_progress"}}"#);
+		assert!(
+			!created
+				.iter()
+				.any(|event| matches!(event, ResponsesProjection::Continuation { .. }))
+		);
+		let completed = decoder.push_json(
+			br#"{"type":"response.completed","response":{"id":"resp_complete","status":"completed"}}"#,
+		);
+		assert!(completed.iter().any(|event| matches!(
+			event,
+			ResponsesProjection::Continuation { response_id, .. }
+				if response_id.as_str() == "resp_complete"
+		)));
+	}
+
+	#[test]
 	fn malformed_and_post_terminal_frames_are_bounded() {
 		let mut decoder = OpenAiResponsesDecoder::default();
 		let malformed = decoder.push_json(b"{");
@@ -4162,7 +4161,7 @@ mod tests {
 		assert_eq!(unrelated.action, RetryAction::Never);
 	}
 	#[test]
-	fn reasoning_only_premature_close_uses_catalog_retry_cap() {
+	fn premature_close_retries_only_before_any_delta_commits() {
 		use crate::error::{ErrorKind, RetryAction};
 
 		let mut adapter = ResponsesDecoderAdapter {
@@ -4185,10 +4184,29 @@ mod tests {
 			continuation: ResponsesContinuationFailure::NotStale,
 		});
 		assert_eq!(error.kind, ErrorKind::Protocol);
+		assert_eq!(error.action, RetryAction::Never);
+		assert!(error.committed);
+
+		let mut empty = ResponsesDecoderAdapter {
+			inner: OpenAiResponsesDecoder::default(),
+			request_id: RequestId::new("request"),
+			provider: ProviderId::from("openai"),
+			route: RouteId::from("openai/responses"),
+			wire_model: Some(sf!("gpt")),
+			thinking_close_max_retries: None,
+		};
+		empty.inner.push_json(
+			br#"{"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_1"}}"#,
+		);
+		let error = empty.error_from_evidence(ResponsesErrorEvidence {
+			code:         Some(sf!("premature_end")),
+			message:      sf!("Responses stream ended before an authoritative terminal event"),
+			continuation: ResponsesContinuationFailure::NotStale,
+		});
 		assert_eq!(error.action, RetryAction::SameRouteLimited {
 			after:       Duration::ZERO,
 			max_retries: 1,
-		},);
+		});
 		assert!(!error.committed);
 	}
 

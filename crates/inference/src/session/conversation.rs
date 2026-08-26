@@ -756,3 +756,66 @@ pub(crate) fn delta<I>(
 	segments.reverse();
 	Ok(HistoryDelta::new(base.map(ToOwned::to_owned), head.to_owned(), segments))
 }
+#[cfg(test)]
+mod tests {
+	use std::time::SystemTime;
+
+	use omp_catalog::{
+		id::{ModelKey, RouteId},
+		provider::{RedirectTrust, TrustDomain},
+	};
+
+	use super::*;
+	use crate::{
+		id::PrincipalId,
+		session::{BindingKey, CredentialGenerationPolicy},
+	};
+
+	#[test]
+	fn rejected_throttled_turn_preserves_last_completed_server_binding() {
+		let conversation = ConversationId::new("conversation");
+		let revision = Revision::new("completed");
+		let binding = ServerStateBinding {
+			key:        BindingKey {
+				conversation:          conversation.clone(),
+				route:                 RouteId::new("openai-codex"),
+				model:                 ModelKey::new("openai-codex/gpt"),
+				principal:             PrincipalId::new("principal"),
+				trust_domain:          TrustDomain {
+					origin:          Str::new("https://chatgpt.com"),
+					redirects:       RedirectTrust::SameOrigin,
+					allow_plaintext: false,
+				},
+				base_revision:         revision.clone(),
+				credential_generation: 1,
+				credential_policy:     CredentialGenerationPolicy::PrincipalBound,
+			},
+			created_at: SystemTime::UNIX_EPOCH,
+			expires_at: None,
+			handle:     Bytes::from_static(b"resp_completed"),
+		};
+		let mut state = ConversationState::<Str>::default();
+		state.heads.insert(conversation.clone(), revision.clone());
+		state.bindings.insert(conversation.clone(), binding);
+		let state = Arc::new(Mutex::new(state));
+		for (draft, code) in [1_u64, 2]
+			.into_iter()
+			.zip(["rate_limit_exceeded", "slow_down"])
+		{
+			state.lock().drafts.insert(draft);
+			drop(TurnDraft {
+				state: Arc::clone(&state),
+				draft,
+				conversation: conversation.clone(),
+				base: revision.clone(),
+				turn: TurnId::new(code),
+				items: Some(Arc::from([Str::new("partial")])),
+				binding: None,
+			});
+		}
+
+		let state = state.lock();
+		assert_eq!(state.bindings[&conversation].handle, Bytes::from_static(b"resp_completed"));
+		assert!(state.drafts.is_empty());
+	}
+}

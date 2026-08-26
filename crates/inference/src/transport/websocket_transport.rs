@@ -35,7 +35,7 @@ use crate::{
 	receipt::{ExecutionReceipt, ReasonId},
 	transport::{
 		Frame, FramingProtocol, WebSocketMessage,
-		cassette::{CapturedFrame, capture_frame},
+		cassette::{CapturedFrame, capture_frame, is_commit_candidate},
 		http::{record_failure, request_id, sanitize_headers},
 	},
 };
@@ -332,6 +332,7 @@ async fn execute(
 		let pump_evidence = evidence.clone();
 		let pump_provider_request_id = provider_request_id.clone();
 		tokio::spawn(async move {
+			let mut emitted = false;
 			loop {
 				tokio::select! {
 					input = async {
@@ -343,20 +344,56 @@ async fn execute(
 						let Some(input) = input else { break };
 						match decoder.encode_control(input) {
 							Ok(Some(frame)) if frame.len() as u64 <= bounds.frame => {
-								if socket.send(wire_message(frame)).await.is_err() { break; }
+								if socket.send(wire_message(frame)).await.is_err() {
+									let error = pump_error(
+										simple_error(ErrorKind::Connectivity, ErrorPhase::Streaming, emitted, "websocket-send-disconnect"),
+										&pump_attempt,
+										&pump_evidence,
+										status,
+										pump_provider_request_id.as_ref(),
+										started,
+										emitted,
+									);
+									let _ = event_tx.send_async(Err(error)).await;
+									break;
+								}
 							},
 							Ok(Some(_)) => {
-								let error = pump_error(simple_error(ErrorKind::StreamCorruption, ErrorPhase::Streaming, true, "websocket-outbound-frame-limit"), &pump_attempt, &pump_evidence, status, pump_provider_request_id.as_ref(), started);
+								let error = pump_error(
+									simple_error(ErrorKind::StreamCorruption, ErrorPhase::Streaming, emitted, "websocket-outbound-frame-limit"),
+									&pump_attempt,
+									&pump_evidence,
+									status,
+									pump_provider_request_id.as_ref(),
+									started,
+									emitted,
+								);
 								let _ = event_tx.send_async(Err(error)).await;
 								break;
 							},
 							Ok(None) => {
-								let error = pump_error(simple_error(ErrorKind::Protocol, ErrorPhase::Streaming, true, "websocket-control-unsupported"), &pump_attempt, &pump_evidence, status, pump_provider_request_id.as_ref(), started);
+								let error = pump_error(
+									simple_error(ErrorKind::Protocol, ErrorPhase::Streaming, emitted, "websocket-control-unsupported"),
+									&pump_attempt,
+									&pump_evidence,
+									status,
+									pump_provider_request_id.as_ref(),
+									started,
+									emitted,
+								);
 								let _ = event_tx.send_async(Err(error)).await;
 								break;
 							},
 							Err(error) => {
-								let error = pump_error(error, &pump_attempt, &pump_evidence, status, pump_provider_request_id.as_ref(), started);
+								let error = pump_error(
+									error,
+									&pump_attempt,
+									&pump_evidence,
+									status,
+									pump_provider_request_id.as_ref(),
+									started,
+									emitted,
+								);
 								let _ = event_tx.send_async(Err(error)).await;
 								break;
 							},
@@ -364,7 +401,19 @@ async fn execute(
 					},
 					message = socket.next() => match message {
 						Some(Ok(Message::Ping(data))) => {
-							if socket.send(Message::Pong(data)).await.is_err() { break; }
+							if socket.send(Message::Pong(data)).await.is_err() {
+								let error = pump_error(
+									simple_error(ErrorKind::Connectivity, ErrorPhase::Streaming, emitted, "websocket-pong-disconnect"),
+									&pump_attempt,
+									&pump_evidence,
+									status,
+									pump_provider_request_id.as_ref(),
+									started,
+									emitted,
+								);
+								let _ = event_tx.send_async(Err(error)).await;
+								break;
+							}
 						},
 						Some(Ok(Message::Pong(_) | Message::Frame(_))) => {},
 						Some(Ok(Message::Text(text))) => {
@@ -375,10 +424,16 @@ async fn execute(
 							let mut decoded = Vec::new();
 							match decoder.push(frame, &mut |event| decoded.push(event)) {
 								Ok(()) => for event in decoded {
+									if let RawEvent::Failure(error) = event {
+										let error = pump_error(error, &pump_attempt, &pump_evidence, status, pump_provider_request_id.as_ref(), started, emitted);
+										let _ = event_tx.send_async(Err(error)).await;
+										return;
+									}
+									emitted |= is_commit_candidate(&event);
 									if event_tx.send_async(Ok(event)).await.is_err() { return; }
 								},
 								Err(error) => {
-									let error = pump_error(error, &pump_attempt, &pump_evidence, status, pump_provider_request_id.as_ref(), started);
+									let error = pump_error(error, &pump_attempt, &pump_evidence, status, pump_provider_request_id.as_ref(), started, emitted);
 									let _ = event_tx.send_async(Err(error)).await;
 									break;
 								},
@@ -391,10 +446,16 @@ async fn execute(
 							let mut decoded = Vec::new();
 							match decoder.push(frame, &mut |event| decoded.push(event)) {
 								Ok(()) => for event in decoded {
+									if let RawEvent::Failure(error) = event {
+										let error = pump_error(error, &pump_attempt, &pump_evidence, status, pump_provider_request_id.as_ref(), started, emitted);
+										let _ = event_tx.send_async(Err(error)).await;
+										return;
+									}
+									emitted |= is_commit_candidate(&event);
 									if event_tx.send_async(Ok(event)).await.is_err() { return; }
 								},
 								Err(error) => {
-									let error = pump_error(error, &pump_attempt, &pump_evidence, status, pump_provider_request_id.as_ref(), started);
+									let error = pump_error(error, &pump_attempt, &pump_evidence, status, pump_provider_request_id.as_ref(), started, emitted);
 									let _ = event_tx.send_async(Err(error)).await;
 									break;
 								},
@@ -404,39 +465,88 @@ async fn execute(
 							let mut decoded = Vec::new();
 							match decoder.finish(&mut |event| decoded.push(event)) {
 								Ok(()) => for event in decoded {
+									if let RawEvent::Failure(error) = event {
+										let error = websocket_close_error(error, emitted);
+										let error = pump_error(error, &pump_attempt, &pump_evidence, status, pump_provider_request_id.as_ref(), started, emitted);
+										let _ = event_tx.send_async(Err(error)).await;
+										return;
+									}
+									emitted |= is_commit_candidate(&event);
 									if event_tx.send_async(Ok(event)).await.is_err() { return; }
 								},
 								Err(error) => {
-									let error = pump_error(error, &pump_attempt, &pump_evidence, status, pump_provider_request_id.as_ref(), started);
+									let error = pump_error(error, &pump_attempt, &pump_evidence, status, pump_provider_request_id.as_ref(), started, emitted);
 									let _ = event_tx.send_async(Err(error)).await;
 								},
 							}
 							break;
 						},
-						Some(Err(_)) => break,
+						Some(Err(_)) => {
+							let error = pump_error(
+								simple_error(ErrorKind::Connectivity, ErrorPhase::Streaming, emitted, "websocket-disconnect"),
+								&pump_attempt,
+								&pump_evidence,
+								status,
+								pump_provider_request_id.as_ref(),
+								started,
+								emitted,
+							);
+							let _ = event_tx.send_async(Err(error)).await;
+							break;
+						},
 					},
 					() = poll_fn(|context| cancel.poll_cancelled(context)) => break,
 					() = tokio::time::sleep_until(deadline) => {
 						cancel.cancel();
-						let error = pump_error(simple_error(ErrorKind::DeadlineExceeded, ErrorPhase::Streaming, true, "websocket-timeout"), &pump_attempt, &pump_evidence, status, pump_provider_request_id.as_ref(), started);
+						let error = pump_error(
+							simple_error(ErrorKind::DeadlineExceeded, ErrorPhase::Streaming, emitted, "websocket-timeout"),
+							&pump_attempt,
+							&pump_evidence,
+							status,
+							pump_provider_request_id.as_ref(),
+							started,
+							emitted,
+						);
 						let _ = event_tx.send_async(Err(error)).await;
 						break;
 					},
 				}
 			}
 		});
-		let first = tokio::select! {
-			first = event_rx.recv_async() => first.map_err(|_| failure(simple_error(ErrorKind::Connectivity, ErrorPhase::Handshake, false, "websocket-close-before-first-frame"), &request, &evidence, started, false))?,
-			() = tokio::time::sleep_until(deadline) => {
-				request.cancel.cancel();
-				return Err(failure(simple_error(ErrorKind::DeadlineExceeded, ErrorPhase::Handshake, false, "websocket-first-frame-timeout"), &request, &evidence, started, false));
-			},
-		};
+		// Hold block starts and other noncommitting markers until actual output
+		// arrives. A failed attempt drops this preamble before retry, so downstream
+		// never receives an orphaned open block that would need a synthetic end.
+		let mut preamble = Vec::new();
+		loop {
+			let first = tokio::select! {
+				first = event_rx.recv_async() => first.map_err(|_| failure(simple_error(ErrorKind::Connectivity, ErrorPhase::Handshake, false, "websocket-close-before-first-frame"), &request, &evidence, started, false))?,
+				() = tokio::time::sleep_until(deadline) => {
+					request.cancel.cancel();
+					return Err(failure(simple_error(ErrorKind::DeadlineExceeded, ErrorPhase::Handshake, false, "websocket-first-frame-timeout"), &request, &evidence, started, false));
+				},
+			};
+			match first {
+				Err(error) => return Err(error),
+				Ok(event) => {
+					let committed = is_commit_candidate(&event);
+					preamble.push(Ok(event));
+					if committed {
+						break;
+					}
+				},
+			}
+		}
 		let events: RawEventStream = Box::pin(async_stream::stream! {
 			let _guard = WebSocketCancelOnDrop(stream_cancel);
-			yield first;
-			while let Ok(event) = event_rx.recv_async().await {
+			for event in preamble {
 				yield event;
+			}
+			while let Ok(event) = event_rx.recv_async().await {
+				let failed = event.is_err();
+				yield event;
+				if failed {
+					break;
+				}
 			}
 		});
 		return Ok(HandshakenResponse {
@@ -634,18 +744,18 @@ async fn execute(
 					Ok(input) => match codec.encode(input) {
 						Ok(frames) => for frame in frames {
 							if frame.len() as u64 > bounds.frame {
-								let error = pump_error(simple_error(ErrorKind::StreamCorruption, ErrorPhase::Streaming, true, "websocket-outbound-frame-limit"), &pump_attempt, &pump_evidence, status, pump_provider_request_id.as_ref(), started);
+								let error = pump_error(simple_error(ErrorKind::StreamCorruption, ErrorPhase::Streaming, true, "websocket-outbound-frame-limit"), &pump_attempt, &pump_evidence, status, pump_provider_request_id.as_ref(), started, true);
 								let _ = inbound_tx.send_async(Err(error)).await;
 								return;
 							}
 							if socket.send(wire_message(frame)).await.is_err() {
-								let error = pump_error(simple_error(ErrorKind::Connectivity, ErrorPhase::Streaming, true, "websocket-send-disconnect"), &pump_attempt, &pump_evidence, status, pump_provider_request_id.as_ref(), started);
+								let error = pump_error(simple_error(ErrorKind::Connectivity, ErrorPhase::Streaming, true, "websocket-send-disconnect"), &pump_attempt, &pump_evidence, status, pump_provider_request_id.as_ref(), started, true);
 								let _ = inbound_tx.send_async(Err(error)).await;
 								return;
 							}
 						},
 						Err(error) => {
-							let error = pump_error(error, &pump_attempt, &pump_evidence, status, pump_provider_request_id.as_ref(), started);
+							let error = pump_error(error, &pump_attempt, &pump_evidence, status, pump_provider_request_id.as_ref(), started, true);
 							let _ = inbound_tx.send_async(Err(error)).await;
 							break;
 						},
@@ -654,7 +764,7 @@ async fn execute(
 				message = socket.next() => match message {
 					Some(Ok(Message::Ping(data))) => {
 						if socket.send(Message::Pong(data)).await.is_err() {
-							let error = pump_error(simple_error(ErrorKind::Connectivity, ErrorPhase::Streaming, true, "websocket-pong-disconnect"), &pump_attempt, &pump_evidence, status, pump_provider_request_id.as_ref(), started);
+							let error = pump_error(simple_error(ErrorKind::Connectivity, ErrorPhase::Streaming, true, "websocket-pong-disconnect"), &pump_attempt, &pump_evidence, status, pump_provider_request_id.as_ref(), started, true);
 							let _ = inbound_tx.send_async(Err(error)).await;
 							break;
 						}
@@ -663,7 +773,7 @@ async fn execute(
 					Some(Ok(Message::Text(text))) => {
 						let payload = Bytes::copy_from_slice(text.as_bytes());
 						if payload.len() as u64 > bounds.frame {
-							let error = pump_error(simple_error(ErrorKind::StreamCorruption, ErrorPhase::Streaming, true, "websocket-inbound-frame-limit"), &pump_attempt, &pump_evidence, status, pump_provider_request_id.as_ref(), started);
+							let error = pump_error(simple_error(ErrorKind::StreamCorruption, ErrorPhase::Streaming, true, "websocket-inbound-frame-limit"), &pump_attempt, &pump_evidence, status, pump_provider_request_id.as_ref(), started, true);
 							let _ = inbound_tx.send_async(Err(error)).await;
 							break;
 						}
@@ -674,7 +784,7 @@ async fn execute(
 								if inbound_tx.send_async(Ok(event)).await.is_err() { return; }
 							},
 							Err(error) => {
-								let error = pump_error(error, &pump_attempt, &pump_evidence, status, pump_provider_request_id.as_ref(), started);
+								let error = pump_error(error, &pump_attempt, &pump_evidence, status, pump_provider_request_id.as_ref(), started, true);
 								let _ = inbound_tx.send_async(Err(error)).await;
 								break;
 							},
@@ -682,7 +792,7 @@ async fn execute(
 					},
 					Some(Ok(Message::Binary(payload))) => {
 						if payload.len() as u64 > bounds.frame {
-							let error = pump_error(simple_error(ErrorKind::StreamCorruption, ErrorPhase::Streaming, true, "websocket-inbound-frame-limit"), &pump_attempt, &pump_evidence, status, pump_provider_request_id.as_ref(), started);
+							let error = pump_error(simple_error(ErrorKind::StreamCorruption, ErrorPhase::Streaming, true, "websocket-inbound-frame-limit"), &pump_attempt, &pump_evidence, status, pump_provider_request_id.as_ref(), started, true);
 							let _ = inbound_tx.send_async(Err(error)).await;
 							break;
 						}
@@ -693,7 +803,7 @@ async fn execute(
 								if inbound_tx.send_async(Ok(event)).await.is_err() { return; }
 							},
 							Err(error) => {
-								let error = pump_error(error, &pump_attempt, &pump_evidence, status, pump_provider_request_id.as_ref(), started);
+								let error = pump_error(error, &pump_attempt, &pump_evidence, status, pump_provider_request_id.as_ref(), started, true);
 								let _ = inbound_tx.send_async(Err(error)).await;
 								break;
 							},
@@ -701,7 +811,7 @@ async fn execute(
 					},
 					Some(Ok(Message::Close(_))) => { let _ = inbound_tx.send_async(Ok(RealtimeEvent::Closed)).await; break; },
 					None | Some(Err(_)) => {
-						let error = pump_error(simple_error(ErrorKind::Connectivity, ErrorPhase::Streaming, true, "websocket-postcommit-disconnect"), &pump_attempt, &pump_evidence, status, pump_provider_request_id.as_ref(), started);
+						let error = pump_error(simple_error(ErrorKind::Connectivity, ErrorPhase::Streaming, true, "websocket-postcommit-disconnect"), &pump_attempt, &pump_evidence, status, pump_provider_request_id.as_ref(), started, true);
 						let _ = inbound_tx.send_async(Err(error)).await;
 						break;
 					},
@@ -709,14 +819,14 @@ async fn execute(
 				},
 				() = poll_fn(|context| cancel.poll_cancelled(context)) => {
 					let _ = socket.send(Message::Close(None)).await;
-					let error = pump_error(simple_error(ErrorKind::Cancelled, ErrorPhase::Streaming, true, "websocket-cancelled"), &pump_attempt, &pump_evidence, status, pump_provider_request_id.as_ref(), started);
+					let error = pump_error(simple_error(ErrorKind::Cancelled, ErrorPhase::Streaming, true, "websocket-cancelled"), &pump_attempt, &pump_evidence, status, pump_provider_request_id.as_ref(), started, true);
 					let _ = inbound_tx.send_async(Err(error)).await;
 					break;
 				},
 				() = tokio::time::sleep_until(deadline) => {
 					cancel.cancel();
 					let _ = socket.send(Message::Close(None)).await;
-					let error = pump_error(simple_error(ErrorKind::DeadlineExceeded, ErrorPhase::Streaming, true, "websocket-timeout"), &pump_attempt, &pump_evidence, status, pump_provider_request_id.as_ref(), started);
+					let error = pump_error(simple_error(ErrorKind::DeadlineExceeded, ErrorPhase::Streaming, true, "websocket-timeout"), &pump_attempt, &pump_evidence, status, pump_provider_request_id.as_ref(), started, true);
 					let _ = inbound_tx.send_async(Err(error)).await;
 					break;
 				},
@@ -732,6 +842,13 @@ async fn execute(
 	})
 }
 
+fn websocket_close_error(mut error: Error, committed: bool) -> Error {
+	if !committed && error.code.as_deref() == Some("premature_end") {
+		error.kind = ErrorKind::Connectivity;
+	}
+	error
+}
+
 fn pump_error(
 	mut error: Error,
 	attempt: &TransportAttempt,
@@ -739,10 +856,22 @@ fn pump_error(
 	status: u16,
 	provider_request_id: Option<&Str>,
 	started: Instant,
+	committed: bool,
 ) -> Error {
-	error.committed = true;
-	error.phase = ErrorPhase::Streaming;
-	record_failure(error, attempt, evidence, Some(status), provider_request_id, started, true)
+	error.committed = committed;
+	error.phase = if committed {
+		ErrorPhase::Streaming
+	} else {
+		ErrorPhase::Handshake
+	};
+	if committed {
+		error.action = RetryAction::Never;
+	} else if matches!(error.action, RetryAction::Never)
+		&& matches!(error.kind, ErrorKind::Connectivity | ErrorKind::StreamCorruption)
+	{
+		error.action = RetryAction::SameRoute { after: std::time::Duration::ZERO };
+	}
+	record_failure(error, attempt, evidence, Some(status), provider_request_id, started, committed)
 }
 
 fn capture_socket_frame(capture: &Arc<Mutex<LiveCapture>>, frame: &Frame) {

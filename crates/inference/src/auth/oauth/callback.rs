@@ -40,6 +40,9 @@ mod callback_server {
 
 	impl CallbackServer {
 		/// Binds the HTTP redirect URI when it addresses the local loopback.
+		///
+		/// An empty expected state supports providers whose callback omits state;
+		/// the PKCE verifier remains the authorization-code binding.
 		pub(in crate::auth::oauth) async fn bind(
 			redirect_uri: &str,
 			expected_state: &str,
@@ -247,9 +250,10 @@ fn callback_decision(callback: &SecretString, expected_state: &str) -> CallbackD
 			.flatten()
 			.filter(|value| !value.is_empty())
 			.unwrap_or(error);
-		let trusted = state
-			.as_ref()
-			.is_some_and(|state| state.as_str() == expected_state);
+		let trusted = expected_state.is_empty()
+			|| state
+				.as_ref()
+				.is_some_and(|state| state.as_str() == expected_state);
 		return CallbackDecision::Denied {
 			message: format!("Authorization failed: {}", description.as_str()),
 			trusted,

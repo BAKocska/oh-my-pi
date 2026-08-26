@@ -934,42 +934,118 @@ fn validate_node(
 			return violation(path, "exclusiveMaximum");
 		}
 	}
-	if strict {
-		const SUPPORTED: &[&str] = &[
-			"$id",
-			"$schema",
-			"$comment",
-			"title",
-			"description",
-			"default",
-			"examples",
-			"type",
-			"const",
-			"enum",
-			"allOf",
-			"anyOf",
-			"oneOf",
-			"properties",
-			"required",
-			"additionalProperties",
-			"items",
-			"minItems",
-			"maxItems",
-			"uniqueItems",
-			"minProperties",
-			"maxProperties",
-			"minLength",
-			"maxLength",
-			"minimum",
-			"maximum",
-			"exclusiveMinimum",
-			"exclusiveMaximum",
-		];
-		if object.keys().any(|key| !SUPPORTED.contains(&key.as_str())) {
-			return violation(path, "unsupportedKeyword");
-		}
+	if strict
+		&& object
+			.keys()
+			.any(|key| !STRICT_KEYWORDS.contains(&key.as_str()))
+	{
+		return violation(path, "unsupportedKeyword");
 	}
 	Ok(())
+}
+
+/// Every keyword strict validation understands or deliberately treats as a
+/// pure annotation (`format` is annotation-only vocabulary in JSON Schema
+/// 2020-12). Any other keyword makes strict validation unsound, so
+/// [`validate_node`] rejects it and [`schema_within_strict_subset`] reports
+/// the schema as outside the subset.
+const STRICT_KEYWORDS: &[&str] = &[
+	"$id",
+	"$schema",
+	"$comment",
+	"title",
+	"description",
+	"default",
+	"examples",
+	"format",
+	"type",
+	"const",
+	"enum",
+	"allOf",
+	"anyOf",
+	"oneOf",
+	"properties",
+	"required",
+	"additionalProperties",
+	"items",
+	"minItems",
+	"maxItems",
+	"uniqueItems",
+	"minProperties",
+	"maxProperties",
+	"minLength",
+	"maxLength",
+	"minimum",
+	"maximum",
+	"exclusiveMinimum",
+	"exclusiveMaximum",
+];
+
+/// Reports whether every reachable node of `schema` stays within the strict
+/// validation subset enforced by [`validate_schema`].
+///
+/// Registries consult this before lowering a tool as `strict: true`: a schema
+/// using keywords the validator cannot assert (`if`/`then`, `not`, `$ref`,
+/// `patternProperties`, …) would otherwise reject every call at runtime the
+/// moment the offending node is visited.
+pub fn schema_within_strict_subset(schema: &Value, limits: ToolAssemblyLimits) -> bool {
+	let mut budget = limits.max_schema_nodes;
+	subset_node(schema, 0, limits.max_schema_depth, &mut budget)
+}
+
+fn subset_node(schema: &Value, depth: usize, max_depth: usize, budget: &mut usize) -> bool {
+	if depth > max_depth || *budget == 0 {
+		return false;
+	}
+	*budget -= 1;
+	if schema.is_boolean() {
+		return true;
+	}
+	let Some(object) = schema.as_object() else {
+		return false;
+	};
+	if object
+		.keys()
+		.any(|key| !STRICT_KEYWORDS.contains(&key.as_str()))
+	{
+		return false;
+	}
+	if let Some(properties) = object.get("properties") {
+		let Some(properties) = properties.as_object() else {
+			return false;
+		};
+		if !properties
+			.values()
+			.all(|property| subset_node(property, depth + 1, max_depth, budget))
+		{
+			return false;
+		}
+	}
+	if let Some(extra) = object.get("additionalProperties")
+		&& !extra.is_boolean()
+		&& !subset_node(extra, depth + 1, max_depth, budget)
+	{
+		return false;
+	}
+	if let Some(items) = object.get("items")
+		&& !subset_node(items, depth + 1, max_depth, budget)
+	{
+		return false;
+	}
+	for combinator in ["allOf", "anyOf", "oneOf"] {
+		if let Some(branches) = object.get(combinator) {
+			let Some(branches) = branches.as_array() else {
+				return false;
+			};
+			if !branches
+				.iter()
+				.all(|branch| subset_node(branch, depth + 1, max_depth, budget))
+			{
+				return false;
+			}
+		}
+	}
+	true
 }
 
 fn unicode_scalar_count(text: &str) -> usize {
@@ -1418,6 +1494,58 @@ mod tests {
 				strict:     true,
 			},
 		}
+	}
+	#[test]
+	fn strict_subset_accepts_annotations_and_combinators() {
+		let schema = json!({
+			"type": "object",
+			"properties": {
+				"timeout_ms": {"type": ["integer", "null"], "format": "uint64", "minimum": 0},
+				"name": {"type": "string", "minLength": 1},
+			},
+			"required": ["name"],
+			"additionalProperties": false,
+			"anyOf": [
+				{"properties": {"async": {"const": false}}},
+				{"required": ["name"]},
+			],
+		});
+		assert!(schema_within_strict_subset(&schema, ToolAssemblyLimits::default()));
+	}
+
+	#[test]
+	fn strict_subset_rejects_unassertable_keywords_anywhere() {
+		let conditional = json!({
+			"type": "object",
+			"properties": {"command": {"type": "string"}},
+			"allOf": [{
+				"if": {"properties": {"async": {"const": true}}, "required": ["async"]},
+				"then": {"required": ["name"]},
+			}],
+		});
+		assert!(!schema_within_strict_subset(&conditional, ToolAssemblyLimits::default()));
+		let nested_ref = json!({
+			"type": "object",
+			"properties": {"item": {"items": {"$ref": "#/$defs/item"}}},
+		});
+		assert!(!schema_within_strict_subset(&nested_ref, ToolAssemblyLimits::default()));
+	}
+
+	#[test]
+	fn strict_validation_treats_format_as_annotation() {
+		let schema = json!({
+			"type": "object",
+			"properties": {"limit": {"type": "integer", "format": "uint32", "minimum": 0}},
+			"additionalProperties": false,
+		});
+		assert!(
+			validate_schema(&schema, &json!({"limit": 3}), true, ToolAssemblyLimits::default())
+				.is_ok()
+		);
+		let issue =
+			validate_schema(&schema, &json!({"limit": "three"}), true, ToolAssemblyLimits::default())
+				.expect_err("type assertion still enforced beside the annotation");
+		assert_eq!(issue.rule, "type");
 	}
 
 	#[test]

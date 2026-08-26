@@ -1524,7 +1524,7 @@ impl SemanticPolicy<Call> for CanonicalSemantic {
 		if matches!(chat.tool_choice, Setting::Require(ToolChoice::Required)) {
 			return Some(GateCondition::WholeAttempt);
 		}
-		None
+		Some(GateCondition::FirstValidEvent)
 	}
 
 	fn max_retries(&self, call: &Call) -> u32 {

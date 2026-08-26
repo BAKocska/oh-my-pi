@@ -22,13 +22,18 @@ use crate::{
 pub struct RetryBackoff {
 	/// First exponential ceiling.
 	pub base:    time::Duration,
-	/// Largest exponential ceiling.
+	/// Largest exponential ceiling; zero disables both provider-wait and
+	/// exponential-delay caps.
 	pub maximum: time::Duration,
 }
 
 impl RetryBackoff {
 	#[cfg(test)]
 	const ZERO: Self = Self { base: time::Duration::ZERO, maximum: time::Duration::ZERO };
+
+	fn accepts(self, delay: time::Duration) -> bool {
+		self.maximum.is_zero() || delay <= self.maximum
+	}
 }
 
 impl Default for RetryBackoff {
@@ -142,7 +147,7 @@ where
 						return Err(error);
 					},
 				};
-				if retry_after > backoff.maximum {
+				if !backoff.accepts(retry_after) {
 					error.action = RetryAction::ReselectRoute;
 					request.context.finalize_error(&mut error);
 					return Err(error);
@@ -169,7 +174,8 @@ where
 	}
 }
 
-/// Calculates `Uniform(0, min(maximum, base * 2^attempt))`.
+/// Calculates `Uniform(0, min(maximum, base * 2^attempt))`; a zero maximum
+/// leaves the exponential ceiling uncapped.
 ///
 /// `sample` is injected for deterministic tests; production uses OS entropy.
 pub fn full_jitter_delay(policy: RetryBackoff, attempt: u32, sample: u64) -> time::Duration {
@@ -177,8 +183,12 @@ pub fn full_jitter_delay(policy: RetryBackoff, attempt: u32, sample: u64) -> tim
 	let ceiling = policy
 		.base
 		.checked_mul(factor)
-		.unwrap_or(policy.maximum)
-		.min(policy.maximum);
+		.unwrap_or(time::Duration::MAX);
+	let ceiling = if policy.maximum.is_zero() {
+		ceiling
+	} else {
+		ceiling.min(policy.maximum)
+	};
 	let nanos = ceiling.as_nanos().min(u128::from(u64::MAX)) as u64;
 	if nanos == 0 {
 		return time::Duration::ZERO;
@@ -334,6 +344,9 @@ mod tests {
 			RetryBackoff { base: Duration::from_millis(500), maximum: Duration::from_secs(8) };
 		assert_eq!(full_jitter_delay(policy, 0, 0), Duration::ZERO);
 		assert!(full_jitter_delay(policy, 4, u64::MAX) <= Duration::from_secs(8));
+		let uncapped = RetryBackoff { base: Duration::from_millis(500), maximum: Duration::ZERO };
+		assert_eq!(full_jitter_delay(uncapped, 4, 8_000_000_000), Duration::from_secs(8));
+		assert!(uncapped.accepts(Duration::from_secs(3 * 60 * 60)));
 		let provider_floor = Duration::from_secs(3);
 		assert_eq!(provider_floor.max(full_jitter_delay(policy, 0, 1)), provider_floor);
 	}

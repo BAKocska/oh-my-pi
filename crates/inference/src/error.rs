@@ -111,24 +111,25 @@ pub enum ErrorKind {
 	InternalInvariant,
 }
 
-/// Classifies token-context versus fixed-payload rejection evidence.
+/// Classifies context-capacity versus fixed-payload rejection evidence.
 ///
-/// Token evidence on any source-chain link or a prior typed overflow wins over
-/// HTTP 413's payload fallback. This permits late response-body finalization to
-/// replace a status-only payload inference without losing cause-chain evidence.
+/// Context-window or provider history-limit evidence on any source-chain link,
+/// or a prior typed overflow, wins over HTTP 413's payload fallback. This
+/// permits late response-body finalization to replace a status-only payload
+/// inference without losing cause-chain evidence.
 pub fn classify_provider_rejection(
 	status: Option<u16>,
 	message: Option<&str>,
 	source: Option<&(dyn error::Error + 'static)>,
 	prior: Option<ErrorKind>,
 ) -> Option<ErrorKind> {
-	let source_has_token_evidence = source.is_some_and(|root| {
+	let source_has_overflow_evidence = source.is_some_and(|root| {
 		let mut link = Some(root);
 		while let Some(cause) = link {
 			if cause
 				.downcast_ref::<Error>()
 				.is_some_and(|error| error.kind == ErrorKind::ContextOverflow)
-				|| has_token_context_evidence(&cause.to_string())
+				|| has_context_overflow_evidence(&cause.to_string())
 			{
 				return true;
 			}
@@ -137,8 +138,8 @@ pub fn classify_provider_rejection(
 		false
 	});
 	if prior == Some(ErrorKind::ContextOverflow)
-		|| message.is_some_and(has_token_context_evidence)
-		|| source_has_token_evidence
+		|| message.is_some_and(has_context_overflow_evidence)
+		|| source_has_overflow_evidence
 	{
 		return Some(ErrorKind::ContextOverflow);
 	}
@@ -148,7 +149,7 @@ pub fn classify_provider_rejection(
 	None
 }
 
-fn has_token_context_evidence(text: &str) -> bool {
+fn has_context_overflow_evidence(text: &str) -> bool {
 	const DIRECT: &[&str] = &[
 		"prompt is too long",
 		"input is too long for requested model",
@@ -181,6 +182,8 @@ fn has_token_context_evidence(text: &str) -> bool {
 				|| contains_ascii_case_insensitive(text.as_bytes(), b"maximum")))
 		|| (contains_ascii_case_insensitive(text.as_bytes(), b"exceeds the limit of")
 			&& contains_ascii_case_insensitive(text.as_bytes(), b"token"))
+		|| (contains_ascii_case_insensitive(text.as_bytes(), b"chat history exceeds the")
+			&& contains_ascii_case_insensitive(text.as_bytes(), b"-message limit"))
 }
 
 fn has_payload_rejection_evidence(text: &str) -> bool {
@@ -802,6 +805,15 @@ mod tests {
 			classify_provider_rejection(
 				Some(413),
 				Some("maximum context length is 128000 tokens"),
+				None,
+				None,
+			),
+			Some(ErrorKind::ContextOverflow),
+		);
+		assert_eq!(
+			classify_provider_rejection(
+				Some(413),
+				Some("Chat history exceeds the 800-message limit"),
 				None,
 				None,
 			),

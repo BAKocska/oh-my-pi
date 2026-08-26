@@ -262,18 +262,21 @@ impl ChatEvent {
 	}
 
 	/// Returns whether this event is ordinary output that commits the stream.
-	pub const fn commits_output(&self) -> bool {
-		matches!(
-			self,
-			Self::BlockStarted { .. }
-				| Self::TextDelta { .. }
-				| Self::ThinkingDelta { .. }
-				| Self::ToolCallStarted { .. }
-				| Self::ToolArgumentsDelta { .. }
-				| Self::ToolCallReady { .. }
-				| Self::Artifact { .. }
-				| Self::Completed(_)
-		)
+	pub fn commits_output(&self) -> bool {
+		match self {
+			Self::TextDelta { text, .. } | Self::ThinkingDelta { text, .. } => !text.is_empty(),
+			Self::ToolArgumentsDelta { bytes, .. } => !bytes.is_empty(),
+			Self::ToolCallStarted { .. }
+			| Self::ToolCallReady { .. }
+			| Self::Artifact { .. }
+			| Self::Completed(_) => true,
+			Self::Started(_)
+			| Self::BlockStarted { .. }
+			| Self::Usage(_)
+			| Self::WorkflowAction(_)
+			| Self::WorkflowResume(_)
+			| Self::WorkflowCancelled { .. } => false,
+		}
 	}
 }
 
@@ -285,6 +288,14 @@ mod tests {
 
 	use super::{ChatEvent, ToolCall};
 	use crate::{call::OpaqueJson, id::ToolCallId};
+
+	#[test]
+	fn only_nonempty_deltas_or_actionable_output_commit() {
+		assert!(!ChatEvent::BlockStarted { index: 0, kind: super::BlockKind::Text }.commits_output());
+		assert!(!ChatEvent::TextDelta { index: 0, text: sf!("") }.commits_output());
+		assert!(ChatEvent::TextDelta { index: 0, text: sf!("  \n") }.commits_output());
+		assert!(ChatEvent::ThinkingDelta { index: 0, text: sf!("thinking") }.commits_output());
+	}
 
 	#[test]
 	fn only_ready_tool_calls_authorize_execution() {

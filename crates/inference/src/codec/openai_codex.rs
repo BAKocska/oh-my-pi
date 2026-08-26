@@ -463,7 +463,8 @@ impl CodexContinuationState {
 		Self { request, response_id, response_items }
 	}
 
-	/// Builds a strict delta-only `response.create` frame.
+	/// Builds a strict delta-only `response.create` frame. The per-turn service
+	/// tier does not break an otherwise identical continuation chain.
 	pub fn continuation_frame(
 		&self,
 		current: &ResponsesRequest,
@@ -473,9 +474,11 @@ impl CodexContinuationState {
 		let mut previous_shape = self.request.clone();
 		previous_shape.input.clear();
 		previous_shape.client_metadata = None;
+		previous_shape.service_tier = None;
 		let mut current_shape = current.clone();
 		current_shape.input.clear();
 		current_shape.client_metadata = None;
+		current_shape.service_tier = None;
 		if current_shape != previous_shape
 			|| current.input.len() <= previous_len.saturating_add(replayed_len)
 		{
@@ -1131,6 +1134,34 @@ mod tests {
 				.expect("strict delta"),
 			fixture.expected_frame
 		);
+	}
+
+	#[test]
+	fn websocket_continuation_survives_service_tier_changes() {
+		#[derive(Deserialize)]
+		struct Fixture {
+			previous_request:        ResponsesRequest,
+			previous_response_id:    Str,
+			previous_response_items: Vec<ResponsesOutputItem>,
+			current_request:         ResponsesRequest,
+		}
+		let mut fixture: Fixture = serde_json::from_str(include_str!(
+			"../../../../fixtures/llm-oracle/openai/codex/websocket.continuation.json"
+		))
+		.expect("continuation fixture");
+		fixture.previous_request.service_tier = Some(Str::new("default"));
+		fixture.current_request.service_tier = Some(Str::new("priority"));
+		let state = CodexContinuationState::new(
+			fixture.previous_request,
+			fixture.previous_response_id.clone(),
+			fixture.previous_response_items,
+		);
+		let frame = state
+			.continuation_frame(&fixture.current_request)
+			.expect("service tier is a per-turn nonsemantic option");
+		assert_eq!(frame.request.previous_response_id, Some(fixture.previous_response_id));
+		assert_eq!(frame.request.service_tier.as_deref(), Some("priority"));
+		assert!(frame.request.input.len() < fixture.current_request.input.len());
 	}
 
 	#[test]

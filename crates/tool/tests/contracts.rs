@@ -570,6 +570,46 @@ fn advertisement_spends_capacity_by_priority_and_receipts_strict_exhaustion() {
 		[Adjustment::Dropped { reason, .. }] if reason.0 == "catalog.strict-schema-budget-exhausted"
 	));
 }
+#[test]
+fn out_of_subset_schema_never_lowers_strict() {
+	let calls = Arc::new(AtomicUsize::new(0));
+	let mut registry = Registry::new();
+	registry
+		.register(
+			FakeTool::new(
+				1,
+				"conditional",
+				br#"{"type":"object","allOf":[{"if":{"required":["async"]},"then":{"required":["name"]}}]}"#,
+				Constraint::Schema { priority: 100, on_unsupported: Fallback::Unspecified },
+				Arc::clone(&calls),
+			)
+			.named("conditional"),
+			Presentation::Slot,
+			claims("omp/tests", Precedence::CORE),
+		)
+		.unwrap();
+	let advertised = registry
+		.advertise(LoweringCaps {
+			strict_schema:  true,
+			grammar:        GrammarBits::empty(),
+			maximum_tools:  None,
+			maximum_strict: None,
+		})
+		.unwrap();
+	assert!(
+		!advertised[0]
+			.definition
+			.input
+			.json_schema()
+			.expect("schema")
+			.1,
+		"if/then schema must degrade to best-effort validation"
+	);
+	assert!(matches!(
+		advertised[0].adjustments.as_slice(),
+		[Adjustment::Dropped { reason, .. }] if reason.0 == "tool.schema-outside-strict-subset"
+	));
+}
 
 #[test]
 fn projection_code_moves_only_projection_identity() {

@@ -24,7 +24,7 @@ use crate::{
 		UnvalidatedToolCall,
 	},
 	error::{Error, ErrorDetail, ErrorKind, ErrorPhase, RetryAction},
-	event::{ChatEvent, Completion},
+	event::{ChatEvent, Completion, FinishReason},
 	layer::{ExecutionContext, LayerCall},
 	plan::ExecutionPlan,
 	receipt::{
@@ -300,7 +300,9 @@ where
 						Ok(event) => event,
 						Err(error) => { yield Err(error); return; },
 					};
-					if let Err(error) = finish_empty(&mut empty, &output_context) {
+					if let Err(error) =
+						finish_empty(&mut empty, &finalized, &output_context)
+					{
 						yield Err(error);
 						return;
 					}
@@ -427,6 +429,7 @@ fn observe_empty(
 
 fn finish_empty(
 	stage: &mut Option<EmptyCompletionStage>,
+	completion: &ChatEvent,
 	context: &ExecutionContext,
 ) -> Result<(), Error> {
 	let Some(stage) = stage.as_mut() else {
@@ -446,6 +449,13 @@ fn finish_empty(
 	let Some(classification) = empty else {
 		return Ok(());
 	};
+	if matches!(
+		completion,
+		ChatEvent::Completed(Completion { reason: FinishReason::Other(reason), .. })
+			if reason.as_str() == "pause_turn"
+	) {
+		return Ok(());
+	}
 	context.with_receipt(|receipt| receipt.recoveries.push(classification.recovery));
 	let (kind, action, reason) = match classification.kind {
 		EmptyCompletionKind::ThinkingOnly => {
@@ -685,6 +695,7 @@ fn recovery_error(reason: &'static str, context: &ExecutionContext) -> Error {
 mod tests {
 
 	use omp_catalog::id::WirePolicyId;
+	use omp_core::sf;
 
 	use super::*;
 	use crate::{
@@ -731,7 +742,27 @@ mod tests {
 		if let Some(event) = event {
 			observe_empty(&mut stage, event, &context).expect("empty observer accepts chat event");
 		}
-		finish_empty(&mut stage, &context).expect_err("empty completion must fail recovery")
+		let completion = ChatEvent::Completed(Completion {
+			reason:  FinishReason::Stop,
+			blocks:  0,
+			usage:   Default::default(),
+			receipt: Default::default(),
+		});
+		finish_empty(&mut stage, &completion, &context)
+			.expect_err("empty completion must fail recovery")
+	}
+
+	#[test]
+	fn pause_turn_accepts_an_empty_completion() {
+		let context = ExecutionContext::new(ExecutionBudget::default());
+		let mut stage = Some(EmptyCompletionStage::new(WirePolicyId::new("wire"), 0));
+		let completion = ChatEvent::Completed(Completion {
+			reason:  FinishReason::Other(sf!("pause_turn")),
+			blocks:  0,
+			usage:   Default::default(),
+			receipt: Default::default(),
+		});
+		assert!(finish_empty(&mut stage, &completion, &context).is_ok());
 	}
 
 	#[test]

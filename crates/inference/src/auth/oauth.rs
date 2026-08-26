@@ -1501,7 +1501,7 @@ fn callback_code(
 			code = Some(SecretString::from(mem::take(&mut *decoded)));
 		}
 	}
-	if !state_seen {
+	if !state_seen && !expected_state.is_empty() {
 		return Err(OAuthError::MalformedCallback);
 	}
 	code.ok_or(OAuthError::MalformedCallback)
