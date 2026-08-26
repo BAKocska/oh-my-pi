@@ -196,6 +196,7 @@ raw-window-handle = "0.6"
 rayon = "1.10"
 reis = { version = "=0.5.0", features = ["tokio"] }
 regex = "1.11"
+resvg = "0.45.1"
 rustc-hash = "2"
 rustc-demangle = "0.1"
 rustix = { version = "1.1", features = ["fs", "pipe", "process", "time"] }
@@ -307,7 +308,7 @@ zerocopy = { version = "0.8", features = ["derive"] }
 zune-jpeg = "0.5"
 zeroize = { version = "1.9", features = ["derive"] }
 zstd = "0.13"
-xutf = "1.1"
+xutf = "1.4"
 xxhash-rust = { version = "0.8", features = ["xxh3", "xxh32"] }
 
 [workspace.metadata.omp.dependency-lints.omp-agent]
