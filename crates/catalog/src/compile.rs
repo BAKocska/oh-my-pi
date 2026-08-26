@@ -56,15 +56,15 @@ use crate::{
 /// Schema version of reviewable normalized compiler output.
 pub const COMPILED_SCHEMA_VERSION: u32 = 1;
 /// Verified raw row count of the checked-in oracle.
-pub const ORACLE_RAW_MODELS: usize = 4_302;
+pub const ORACLE_RAW_MODELS: usize = 4_303;
 /// Verified normalized logical model count of the checked-in oracle.
-pub const ORACLE_LOGICAL_MODELS: usize = 4_177;
+pub const ORACLE_LOGICAL_MODELS: usize = 4_178;
 /// Verified curated provider count.
-pub const ORACLE_PROVIDERS: usize = 111;
+pub const ORACLE_PROVIDERS: usize = 112;
 /// Verified number of provider keys present in raw model records.
-pub const ORACLE_RAW_PROVIDER_KEYS: usize = 80;
+pub const ORACLE_RAW_PROVIDER_KEYS: usize = 81;
 /// Verified number of distinct route URLs.
-pub const ORACLE_URLS: usize = 119;
+pub const ORACLE_URLS: usize = 120;
 /// Full transport vocabulary size in the oracle.
 pub const ORACLE_TRANSPORTS: usize = 16;
 /// Transport variants active in the checked-in oracle.
@@ -5291,6 +5291,7 @@ usage = true
 			"reasoning-axes.kdl",
 			r#"class "qwen" {
 				template-reasoning-effort #true
+				thinking-format "chat-template"
 				thinking-tool-choice-conflict "drop_thinking_when_any"
 			}"#,
 		)])
@@ -5309,6 +5310,10 @@ usage = true
 			axis_map_to_source_wire_policy(resolved.wire).expect("resolved axes deserialize");
 		let policy = compile_wire_policy(WirePolicy::baseline(), &source).expect("axes compile");
 		assert_eq!(policy.reasoning.template_reasoning_effort, Some(true));
+		assert_eq!(
+			policy.reasoning.thinking_format,
+			Some(crate::policy::ThinkingFormat::ChatTemplate)
+		);
 		assert_eq!(
 			policy.tool.thinking_conflict,
 			Some(crate::policy::ThinkingToolChoiceConflict::DropThinkingWhenAny)

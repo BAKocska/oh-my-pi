@@ -143,6 +143,19 @@ exchange = "cursor-poll"
 principal_resolution = { kind = "static-label", label = "cursor" }
 
 [[provider]]
+provider = "openrouter"
+credential_provider = "openrouter"
+kind = "custom-exchange"
+client_id = ""
+authorize_url = "https://openrouter.ai/auth"
+token_url = "https://openrouter.ai/api/v1/auth/keys"
+scopes = []
+callback_port = 54549
+custom_params = { redirect_uri = "http://localhost:54549/callback", key_info_url = "https://openrouter.ai/api/v1/auth/key" }
+exchange = "open-router-api-key"
+principal_resolution = { kind = "static-label", label = "openrouter" }
+
+[[provider]]
 provider = "zai"
 credential_provider = "zai"
 kind = "custom-exchange"
@@ -235,3 +248,15 @@ scopes = []
 custom_params = { token_plan_url = "https://platform.xiaomimimo.com/console/plan-manage" }
 exchange = "api-key-paste"
 principal_resolution = { kind = "static-label", label = "xiaomi" }
+
+[[provider]]
+provider = "yolo-auto"
+credential_provider = "yolo-auto"
+kind = "custom-exchange"
+client_id = ""
+authorize_url = "https://yolo-auto.com/app"
+token_url = ""
+scopes = []
+custom_params = { models_url = "https://yolo-auto.com/v1/models" }
+exchange = "api-key-paste"
+principal_resolution = { kind = "static-label", label = "yolo-auto" }

@@ -8,7 +8,7 @@
         "kind": "verbatim-source-snapshot"
       },
       "secret_free": true,
-      "sha256": "499bc740d00a4551d4ddf30f2c4b0ece30991af007754b269cb8cc21bc73964b",
+      "sha256": "0555b6916390bf524ec913f9e321a59f9d580e3a750e5a64382c068cbf180851",
       "source": "archive/llm-legacy/llm-catalog/models.json.zst"
     },
     {
@@ -19,7 +19,7 @@
         "kind": "verbatim-zstd-decompression"
       },
       "secret_free": true,
-      "sha256": "310e4e09256a1a4a9562cafbdf5c9da3c8854311361e2bc5ec68b9820549a3f6",
+      "sha256": "62a43a09c3c6f8d406f62cbd5799a18553246b1a0b9a5d806a81dc023afb8eb5",
       "source": "archive/llm-legacy/llm-catalog/models.json.zst"
     },
     {
@@ -37,7 +37,7 @@
         "projector": "project_normalized.rs"
       },
       "secret_free": true,
-      "sha256": "95037fe800b694f6162bc09022db92f1edf5ec61c0cc74ed661137d0b4b5ca86",
+      "sha256": "c857ce7d0867b26ab6e053ff4f0987fac00e41dded1a3d8a0de06e7017888da6",
       "source": "52b111a4abc8d76064abc4f58afda931edee9833:crates/llm-catalog/src/models.rs"
     },
     {
@@ -58,7 +58,7 @@
         "kind": "verbatim-source-snapshot"
       },
       "secret_free": true,
-      "sha256": "4878842fe3d7a49abbf8afde97867f5f89bcf5ff775254d2e91b8e6d323e7a13",
+      "sha256": "f6ec0b664ee67f295d63c4fe17ea975c51b49885154b603297a4397e815932bd",
       "source": "archive/llm-legacy/llm-catalog/providers.toml"
     },
     {
@@ -68,7 +68,7 @@
         "kind": "source-snapshot"
       },
       "secret_free": true,
-      "sha256": "410928f94d0f26fd431de302118de2b50907763b8e5cf75dc6d3dad1deffdbf0",
+      "sha256": "61c7c07eeb1e1f141c5b8ffdb87a4b508cfb202b79302fabdede415cbdd25491",
       "source": "archive/llm-legacy/llm-catalog/oauth.toml"
     },
     {
@@ -84,7 +84,7 @@
         ]
       },
       "secret_free": true,
-      "sha256": "49d623c86d34b2fe73c9af71648b42dc0fc69d53ef9cade38cfabf9b5cc81960",
+      "sha256": "dcac785cdab54b8c2e26fb954658763deccb9fcbf5914e7b457d254a7a053535",
       "source": "archive/llm-legacy/llm-catalog/src/models.rs::load_catalog_zstd"
     }
   ],

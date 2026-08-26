@@ -84,6 +84,7 @@ transport = "open-ai-chat"
 base_url = "https://openrouter.ai/api/v1"
 headers = { "HTTP-Referer" = "https://omp.sh/", "X-OpenRouter-Title" = "omp", "X-OpenRouter-Categories" = "cli-agent", "X-OpenRouter-Cache" = "true", "X-OpenRouter-Cache-TTL" = "3600" }
 auth = { type = "bearer", env = ["OMP_OPENROUTER_API_KEY"] }
+oauth_flow = "openrouter"
 discovery = { kind = "open-ai-models", label = "OpenRouter", authoritative = false }
 facets = ["chat", "image_generation"]
 compat = { "reasoning_wire_format" = "open_router", "cache_control_format" = "anthropic", "leaked_thinking_healer" = "thinking" }
@@ -421,7 +422,7 @@ compat = { "max_tokens_field" = "max_tokens" }
 [providers."deepinfra"]
 transport = "open-ai-chat"
 base_url = "https://api.deepinfra.com/v1/openai"
-auth = { type = "bearer", env = ["OMP_DEEPINFRA_TOKEN"] }
+auth = { type = "bearer", env = ["OMP_DEEPINFRA_API_KEY"] }
 discovery = { kind = "open-ai-models", label = "DeepInfra", authoritative = true }
 facets = ["chat"]
 
@@ -907,4 +908,10 @@ auth = { type = "bearer", env = ["OMP_GMI_API_KEY"] }
 discovery = { kind = "open-ai-models", label = "GMI Cloud", authoritative = true }
 facets = ["chat"]
 
-
+[providers."yolo-auto"]
+transport = "open-ai-chat"
+base_url = "https://yolo-auto.com/v1"
+auth = { type = "bearer", env = ["OMP_YOLO_AUTO_API_KEY"] }
+oauth_flow = "yolo-auto"
+discovery = { kind = "open-ai-models", label = "Yolo-Auto", authoritative = true }
+facets = ["chat"]

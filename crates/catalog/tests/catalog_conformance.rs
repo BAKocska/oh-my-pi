@@ -17,8 +17,8 @@ use omp_catalog::{
 	},
 	pricing::{PriceUnit, UsageDimensions},
 	provider::{
-		AuthSpecKind, CodexTransportPreference, OAuthFlowSpec, OAuthRefreshBehavior, OAuthSpec,
-		PrincipalResolution,
+		AuthSpecKind, CodexTransportPreference, OAuthExchangeKind, OAuthFlowSpec,
+		OAuthRefreshBehavior, OAuthSpec, PrincipalResolution,
 	},
 	snapshot::{Catalog, SnapshotProvenance},
 	thinking::{ThinkingEffort, ThinkingMode, ThinkingPolicy},
@@ -894,6 +894,24 @@ fn provider_oauth<'a>(compiled: &'a CompiledCatalog, provider_id: &str) -> &'a O
 		.find(|oauth| &oauth.id == oauth_id)
 		.expect("OAuth spec")
 }
+fn advertised_oauth<'a>(compiled: &'a CompiledCatalog, provider_id: &str) -> &'a OAuthSpec {
+	let provider = compiled
+		.providers
+		.iter()
+		.find(|provider| provider.id == provider_id)
+		.expect("provider");
+	let oauth_id = provider
+		.auth
+		.iter()
+		.filter_map(|id| compiled.auth_specs.iter().find(|auth| &auth.id == id))
+		.find_map(|auth| auth.oauth.as_ref())
+		.expect("advertised OAuth login");
+	compiled
+		.oauth_specs
+		.iter()
+		.find(|oauth| &oauth.id == oauth_id)
+		.expect("OAuth spec")
+}
 
 #[test]
 fn interactive_oauth_contracts_preserve_provider_parameters_and_identity() {
@@ -930,6 +948,21 @@ fn interactive_oauth_contracts_preserve_provider_parameters_and_identity() {
 			.iter()
 			.any(|parameter| parameter.name == "access_type")
 	);
+
+	let openrouter = advertised_oauth(&compiled, "openrouter");
+	let OAuthFlowSpec::Custom { authorize_url, exchange, parameters, polling } = &openrouter.flow
+	else {
+		panic!("OpenRouter login must use its custom PKCE key-provisioning flow");
+	};
+	assert_eq!(authorize_url, "https://openrouter.ai/auth");
+	assert_eq!(*exchange, OAuthExchangeKind::OpenRouterApiKey);
+	assert!(polling.is_none());
+	assert!(parameters.iter().any(|parameter| {
+		parameter.name == "redirect_uri" && parameter.value == "http://localhost:54549/callback"
+	}));
+	assert!(parameters.iter().any(|parameter| {
+		parameter.name == "key_info_url" && parameter.value == "https://openrouter.ai/api/v1/auth/key"
+	}));
 
 	for provider in ["openai-codex", "github-copilot", "xai-oauth", "gitlab-duo"] {
 		assert!(

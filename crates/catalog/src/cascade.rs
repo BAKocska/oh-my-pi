@@ -11,7 +11,8 @@
 //! - **family** — the classified product family within a class,
 //! - **revision** — a conjunction of `SemVer` comparisons,
 //! - **models** — exact or `*`-glob, ASCII-case-insensitive, matched against
-//!   the provider-relative model identifier.
+//!   the provider-relative model identifier; `token="name"` matches only when
+//!   bounded by non-alphanumeric separators or identifier edges.
 //!
 //! Axis ownership is semantic, not statistical: `classes/*.kdl` carry
 //! model-lineage truths (the census keys them on model-class predicates —
@@ -275,6 +276,7 @@ pub const BUNDLED_COMPAT: &[(&str, &str)] = sources![
 	"providers/xiaomi-token-plan-cn",
 	"providers/xiaomi-token-plan-sgp",
 	"providers/yandex",
+	"providers/yolo-auto",
 	"providers/zai",
 	"providers/zenmux",
 	"providers/zhipu-coding-plan",
@@ -416,6 +418,8 @@ enum Selector {
 	/// `*`-wildcard match (ASCII-case-insensitive: patterns span the chaotic
 	/// aggregator spellings of one lineage).
 	Glob(Str),
+	/// ASCII-case-insensitive token bounded by identifier punctuation or edges.
+	Token(Str),
 }
 
 impl Selector {
@@ -431,14 +435,18 @@ impl Selector {
 		match self {
 			Self::Exact(id) => id.as_str() == model,
 			Self::Glob(pattern) => glob_match(pattern.as_str(), model_lower),
+			Self::Token(token) => model_lower
+				.split(|character: char| !character.is_ascii_alphanumeric())
+				.any(|part| part == token.as_str()),
 		}
 	}
 
-	/// Exact selectors outrank globs; both outrank selector-free rules.
+	/// Exact selectors outrank globs and bounded tokens; all outrank
+	/// selector-free rules.
 	const fn exactness(&self) -> u8 {
 		match self {
 			Self::Exact(_) => 2,
-			Self::Glob(_) => 1,
+			Self::Glob(_) | Self::Token(_) => 1,
 		}
 	}
 }
@@ -920,7 +928,11 @@ impl RuleAxes {
 fn node_priority(file: &str, node: &KdlNode) -> Result<i64, CascadeError> {
 	let mut priority = None;
 	for entry in node.entries().iter().filter(|entry| entry.name().is_some()) {
-		if entry.name().is_none_or(|name| name.value() != "priority") || priority.is_some() {
+		let name = entry.name().expect("filtered to named entries").value();
+		if node.name().value() == "models" && name == "token" {
+			continue;
+		}
+		if name != "priority" || priority.is_some() {
 			return Err(CascadeError::MalformedDirective {
 				file:      file.to_str(),
 				directive: node.name().value().to_str(),
@@ -1036,11 +1048,29 @@ fn string_arguments(node: &KdlNode, file: &str, directive: &str) -> Result<Vec<S
 }
 
 fn selector_arguments(node: &KdlNode, file: &str) -> Result<Vec<Selector>, CascadeError> {
-	let patterns = string_arguments(node, file, "models")?;
-	Ok(patterns
-		.iter()
-		.map(|pattern| Selector::new(pattern.as_str()))
-		.collect())
+	let malformed = || CascadeError::MalformedDirective {
+		file:      file.to_str(),
+		directive: "models".to_str(),
+	};
+	let mut selectors = Vec::new();
+	for entry in node.entries() {
+		let name = entry.name().map(|name| name.value());
+		if name == Some("priority") {
+			continue;
+		}
+		let value = entry.value().as_string().ok_or_else(|| malformed())?;
+		match name {
+			None => selectors.push(Selector::new(value)),
+			Some("token") => {
+				selectors.push(Selector::Token(value.to_ascii_lowercase().to_str()));
+			},
+			Some(_) => return Err(malformed()),
+		}
+	}
+	if selectors.is_empty() {
+		return Err(malformed());
+	}
+	Ok(selectors)
 }
 
 #[cfg(test)]
@@ -1058,6 +1088,24 @@ mod tests {
 		reasoning: bool,
 	) -> ResolveTarget<'a> {
 		ResolveTarget { provider, class, family: None, revision: None, model, reasoning }
+	}
+
+	#[test]
+	fn deepseek_vision_exemption_requires_a_bounded_token() {
+		let cascade = CompatCascade::bundled().expect("bundled cascade parses");
+		let encoding = |model| {
+			cascade
+				.resolve(&target("custom-proxy", "deepseek", model, false))
+				.expect("DeepSeek model resolves")
+				.wire["image_encoding_format"]
+				.clone()
+		};
+		for model in ["deepseek-v4-flash-vision-exp", "deepseek_vision", "vision-deepseek-v4"] {
+			assert_eq!(encoding(model), Value::from("open_ai_url"), "{model}");
+		}
+		for model in ["deepseek-r1-revision-0528", "deepseek-v4-provisioned"] {
+			assert_eq!(encoding(model), Value::from("none"), "{model}");
+		}
 	}
 
 	#[test]

@@ -9,7 +9,7 @@ discovery {
 	// intrinsic parameters for its exact gateway-first Responses pins, whose
 	// bare ids otherwise carry no capability metadata (pi bb80c8bc45).
 	// Pricing, wire policy, and routes are never borrowed across providers.
-	recover-canonical-params "gmi-cloud" "opencode-go"
+	recover-canonical-params "gmi-cloud" "opencode-go" "yolo-auto"
 	// The OpenCode gateways share one operator and ship models before any
 	// census bundles them (muse-spark-1.2[-contributor] was served only at
 	// /responses while unbundled, pi #8957). An unbundled discovered id —

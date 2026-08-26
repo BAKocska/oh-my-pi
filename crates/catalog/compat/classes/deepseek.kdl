@@ -2,7 +2,7 @@
 
 class "deepseek" {
 	image-encoding-format "none"
-	models "*deepseek-ocr*" "*janus*" "*vision*" "*vl*" {
+	models "*deepseek-ocr*" "*janus*" "*vl*" token="vision" {
 		image-encoding-format "open_ai_url"
 	}
 	on "aiand" "aimlapi" "alibaba-token-plan" "baseten" "coreweave" "deepseek" "fireworks" \
