@@ -29,7 +29,9 @@ impl GitWorkbench {
 			.as_ref()
 			.map_or(self.ctx.theme.muted, |(_, color, _)| *color);
 		let encoding = self.contents.as_ref().map_or("UTF-8", |contents| {
-			if contents.media.is_some() {
+			if contents.media.as_deref() == Some("binary") {
+				"Binary"
+			} else if contents.media.is_some() {
 				"Media"
 			} else if contents.binary {
 				"Binary"

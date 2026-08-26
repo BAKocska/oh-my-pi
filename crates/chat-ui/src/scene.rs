@@ -18,10 +18,10 @@ use omp_tui::{
 	anim::{self, Easing, Shimmer, Tween},
 	components::{
 		Attachment, AttachmentContent, Attachments, ComposerStatusAttachment, ComposerStyle,
-		ContextGauge, ContextGaugeMode, EditorPane, GaugeCell, Img, KeywordAccent, Segment, Status,
-		TextLeaf, ToolCard, ToolState, advisor_spend_label, boundary_layout, collapse_hud_line,
-		compaction_boundary_color, compaction_threshold_color, hr::truncate_to_width, spend_label,
-		write_compact_count,
+		ContextGauge, ContextGaugeMode, EditorPane, GaugeCell, Img, KeywordAccent, Markdown, Segment,
+		Status, TextLeaf, ToolCard, ToolState, advisor_spend_label, boundary_layout,
+		collapse_hud_line, compaction_boundary_color, compaction_threshold_color,
+		hr::truncate_to_width, spend_label, write_compact_count,
 	},
 	next_slot,
 };
@@ -31,7 +31,7 @@ use crate::{
 	ActivityWaveform, AgentRow, BackendEvent, CompactionSpeculationStatus, ModelDownloadProgress,
 	QueuedPrompt, StatusFacts, StatusLayout, StatusSeparator, SubmitMode, ThinkingLevel, TodoHud,
 	TranscriptFrame, TranscriptFrameKind,
-	blocks::{BlockMode, BlockOrdinal, Blocks},
+	blocks::{BlockOrdinal, Blocks},
 	frame::{FrameError, FrameMutation, RetainedFrames, render_frame_tml},
 	slots::{Mount, Slots},
 };
@@ -54,6 +54,7 @@ use strum::IntoStaticStr;
 use crate::{queue, slots::Damage};
 const INPUT_ID: &str = "input";
 const LIVE_TOOL_CARD_ID: &str = "live-tool-card";
+const LIVE_ASSISTANT_ID: &str = "live-assistant";
 
 const LIVE_VOICE_ROWS: u16 = 4;
 const LIVE_VOICE_FRAME: Duration = Duration::from_millis(50);
@@ -255,22 +256,21 @@ pub struct ViewportFrame<'a> {
 pub struct RetirementBatch {
 	/// Half-open block ordinal range committed by a successful transaction.
 	///
-	/// Natural append and replay transactions do not advance this range.
+	/// Replay transactions do not advance this range.
 	pub range:     Range<u64>,
-	/// Width-dependent stable or finalized rows written by a non-replay
-	/// transaction.
+	/// Width-dependent finalized rows written by a commit transaction.
 	pub frame:     Frame,
 	replay_frames: Option<Vec<Frame>>,
 	kind:          RetirementKind,
 }
 
 impl RetirementBatch {
-	/// Returns the replay policy and ordered row segments, or `None` for commit
-	/// and natural append transactions.
+	/// Returns the replay policy and ordered row segments, or `None` for a
+	/// commit transaction.
 	pub(crate) fn replay_plan(&self) -> Option<(HistoryReplay, &[Frame])> {
 		match (self.kind, self.replay_frames.as_deref()) {
 			(RetirementKind::Replay(mode), Some(frames)) => Some((mode, frames)),
-			(RetirementKind::Commit | RetirementKind::Append { .. }, None) => None,
+			(RetirementKind::Commit, None) => None,
 			_ => unreachable!("replay kind and segmented frame plan must agree"),
 		}
 	}
@@ -279,15 +279,13 @@ impl RetirementBatch {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RetirementKind {
 	Commit,
-	Append { ordinal: BlockOrdinal, emitted: u64 },
 	Replay(HistoryReplay),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Replay {
-	end:     u64,
-	partial: Option<(BlockOrdinal, u64)>,
-	mode:    HistoryReplay,
+	end:  u64,
+	mode: HistoryReplay,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -591,30 +589,12 @@ impl RichText {
 }
 
 struct AssistantEntry {
-	body:         RichText,
-	visible:      Option<RichText>,
-	visible_from: u64,
+	body: RichText,
 }
 
 impl AssistantEntry {
-	fn new(text: String, emitted: u64, width: u16, ctx: &UiContext) -> Self {
-		let body = RichText::new(text, width, ctx);
-		let mut entry = Self { body, visible: None, visible_from: 0 };
-		entry.set_emitted(emitted, width, ctx);
-		entry
-	}
-
-	fn set_emitted(&mut self, emitted: u64, width: u16, ctx: &UiContext) {
-		if self.visible_from == emitted {
-			return;
-		}
-		self.visible_from = emitted;
-		self.visible =
-			stable_suffix(&self.body.text, emitted).map(|suffix| RichText::new(suffix, width, ctx));
-	}
-
-	fn visible(&self) -> &RichText {
-		self.visible.as_ref().unwrap_or(&self.body)
+	fn new(text: String, width: u16, ctx: &UiContext) -> Self {
+		Self { body: RichText::new(text, width, ctx) }
 	}
 }
 
@@ -680,7 +660,7 @@ impl ToolView {
 
 struct ToolEntry {
 	label:    Str,
-	ok:       bool,
+	ok:       Option<bool>,
 	expanded: bool,
 	view:     ToolView,
 	images:   Vec<ToolImageEntry>,
@@ -784,81 +764,43 @@ fn append_thinking_ellipsis(lines: &mut Vec<String>) {
 	}
 }
 
-/// Returns immutable Markdown chunks closed by a blank line or closing fence.
-///
-/// A newline alone does not close a CommonMark paragraph (a following setext
-/// underline can still restyle it), so the current paragraph and any open
-/// fenced block remain viewport-owned.
-fn stable_assistant_rows(text: &str) -> SmallVec<Range<usize>, 8> {
-	let mut rows = SmallVec::new();
-	let mut start = 0;
-	let mut offset = 0;
-	let mut fence: Option<(u8, usize)> = None;
-	for line in text.split_inclusive('\n') {
-		offset += line.len();
-		let content = line
-			.strip_suffix('\n')
-			.unwrap_or(line)
-			.trim_end_matches('\r');
-		if let Some((marker, length)) = fence {
-			if fence_marker(content).is_some_and(|(candidate, candidate_len, suffix)| {
-				candidate == marker && candidate_len >= length && suffix.trim().is_empty()
-			}) {
-				fence = None;
-				rows.push(start..offset);
-				start = offset;
-			}
-			continue;
-		}
-		if let Some((marker, length, suffix)) = fence_marker(content)
-			&& !(marker == b'`' && suffix.contains('`'))
-		{
-			fence = Some((marker, length));
-			continue;
-		}
-		if content.trim().is_empty() && start < offset {
-			rows.push(start..offset);
-			start = offset;
-		}
-	}
-	rows
-}
-
-fn stable_suffix(text: &str, emitted: u64) -> Option<&str> {
-	if emitted == 0 {
-		return None;
-	}
-	let rows = stable_assistant_rows(text);
-	let cutoff = usize::try_from(emitted)
-		.ok()
-		.and_then(|count| count.checked_sub(1))
-		.and_then(|index| rows.get(index))
-		.map_or(text.len(), |row| row.end);
-	Some(&text[cutoff..])
-}
-
 struct LiveAssistant {
 	ordinal:    BlockOrdinal,
 	id:         Str,
 	text:       StrMut,
+	view:       Ui,
 	started:    Duration,
 	thinking:   bool,
 	allocation: u16,
 }
 
 impl LiveAssistant {
-	fn stable_rows(&self) -> SmallVec<Range<usize>, 8> {
-		if self.thinking {
-			SmallVec::new()
-		} else {
-			stable_assistant_rows(self.text.as_str())
+	fn new(ordinal: BlockOrdinal, id: Str, width: u16, ctx: &UiContext, started: Duration) -> Self {
+		let markdown = Markdown::new()
+			.with(Prop::Id, LIVE_ASSISTANT_ID)
+			.with(Prop::Partial, true)
+			.text("");
+		let view = Ui::from_root(markdown, width.max(1), ctx.clone());
+		Self { ordinal, id, text: StrMut::new(""), view, started, thinking: false, allocation: 0 }
+	}
+
+	fn append(&mut self, delta: &str) {
+		self.text.push_str(delta);
+		let _ = self.view.set_text(LIVE_ASSISTANT_ID, self.text.as_str());
+		self.thinking |= self.text.as_str().starts_with("*Thinking:* ");
+	}
+
+	fn resize(&mut self, width: u16) {
+		if self.view.frame().size().width != width.max(1) {
+			self.view.resize(width.max(1));
 		}
 	}
 
-	fn visible_text(&self, emitted: u64) -> &str {
-		stable_suffix(self.text.as_str(), emitted).unwrap_or(self.text.as_str())
+	fn height(&self) -> u16 {
+		self.view.height().max(1)
 	}
 }
+
 struct DownloadActivity {
 	received:  Duration,
 	completed: Option<Duration>,
@@ -973,13 +915,6 @@ fn restyle_entry(entry: &mut Entry, ctx: &UiContext) {
 		},
 		Entry::Assistant(assistant) => {
 			if let Some(view) = assistant.body.view.as_mut() {
-				let _ = view.set_context(ctx.clone());
-			}
-			if let Some(view) = assistant
-				.visible
-				.as_mut()
-				.and_then(|body| body.view.as_mut())
-			{
 				let _ = view.set_context(ctx.clone());
 			}
 		},
@@ -2033,15 +1968,14 @@ impl Chat {
 	/// Begins a live assistant message.
 	pub fn begin_assistant(&mut self, id: impl Into<Str>) {
 		self.finalize_abandoned_streams();
-		let ordinal = self.blocks.create(BlockMode::AppendOnly);
-		self.live_assistant = Some(LiveAssistant {
+		let ordinal = self.blocks.create();
+		self.live_assistant = Some(LiveAssistant::new(
 			ordinal,
-			id: id.into(),
-			text: StrMut::new(""),
-			started: self.started_at.elapsed(),
-			thinking: false,
-			allocation: 0,
-		});
+			id.into(),
+			Self::message_width(self.layout_width),
+			&self.ctx,
+			self.started_at.elapsed(),
+		));
 		self.bump_live();
 	}
 
@@ -2052,21 +1986,27 @@ impl Chat {
 	/// content.
 	fn finalize_abandoned_streams(&mut self) {
 		if let Some(assistant) = self.live_assistant.take() {
-			let emitted = self.blocks.emitted(assistant.ordinal).unwrap_or(0);
-			if emitted > 0 {
-				let body = AssistantEntry::new(
-					assistant.text.as_str().to_owned(),
-					emitted,
-					Self::message_width(self.layout_width),
-					&self.ctx,
-				);
-				self
-					.entries
-					.insert(assistant.ordinal, Entry::Assistant(body));
-			}
 			self.blocks.finalize(assistant.ordinal);
 		}
 		for tool in self.live_tools.drain(..) {
+			let label = fmts_mut!(
+				"{} {}@{} · {}",
+				self.ctx.charset.icon(Icon::Cancellable),
+				tool.name,
+				tool.rev,
+				tool.title
+			)
+			.freeze();
+			self.entries.insert(
+				tool.ordinal,
+				Entry::Tool(ToolEntry {
+					label,
+					ok: None,
+					expanded: tool.expanded,
+					view: tool.view,
+					images: tool.images,
+				}),
+			);
 			self.blocks.finalize(tool.ordinal);
 		}
 	}
@@ -2076,8 +2016,7 @@ impl Chat {
 		if let Some(message) = &mut self.live_assistant
 			&& message.id.as_str() == id
 		{
-			message.text.push_str(text);
-			message.thinking |= message.text.as_str().starts_with("*Thinking:* ");
+			message.append(text);
 			self.bump_live();
 		}
 	}
@@ -2112,10 +2051,8 @@ impl Chat {
 					);
 				}
 			} else {
-				let emitted = self.blocks.emitted(message.ordinal).unwrap_or(0);
 				let body = AssistantEntry::new(
 					body.to_owned(),
-					emitted,
 					Self::message_width(self.layout_width),
 					&self.ctx,
 				);
@@ -2158,7 +2095,7 @@ impl Chat {
 		let name = name.into();
 		let rev = rev.into();
 		let title = hud_line(title.into(), self.ctx.charset);
-		let ordinal = self.blocks.create(BlockMode::Mutable);
+		let ordinal = self.blocks.create();
 		let duration = if self.reduced_motion { "0ms" } else { "180ms" };
 		let card = ToolCard::new()
 			.with(Prop::Id, LIVE_TOOL_CARD_ID)
@@ -2264,7 +2201,7 @@ impl Chat {
 			let label = fmts_mut!("{icon} {}@{} · {}", tool.name, tool.rev, tool.title).freeze();
 			let entry = ToolEntry {
 				label,
-				ok,
+				ok: Some(ok),
 				expanded: true,
 				view: ToolView::structured(view, width, &self.ctx),
 				images,
@@ -2387,6 +2324,9 @@ impl Chat {
 		for entry in &mut self.entries.values_mut() {
 			restyle_entry(entry, &context);
 		}
+		if let Some(assistant) = &mut self.live_assistant {
+			let _ = assistant.view.set_context(context.clone());
+		}
 		for tool in &mut self.live_tools {
 			let _ = tool.view.rendered.set_context(context.clone());
 			let _ = tool.card_ui.set_context(context.clone());
@@ -2395,6 +2335,10 @@ impl Chat {
 	}
 
 	/// Appends a semantic transcript boundary with core-owned styling.
+	///
+	/// [`TranscriptFrameKind::Error`] only pins the failure status line; the
+	/// durable transcript surface for a failed turn is its retained
+	/// diagnostic card, so no duplicate notice entry is appended.
 	pub fn push_transcript_frame(&mut self, frame: TranscriptFrame) {
 		if frame.kind == TranscriptFrameKind::Peer {
 			self.enqueue_final(Entry::Peer { title: frame.title, detail: frame.detail });
@@ -2417,7 +2361,8 @@ impl Chat {
 			_ => sf!("{marker} · {}", frame.title),
 		};
 		if frame.kind == TranscriptFrameKind::Error {
-			self.push_error(text);
+			self.pinned_error = Some(text);
+			self.bump_live();
 		} else {
 			self.push_notice(text);
 		}
@@ -2610,8 +2555,7 @@ impl Chat {
 	pub fn cancel_active(&mut self, reason: impl IntoStr) {
 		let reason = reason.into_str();
 		if let Some(assistant) = self.live_assistant.take() {
-			let emitted = self.blocks.emitted(assistant.ordinal).unwrap_or(0);
-			if emitted == 0 {
+			if assistant.text.is_empty() {
 				self
 					.entries
 					.insert(assistant.ordinal, Entry::Notice { text: reason.clone(), error: true });
@@ -2629,7 +2573,6 @@ impl Chat {
 					assistant.ordinal,
 					Entry::Assistant(AssistantEntry::new(
 						text,
-						emitted,
 						Self::message_width(self.layout_width),
 						&self.ctx,
 					)),
@@ -2788,19 +2731,15 @@ impl Chat {
 		viewport: Size,
 		batch: &RetirementBatch,
 	) -> ViewportFrame<'_> {
-		let (frontier, projected_emission) = match batch.kind {
-			RetirementKind::Commit => (batch.range.end, None),
-			RetirementKind::Append { ordinal, emitted } => {
-				(self.blocks.frontier(), Some((ordinal, emitted)))
-			},
-			RetirementKind::Replay(_) => (self.blocks.frontier(), None),
+		let frontier = match batch.kind {
+			RetirementKind::Commit => batch.range.end,
+			RetirementKind::Replay(_) => self.blocks.frontier(),
 		};
 		self.render_at_with_frontier(
 			viewport,
 			self.started_at.elapsed(),
 			frontier,
 			AdmissionMode::Defer,
-			projected_emission,
 		)
 	}
 
@@ -2948,7 +2887,7 @@ impl Chat {
 
 	fn render_at(&mut self, viewport: Size, elapsed: Duration) -> ViewportFrame<'_> {
 		let frontier = self.blocks.frontier();
-		self.render_at_with_frontier(viewport, elapsed, frontier, AdmissionMode::Allow, None)
+		self.render_at_with_frontier(viewport, elapsed, frontier, AdmissionMode::Allow)
 	}
 
 	fn render_at_with_frontier(
@@ -2957,7 +2896,6 @@ impl Chat {
 		elapsed: Duration,
 		frontier: u64,
 		admission: AdmissionMode,
-		projected_emission: Option<(BlockOrdinal, u64)>,
 	) -> ViewportFrame<'_> {
 		self.last_viewport = viewport;
 		if self.frame.size() != viewport {
@@ -2992,17 +2930,6 @@ impl Chat {
 			if self.hide_thinking && matches!(entry, Entry::Thinking(_)) {
 				continue;
 			}
-			if let Some((projected, emitted)) = projected_emission
-				&& *ordinal == projected
-			{
-				match entry {
-					Entry::Assistant(assistant) => {
-						assistant.set_emitted(emitted, content_width, &self.ctx);
-					},
-					Entry::Thinking(thinking) => thinking.visible = false,
-					_ => {},
-				}
-			}
 			Self::resize_entry(entry, content_width, &self.ctx);
 			let height = Self::entry_height(entry, content_width);
 			if height > 0 {
@@ -3013,20 +2940,12 @@ impl Chat {
 		let mut natural = SmallVec::<(BlockOrdinal, u16), 16>::new();
 		if let Some(assistant) = self
 			.live_assistant
-			.as_ref()
+			.as_mut()
 			.filter(|assistant| !(self.hide_thinking && assistant.thinking))
 		{
-			let emitted = projected_emission
-				.filter(|(ordinal, _)| *ordinal == assistant.ordinal)
-				.map_or_else(
-					|| self.blocks.emitted(assistant.ordinal).unwrap_or(0),
-					|(_, emitted)| emitted,
-				);
+			assistant.resize(content_width);
 			sampled.push((assistant.ordinal, assistant.allocation));
-			natural.push((
-				assistant.ordinal,
-				flowed_height(assistant.visible_text(emitted), content_width.max(1)).max(1),
-			));
+			natural.push((assistant.ordinal, assistant.height()));
 		}
 		for tool in &mut self.live_tools {
 			if tool.card_ui.frame().size().width != content_width {
@@ -3043,9 +2962,9 @@ impl Chat {
 				},
 			));
 		}
-		// Merged allocation across settled snapshots and live cards: within
-		// capacity everything renders whole; pressure gives newest blocks the
-		// available rows, reserving one summary row when some must be hidden.
+		// Merged allocation across settled snapshots and live cards. Every
+		// represented block gets one row first; surplus favors transcript text
+		// before tool cards, newest-first within each class.
 		let mut merged = SmallVec::<(BlockOrdinal, u16, bool), 16>::new();
 		for (ordinal, height) in &settled {
 			merged.push((*ordinal, *height, true));
@@ -3056,13 +2975,23 @@ impl Chat {
 			}
 		}
 		merged.sort_unstable_by_key(|(ordinal, ..)| *ordinal);
+		let tool_flags = merged
+			.iter()
+			.map(|(ordinal, _, is_settled)| {
+				if *is_settled {
+					matches!(self.entries.get(ordinal), Some(Entry::Tool(_)))
+				} else {
+					self.live_tools.iter().any(|tool| tool.ordinal == *ordinal)
+				}
+			})
+			.collect::<SmallVec<bool, 16>>();
 		let layout_overflow = merged.len() > usize::from(h_live);
 		let summary_rows = u16::from(layout_overflow && h_live > 0);
 		let mut allocs = SmallVec::<u16, 16>::new();
-		let wanted_total: u32 = merged
+		let wanted_total = merged
 			.iter()
 			.map(|(_, desired, _)| u32::from(*desired))
-			.sum();
+			.sum::<u32>();
 		if wanted_total <= u32::from(h_live) {
 			allocs.extend(merged.iter().map(|(_, desired, _)| *desired));
 		} else {
@@ -3075,16 +3004,64 @@ impl Chat {
 				*alloc = 1;
 				budget -= 1;
 			}
-			for (alloc, (_, desired, _)) in allocs.iter_mut().rev().zip(merged.iter().rev()) {
+			let mut surplus_order = SmallVec::<usize, 16>::new();
+			for index in (0..merged.len()).rev() {
+				if !tool_flags[index] {
+					surplus_order.push(index);
+				}
+			}
+			for index in (0..merged.len()).rev() {
+				if tool_flags[index] {
+					surplus_order.push(index);
+				}
+			}
+			for index in surplus_order {
 				if budget == 0 {
 					break;
 				}
+				let alloc = &mut allocs[index];
 				if *alloc == 0 {
 					continue;
 				}
-				let grant = desired.saturating_sub(*alloc).min(budget);
+				let grant = merged[index].1.saturating_sub(*alloc).min(budget);
 				*alloc += grant;
 				budget -= grant;
+			}
+		}
+
+		// An active head can pin later settled answers outside native-history
+		// retirement. Keep the latest assistant prose represented by stealing
+		// one row from the visible tail; thinking entries are a separate variant
+		// and never qualify.
+		let emergency_index =
+			(wanted_total > u32::from(h_live) && self.blocks.retirement_batch().is_none())
+				.then(|| {
+					merged.iter().enumerate().rev().find_map(
+						|(index, (ordinal, desired, is_settled))| {
+							(*is_settled
+								&& allocs[index] < *desired
+								&& matches!(
+									self.entries.get(ordinal),
+									Some(Entry::Assistant(assistant)) if !assistant.body.text.trim().is_empty()
+								))
+							.then_some(index)
+						},
+					)
+				})
+				.flatten();
+		let mut emergency_ordinal = None;
+		if let Some(index) = emergency_index {
+			if allocs[index] > 0 {
+				emergency_ordinal = Some(merged[index].0);
+			} else {
+				let donor = (index + 1..merged.len())
+					.find(|candidate| tool_flags[*candidate] && allocs[*candidate] > 0)
+					.or_else(|| (index + 1..merged.len()).find(|candidate| allocs[*candidate] > 0));
+				if let Some(donor) = donor {
+					allocs[donor] -= 1;
+					allocs[index] = 1;
+					emergency_ordinal = Some(merged[index].0);
+				}
 			}
 		}
 		let settled_rows: u32 = merged
@@ -3211,17 +3188,16 @@ impl Chat {
 			if allocation == 0 {
 				continue;
 			}
-			if *is_settled {
+			if *is_settled && emergency_ordinal == Some(*ordinal) {
+				self.draw_settled_assistant_emergency(*ordinal, y, content_width);
+			} else if *is_settled {
 				self.draw_settled_clipped(*ordinal, y, allocation, *desired, content_width);
 			} else if self
 				.live_assistant
 				.as_ref()
 				.is_some_and(|assistant| assistant.ordinal == *ordinal)
 			{
-				let emitted = projected_emission
-					.filter(|(projected, _)| projected == ordinal)
-					.map_or_else(|| self.blocks.emitted(*ordinal).unwrap_or(0), |(_, emitted)| emitted);
-				self.draw_live_assistant_clipped(*ordinal, y, allocation, content_width, emitted);
+				self.draw_live_assistant_clipped(*ordinal, y, allocation, content_width);
 			} else {
 				self.live_layout.push((*ordinal, y, allocation));
 				self.draw_live_tool_clipped(*ordinal, y, allocation, content_width);
@@ -3385,8 +3361,7 @@ impl Chat {
 		let live_end = self.blocks.frontier() + self.blocks.live_count();
 		let eligible = self.blocks.retirement_batch();
 
-		// Measure the complete uncommitted demand after subtracting any stable
-		// append-only prefix that has already escaped.
+		// Measure the complete uncommitted demand.
 		let mut prefix = SmallVec::<u32, 8>::new();
 		let mut total = 0_u32;
 		for ordinal in self.blocks.frontier()..live_end {
@@ -3411,8 +3386,7 @@ impl Chat {
 			.as_ref()
 			.filter(|assistant| !(self.hide_thinking && assistant.thinking))
 		{
-			let emitted = self.blocks.emitted(assistant.ordinal).unwrap_or(0);
-			let wanted = flowed_height(assistant.visible_text(emitted), content_width.max(1)).max(1);
+			let wanted = assistant.height();
 			total = total.saturating_add(u32::from(assistant.allocation.max(wanted)));
 		}
 		for tool in &self.live_tools {
@@ -3427,30 +3401,7 @@ impl Chat {
 		let live_count = self.blocks.live_count();
 		let row_pressure = total > u32::from(h_live);
 		let pressured = row_pressure || live_count >= MAX_LIVE_BLOCKS;
-		if policy == RetirementPolicy::Pressure
-			&& row_pressure
-			&& let Some(batch) = self.render_next_stable_head(viewport.width.max(1))
-		{
-			return Some(batch);
-		}
-
 		let eligible = eligible?;
-		// A finalized head whose complete value escaped advances logically
-		// without issuing a terminal write.
-		if prefix.first().copied() == Some(0)
-			&& self.blocks.mode(BlockOrdinal(eligible.start)) == Some(BlockMode::AppendOnly)
-			&& self
-				.blocks
-				.emitted(BlockOrdinal(eligible.start))
-				.unwrap_or(0)
-				> 0
-		{
-			return Some(self.render_retirement_batch(
-				eligible.start..eligible.start + 1,
-				viewport.width.max(1),
-				RetirementKind::Commit,
-			));
-		}
 		if policy == RetirementPolicy::Pressure && !pressured {
 			return None;
 		}
@@ -3480,67 +3431,6 @@ impl Chat {
 		))
 	}
 
-	fn render_next_stable_head(&mut self, width: u16) -> Option<RetirementBatch> {
-		let ordinal = BlockOrdinal(self.blocks.frontier());
-		if !self.hide_thinking
-			&& let Some(Entry::Thinking(thinking)) = self.entries.get_mut(&ordinal)
-		{
-			thinking.body.resize(width.max(1), &self.ctx);
-			let (head, emitted) = self.blocks.stable_head(1)?;
-			let height = Self::replay_entry_height(
-				self
-					.entries
-					.get(&ordinal)
-					.expect("thinking head remains present"),
-				width,
-			);
-			let mut frame = Frame::new(Size::new(width, height));
-			frame.fill(Rect::new(0, 0, width, height), base_style(self.ctx.theme));
-			Self::draw_replay_entry(
-				&mut frame,
-				self
-					.entries
-					.get(&ordinal)
-					.expect("thinking head remains present"),
-				0,
-				width,
-				&self.ctx,
-			);
-			return Some(RetirementBatch {
-				range: head.0..head.0,
-				frame,
-				replay_frames: None,
-				kind: RetirementKind::Append { ordinal: head, emitted: emitted + 1 },
-			});
-		}
-		let (text, rows) = if let Some(assistant) = self
-			.live_assistant
-			.as_ref()
-			.filter(|assistant| assistant.ordinal == ordinal)
-		{
-			(assistant.text.as_str(), assistant.stable_rows())
-		} else if let Some(Entry::Assistant(assistant)) = self.entries.get(&ordinal) {
-			(assistant.body.text.as_str(), stable_assistant_rows(&assistant.body.text))
-		} else {
-			return None;
-		};
-		let stable_count = u64::try_from(rows.len()).unwrap_or(u64::MAX);
-		let (head, emitted) = self.blocks.stable_head(stable_count)?;
-		let row = rows.get(usize::try_from(emitted).ok()?)?;
-		let source = text.get(row.clone())?.to_owned();
-		let body = RichText::new(source, width, &self.ctx);
-		let height = body.height().saturating_add(1);
-		let mut frame = Frame::new(Size::new(width, height));
-		frame.fill(Rect::new(0, 0, width, height), base_style(self.ctx.theme));
-		draw_rich(&mut frame, 0, &body, 0, width, self.ctx.theme);
-		Some(RetirementBatch {
-			range: head.0..head.0,
-			frame,
-			replay_frames: None,
-			kind: RetirementKind::Append { ordinal: head, emitted: emitted + 1 },
-		})
-	}
-
 	fn render_replay_batch(&mut self, replay: Replay, width: u16) -> RetirementBatch {
 		let mut frames = Vec::new();
 		for ordinal in 0..replay.end {
@@ -3559,56 +3449,6 @@ impl Chat {
 			frame.fill(Rect::new(0, 0, width, height), base_style(self.ctx.theme));
 			Self::draw_replay_entry(&mut frame, entry, 0, width, &self.ctx);
 			frames.push(frame);
-		}
-		if let Some((ordinal, emitted)) = replay.partial {
-			if !self.hide_thinking
-				&& let Some(Entry::Thinking(thinking)) = self.entries.get_mut(&ordinal)
-			{
-				thinking.body.resize(width.max(1), &self.ctx);
-				let height = Self::replay_entry_height(
-					self
-						.entries
-						.get(&ordinal)
-						.expect("thinking head remains present"),
-					width,
-				);
-				let mut frame = Frame::new(Size::new(width, height));
-				frame.fill(Rect::new(0, 0, width, height), base_style(self.ctx.theme));
-				Self::draw_replay_entry(
-					&mut frame,
-					self
-						.entries
-						.get(&ordinal)
-						.expect("thinking head remains present"),
-					0,
-					width,
-					&self.ctx,
-				);
-				frames.push(frame);
-			} else {
-				let text = if let Some(assistant) = self
-					.live_assistant
-					.as_ref()
-					.filter(|assistant| assistant.ordinal == ordinal)
-				{
-					Some(assistant.text.as_str())
-				} else if let Some(Entry::Assistant(assistant)) = self.entries.get(&ordinal) {
-					Some(assistant.body.text.as_str())
-				} else {
-					None
-				};
-				if let Some(text) = text {
-					let count = usize::try_from(emitted).unwrap_or(usize::MAX);
-					for row in stable_assistant_rows(text).into_iter().take(count) {
-						let body = RichText::new(&text[row], width, &self.ctx);
-						let height = body.height().saturating_add(1);
-						let mut frame = Frame::new(Size::new(width, height));
-						frame.fill(Rect::new(0, 0, width, height), base_style(self.ctx.theme));
-						draw_rich(&mut frame, 0, &body, 0, width, self.ctx.theme);
-						frames.push(frame);
-					}
-				}
-			}
 		}
 		RetirementBatch {
 			range:         0..replay.end,
@@ -3660,52 +3500,29 @@ impl Chat {
 	}
 
 	/// Starts one complete replay snapshot with `mode` without changing block
-	/// phases or the logical commit frontier. The snapshot includes the emitted
-	/// prefix of an active append-only head.
-	pub fn begin_replay(&mut self, mode: HistoryReplay) {
+	/// phases or the logical commit frontier.
+	pub fn begin_history_replay(&mut self, mode: HistoryReplay) {
 		let end = self.blocks.frontier();
-		let ordinal = BlockOrdinal(end);
-		let emitted = self.blocks.emitted(ordinal).unwrap_or(0);
-		let partial = (emitted > 0).then_some((ordinal, emitted));
-		self.replay = (end > 0 || partial.is_some() || mode == HistoryReplay::Rebuild)
-			.then_some(Replay { end, partial, mode });
+		self.replay = (end > 0 || mode == HistoryReplay::Rebuild).then_some(Replay { end, mode });
 		self.bump_live();
 	}
 
-	/// Acknowledges one successful commit, natural append, or replay
-	/// transaction.
+	/// Cancels an unoffered replay so shutdown flushes only unretired rows.
+	pub fn begin_history_flush(&mut self) {
+		self.replay = None;
+		self.bump_live();
+	}
+
+	/// Acknowledges one successful commit or replay transaction.
 	pub fn mark_retired(&mut self, batch: &RetirementBatch) {
 		match batch.kind {
-			RetirementKind::Commit => {
-				self.blocks.mark_committed(batch.range.end);
-				for ordinal in batch.range.clone() {
-					if let Some(Entry::Assistant(assistant)) =
-						self.entries.get_mut(&BlockOrdinal(ordinal))
-					{
-						assistant.visible = None;
-						assistant.visible_from = 0;
-					}
-				}
-			},
-			RetirementKind::Append { ordinal, emitted } => {
-				assert!(
-					self.blocks.mark_emitted(ordinal, emitted),
-					"stable append acknowledgement must be exactly next at the head"
-				);
-				match self.entries.get_mut(&ordinal) {
-					Some(Entry::Assistant(assistant)) => {
-						assistant.set_emitted(emitted, self.layout_width.max(1), &self.ctx);
-					},
-					Some(Entry::Thinking(thinking)) => thinking.visible = false,
-					_ => {},
-				}
-			},
+			RetirementKind::Commit => self.blocks.mark_committed(batch.range.end),
 			RetirementKind::Replay(_) => self.replay = None,
 		}
 	}
 
 	fn enqueue_final(&mut self, entry: Entry) -> BlockOrdinal {
-		let ordinal = self.blocks.create(BlockMode::Mutable);
+		let ordinal = self.blocks.create();
 		self.entries.insert(ordinal, entry);
 		self.blocks.finalize(ordinal);
 		ordinal
@@ -3717,31 +3534,37 @@ impl Chat {
 		y: u16,
 		height: u16,
 		width: u16,
-		emitted: u64,
 	) {
 		let Some(message) = self
 			.live_assistant
-			.as_ref()
+			.as_mut()
 			.filter(|message| message.ordinal == ordinal)
 		else {
 			return;
 		};
-		let visible = message.visible_text(emitted);
-		let natural = flowed_height(visible, width.max(1)).max(1);
-		let scratch_size = Size::new(width, natural);
-		if self.clip_scratch.size() != scratch_size {
-			self.clip_scratch = Frame::new(scratch_size);
+		message.resize(width);
+		let natural = message.height();
+		self
+			.frame
+			.blit(message.view.frame(), natural.saturating_sub(height), height, 0, y);
+	}
+
+	/// Draws the first prose row of a settled assistant under emergency
+	/// pressure, never a thinking marker or the assistant's clipped tail.
+	fn draw_settled_assistant_emergency(&mut self, ordinal: BlockOrdinal, y: u16, width: u16) {
+		let Some(Entry::Assistant(assistant)) = self.entries.get(&ordinal) else {
+			return;
+		};
+		let natural = assistant.body.height().saturating_add(1).max(1);
+		let size = Size::new(width, natural);
+		if self.clip_scratch.size() != size {
+			self.clip_scratch = Frame::new(size);
 		}
 		self
 			.clip_scratch
 			.fill(Rect::new(0, 0, width, natural), base_style(self.ctx.theme));
-		draw_flowed(&mut self.clip_scratch, Rect::new(0, 0, width, natural), &[Span::new(
-			visible,
-			prose_style(self.ctx.theme),
-		)]);
-		self
-			.frame
-			.blit(&self.clip_scratch, natural.saturating_sub(height), height, 0, y);
+		draw_rich(&mut self.clip_scratch, 0, &assistant.body, 0, width, self.ctx.theme);
+		self.frame.blit(&self.clip_scratch, 0, 1, 0, y);
 	}
 
 	fn draw_live_tool_clipped(&mut self, ordinal: BlockOrdinal, y: u16, height: u16, _width: u16) {
@@ -3827,12 +3650,7 @@ impl Chat {
 		let message_width = Self::message_width(width);
 		match entry {
 			Entry::User(user) => user.body.resize(message_width, ctx),
-			Entry::Assistant(assistant) => {
-				assistant.body.resize(width.max(1), ctx);
-				if let Some(visible) = assistant.visible.as_mut() {
-					visible.resize(width.max(1), ctx);
-				}
-			},
+			Entry::Assistant(assistant) => assistant.body.resize(width.max(1), ctx),
 			Entry::Thinking(thinking) => thinking.body.resize(width.max(1), ctx),
 			Entry::Peer { .. } => {},
 			Entry::Tool(tool) => tool.view.resize(Self::tool_view_width(width), ctx),
@@ -3855,11 +3673,10 @@ impl Chat {
 				}
 			},
 			Entry::Assistant(assistant) => {
-				let body = assistant.visible();
-				if body.text.trim().is_empty() {
+				if assistant.body.text.trim().is_empty() {
 					0
 				} else {
-					body.height().saturating_add(1)
+					assistant.body.height().saturating_add(1)
 				}
 			},
 			Entry::Thinking(thinking) => {
@@ -3962,11 +3779,10 @@ impl Chat {
 				}
 			},
 			Entry::Assistant(assistant) => {
-				let body = assistant.visible();
-				if body.text.trim().is_empty() {
+				if assistant.body.text.trim().is_empty() {
 					0
 				} else {
-					draw_rich(frame, y, body, 0, width, ctx.theme).saturating_add(1)
+					draw_rich(frame, y, &assistant.body, 0, width, ctx.theme).saturating_add(1)
 				}
 			},
 			Entry::Thinking(thinking) => {
@@ -4210,7 +4026,11 @@ fn draw_tool(frame: &mut Frame, y: u16, width: u16, tool: &ToolEntry, ctx: &UiCo
 	let margin = u16::from(width >= 50);
 	let height = tool_height(tool, width);
 	let rect = Rect::new(margin, y, width.saturating_sub(margin * 2), height);
-	let state = if tool.ok { ctx.theme.ok } else { ctx.theme.err };
+	let state = match tool.ok {
+		Some(true) => ctx.theme.ok,
+		Some(false) => ctx.theme.err,
+		None => ctx.theme.warn,
+	};
 	draw_box(frame, rect, ink(state), panel_style(ctx.theme), ctx.charset, ctx.native_decor);
 	draw_line(frame, rect.x.saturating_add(1), y, rect.width.saturating_sub(2), &[Span::new(
 		&tool.label,
@@ -4636,6 +4456,18 @@ mod tests {
 	}
 
 	#[test]
+	fn streaming_assistant_uses_partial_markdown_view() {
+		let mut chat = Chat::new(&ctx());
+		chat.begin_assistant("assistant");
+		chat.append_assistant("assistant", "**streaming** tail");
+		let viewport = Size::new(40, 8);
+		settle(&mut chat, viewport);
+		let text = frame_text(chat.render_at(viewport, Duration::from_millis(500)).frame);
+		assert!(text.contains("streaming tail"), "{text}");
+		assert!(!text.contains("**"), "{text}");
+	}
+
+	#[test]
 	fn next_assistant_begin_finalizes_orphan_without_transcript_content() {
 		let mut chat = Chat::new(&ctx());
 		chat.begin_assistant("orphan");
@@ -4653,6 +4485,23 @@ mod tests {
 				.map(|message| message.id.as_str()),
 			Some("retry")
 		);
+	}
+
+	#[test]
+	fn next_assistant_begin_seals_orphaned_tool_card() {
+		let mut chat = Chat::new(&ctx());
+		chat.tool_started("orphan", "bash", "1", "unfinished command");
+		chat.tool_output("orphan", "partial output");
+		settle(&mut chat, Size::new(40, 12));
+
+		chat.begin_assistant("next-turn");
+
+		assert!(chat.live_tools.is_empty());
+		assert_eq!(chat.blocks.phase(BlockOrdinal(0)), Some(BlockPhase::FinalizedPending));
+		assert!(matches!(
+			chat.entries.get(&BlockOrdinal(0)),
+			Some(Entry::Tool(ToolEntry { ok: None, .. }))
+		));
 	}
 
 	#[test]
@@ -4693,7 +4542,7 @@ mod tests {
 		let committed = frame_text(&batch.frame);
 		chat.mark_retired(&batch);
 
-		chat.begin_replay(HistoryReplay::Append);
+		chat.begin_history_replay(HistoryReplay::Append);
 		let replay = chat
 			.retirement_batch(viewport)
 			.expect("committed rows replay");
@@ -4876,6 +4725,26 @@ mod tests {
 	}
 
 	#[test]
+	fn history_flush_cancels_destructive_replay_and_emits_only_unretired_rows() {
+		let mut chat = Chat::new(&ctx());
+		chat.push_notice("already committed");
+		let drained = Size::new(40, 0);
+		let committed = chat.retirement_batch(drained).expect("initial retire");
+		chat.mark_retired(&committed);
+		chat.push_notice("unretired tail");
+		chat.begin_history_replay(HistoryReplay::Rebuild);
+
+		chat.begin_history_flush();
+		let flush = chat
+			.flush_retirement_batch(drained)
+			.expect("unretired tail flushes");
+		assert!(flush.replay_plan().is_none());
+		let text = frame_text(&flush.frame);
+		assert!(text.contains("unretired tail"), "{text}");
+		assert!(!text.contains("already committed"), "{text}");
+	}
+
+	#[test]
 	fn replay_reoffers_committed_rows_without_rewinding_the_frontier() {
 		let mut chat = Chat::new(&ctx());
 		chat.push_notice("replayed row");
@@ -4885,7 +4754,7 @@ mod tests {
 		let frontier = chat.blocks.frontier();
 		assert!(chat.retirement_batch(drained).is_none());
 
-		chat.begin_replay(HistoryReplay::Append);
+		chat.begin_history_replay(HistoryReplay::Append);
 		assert_eq!(chat.blocks.frontier(), frontier);
 		let replay = chat.retirement_batch(drained).expect("replay retire");
 		assert_eq!(replay.range, 0..frontier);
@@ -4904,7 +4773,7 @@ mod tests {
 		chat.mark_retired(&batch);
 
 		chat.clear_history();
-		chat.begin_replay(HistoryReplay::Append);
+		chat.begin_history_replay(HistoryReplay::Append);
 		let replay = chat
 			.retirement_batch(drained)
 			.expect("committed row replays");
@@ -4923,6 +4792,43 @@ mod tests {
 			.retirement_batch(Size::new(40, u16::MAX))
 			.expect("memory pressure retires");
 		assert_eq!(batch.range.start, 0);
+	}
+
+	#[test]
+	fn emergency_row_keeps_latest_settled_assistant_prose_visible() {
+		let mut chat = Chat::new(&ctx());
+		chat.begin_assistant("active-prefix");
+		chat.append_assistant("active-prefix", "stale active prefix");
+		let answer = AssistantEntry::new("Implemented answer".to_owned(), 40, &chat.ctx);
+		chat.enqueue_final(Entry::Assistant(answer));
+		chat.tool_started("tool", "read", "1", "task running");
+		settle(&mut chat, Size::new(40, 16));
+
+		let tight = Size::new(40, 7);
+		assert!(
+			chat.retirement_batch(tight).is_none(),
+			"active prefix must block ordered retirement"
+		);
+		let text = frame_text(chat.render_at(tight, Duration::from_millis(900)).frame);
+		assert!(text.contains("Implemented answer"), "{text}");
+		assert!(!text.contains("thinking ·"), "{text}");
+	}
+
+	#[test]
+	fn transcript_text_receives_surplus_before_live_tool_cards() {
+		let mut chat = Chat::new(&ctx());
+		chat.push_notice("Answer one\nAnswer two\nAnswer three\nAnswer four");
+		chat.tool_started("tool", "bash", "1", "long activity");
+		chat.tool_output("tool", "one\ntwo\nthree\nfour\nfive");
+		settle(&mut chat, Size::new(40, 18));
+		let tight = (6..18)
+			.map(|height| Size::new(40, height))
+			.find(|viewport| chat.chrome_layout(*viewport, Duration::from_secs(1)).h_live == 6)
+			.expect("fixture can create a six-row transcript viewport");
+
+		let text = frame_text(chat.render_at(tight, Duration::from_secs(1)).frame);
+		assert!(text.contains("Answer one"), "{text}");
+		assert_eq!(chat.live_tools[0].target_height, 1);
 	}
 
 	#[test]
@@ -4997,123 +4903,41 @@ mod tests {
 	}
 
 	#[test]
-	fn stable_assistant_prefix_excludes_open_markdown_and_partial_tail() {
-		let rows = stable_assistant_rows("settled paragraph\n\n```rust\nopen\npartial");
-		assert_eq!(rows.as_slice(), &[0.."settled paragraph\n\n".len()]);
-
-		let closed = stable_assistant_rows("settled\n\n```rust\nbody\n```\npartial");
-		assert_eq!(closed.len(), 2);
-		assert_eq!(
-			&"settled\n\n```rust\nbody\n```\npartial"[closed[1].clone()],
-			"```rust\nbody\n```\n"
-		);
-	}
-
-	#[test]
-	fn assistant_and_thinking_declare_append_only_while_tools_remain_mutable() {
+	fn streaming_assistant_stays_viewport_owned_until_finalization() {
 		let mut chat = Chat::new(&ctx());
 		chat.begin_assistant("assistant");
-		assert_eq!(chat.blocks.mode(BlockOrdinal(0)), Some(BlockMode::AppendOnly));
-		chat.append_assistant("assistant", "*Thinking:* private");
-		assert_eq!(chat.blocks.mode(BlockOrdinal(0)), Some(BlockMode::AppendOnly));
+		chat.append_assistant("assistant", "completed paragraph\n\nmutable tail");
+		let viewport = Size::new(40, 0);
+
+		assert!(
+			chat.retirement_batch(viewport).is_none(),
+			"active assistant content must never enter native history"
+		);
+		chat.append_assistant("assistant", "\nrevised suffix");
 		chat.end_assistant("assistant");
-		chat.tool_started("tool", "read", "1", "mutable tool");
-		assert_eq!(chat.blocks.mode(BlockOrdinal(1)), Some(BlockMode::Mutable));
+
+		let batch = chat
+			.flush_retirement_batch(viewport)
+			.expect("finalized assistant retires as one immutable value");
+		let text = frame_text(&batch.frame);
+		assert!(text.contains("completed paragraph"), "{text}");
+		assert!(text.contains("revised suffix"), "{text}");
 	}
 
 	#[test]
-	fn finalized_thinking_exposes_its_exact_collapsed_stable_rows() {
+	fn finalized_thinking_retires_only_after_finalization() {
 		let mut chat = Chat::new(&ctx());
 		chat.begin_assistant("thinking");
 		chat.append_assistant("thinking", "*Thinking:* private reasoning");
+		assert!(chat.retirement_batch(Size::new(40, 0)).is_none());
 		chat.end_assistant("thinking");
 
-		let append = chat
-			.retirement_batch(Size::new(40, 0))
-			.expect("final thinking rows are stable under pressure");
-		assert!(matches!(append.kind, RetirementKind::Append { emitted: 1, .. }));
-		let emitted = frame_text(&append.frame);
-		assert!(emitted.contains("thinking ·"), "{emitted}");
-		assert!(!emitted.contains("private reasoning"), "{emitted}");
-		chat.mark_retired(&append);
-
-		chat.begin_replay(HistoryReplay::Append);
-		let replay = chat
-			.retirement_batch(Size::new(40, 0))
-			.expect("emitted thinking prefix replays");
-		assert_eq!(batch_text(&replay), emitted);
-		chat.mark_retired(&replay);
-
-		let completion = chat
-			.retirement_batch(Size::new(40, 20))
-			.expect("fully emitted thinking completes logically");
-		assert_eq!(completion.frame.size().height, 0);
-	}
-
-	#[test]
-	fn natural_append_retires_only_stable_head_and_finalization_writes_suffix() {
-		let mut chat = Chat::new(&ctx());
-		chat.begin_assistant("assistant");
-		chat.append_assistant("assistant", "stable paragraph\n\nmutable tail");
-		let _ = chat.render(Size::new(40, 10));
-
-		let append = chat
-			.retirement_batch(Size::new(40, 0))
-			.expect("row pressure emits stable head");
-		assert!(matches!(append.kind, RetirementKind::Append { emitted: 1, .. }));
-		assert!(frame_text(&append.frame).contains("stable paragraph"));
-		assert!(!frame_text(&append.frame).contains("mutable tail"));
-		chat.mark_retired(&append);
-		assert_eq!(chat.blocks.emitted(BlockOrdinal(0)), Some(1));
-
-		chat.end_assistant("assistant");
-		let suffix = chat
+		let batch = chat
 			.flush_retirement_batch(Size::new(40, 0))
-			.expect("final retirement writes remaining suffix");
-		let text = frame_text(&suffix.frame);
-		assert!(!text.contains("stable paragraph"), "{text}");
-		assert!(text.contains("mutable tail"), "{text}");
-	}
-
-	#[test]
-	fn fully_emitted_finalized_head_completes_without_physical_rows() {
-		let mut chat = Chat::new(&ctx());
-		chat.begin_assistant("assistant");
-		chat.append_assistant("assistant", "complete paragraph\n\n");
-		let _ = chat.render(Size::new(40, 10));
-		let append = chat
-			.retirement_batch(Size::new(40, 0))
-			.expect("stable head emits");
-		chat.mark_retired(&append);
-		chat.end_assistant("assistant");
-
-		let completion = chat
-			.retirement_batch(Size::new(40, 20))
-			.expect("logical zero-write completion");
-		assert_eq!(completion.frame.size().height, 0);
-		chat.mark_retired(&completion);
-		assert_eq!(chat.blocks.frontier(), 1);
-	}
-
-	#[test]
-	fn replay_includes_emitted_prefix_of_active_head() {
-		let mut chat = Chat::new(&ctx());
-		chat.begin_assistant("assistant");
-		chat.append_assistant("assistant", "escaped paragraph\n\nmutable tail");
-		let _ = chat.render(Size::new(40, 10));
-		let append = chat
-			.retirement_batch(Size::new(40, 0))
-			.expect("stable head emits");
-		chat.mark_retired(&append);
-
-		chat.begin_replay(HistoryReplay::Append);
-		let replay = chat
-			.retirement_batch(Size::new(40, 0))
-			.expect("partial head replay");
-		let text = batch_text(&replay);
-		assert!(text.contains("escaped paragraph"), "{text}");
-		assert!(!text.contains("mutable tail"), "{text}");
-		assert_eq!(chat.blocks.frontier(), 0);
+			.expect("final thinking snapshot retires");
+		let text = frame_text(&batch.frame);
+		assert!(text.contains("thinking ·"), "{text}");
+		assert!(!text.contains("private reasoning"), "{text}");
 	}
 
 	#[test]
@@ -5163,5 +4987,26 @@ mod tests {
 			.accumulate(true, 8);
 		assert_eq!(rails, RailWidths { left: 20, right: 30 });
 		assert_eq!(rails.content_width(80), 30);
+	}
+	#[test]
+	fn error_transcript_frame_pins_status_without_a_duplicate_entry() {
+		let mut chat = Chat::new(&ctx());
+		let before = chat.entries.len();
+		chat.push_transcript_frame(TranscriptFrame {
+			kind:   TranscriptFrameKind::Error,
+			title:  Str::new_static("Agent error"),
+			detail: Some(Str::new_static("terminal turn error (Auth)")),
+		});
+		assert_eq!(chat.entries.len(), before, "error frames must not append a notice entry");
+		assert_eq!(
+			chat.pinned_error.as_deref(),
+			Some("error · Agent error — terminal turn error (Auth)")
+		);
+		chat.push_transcript_frame(TranscriptFrame {
+			kind:   TranscriptFrameKind::Recovery,
+			title:  Str::new_static("Recovered on attempt 2"),
+			detail: None,
+		});
+		assert!(chat.pinned_error.is_none(), "recovery clears the pinned failure");
 	}
 }

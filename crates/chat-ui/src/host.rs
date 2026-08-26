@@ -1317,7 +1317,8 @@ async fn run_chat(
 													intents,
 													exit_on_session_change,
 												) {
-													return Ok(host_outcome(&host, exit));
+													requested_exit = exit;
+													break;
 												}
 												if host.overlay.is_none() {
 													close_overlay(terminal, renderer, &mut host, viewport, &mut resize)?;
@@ -1451,7 +1452,8 @@ async fn run_chat(
 													intents,
 													exit_on_session_change,
 												) {
-													return Ok(host_outcome(&host, exit));
+													requested_exit = exit;
+													break;
 												}
 												if host.overlay.is_none() {
 													close_overlay(terminal, renderer, &mut host, viewport, &mut resize)?;
@@ -1472,7 +1474,8 @@ async fn run_chat(
 													intents,
 													exit_on_session_change,
 												) {
-													return Ok(host_outcome(&host, exit));
+													requested_exit = exit;
+													break;
 												}
 												if host.overlay.is_none() {
 													close_overlay(terminal, renderer, &mut host, viewport, &mut resize)?;
@@ -1506,7 +1509,8 @@ async fn run_chat(
 							},
 							backend = events.recv_async() => match backend {
 								Ok(BackendEvent::NewSessionRequested) if exit_on_session_change => {
-									return Ok(host_outcome(&host, HostExit::NewSession));
+									requested_exit = HostExit::NewSession;
+									break;
 								},
 								Ok(event) => {
 									match &event {
@@ -1631,9 +1635,16 @@ async fn run_chat(
 	if host.overlay.take().is_some() {
 		close_overlay(terminal, renderer, &mut host, viewport, &mut resize)?;
 	}
-	start_pending_replay(renderer, &mut host, &mut pending_replay)?;
-	if requested_exit == HostExit::Quit {
-		host.chat.cancel_active("Host closed");
+	if requested_exit == HostExit::Suspend {
+		start_pending_replay(renderer, &mut host, &mut pending_replay)?;
+	} else {
+		// A latched rebuild replay would destructively clear native history
+		// during teardown. Discard it and flush only genuinely unretired rows.
+		let _ = pending_replay.take();
+		host.chat.begin_history_flush();
+		if requested_exit == HostExit::Quit {
+			host.chat.cancel_active("Host closed");
+		}
 		loop {
 			match paint_host(renderer, &mut host, viewport, Retirement::Flush)? {
 				PaintKind::Retired | PaintKind::Deferred => {},
@@ -2252,7 +2263,7 @@ fn start_pending_replay<W: Write>(
 		ResizeScrollback::Rebuild => HistoryReplay::Rebuild,
 		ResizeScrollback::Preserve => return Ok(()),
 	};
-	host.chat.begin_replay(mode);
+	host.chat.begin_history_replay(mode);
 	Ok(())
 }
 
@@ -2296,16 +2307,22 @@ fn paint_host<W: Write>(
 			PaintKind::Presented
 		});
 	};
-	if let Some((mode, frames)) = batch.replay_plan() {
+	let replayed = if let Some((mode, frames)) = batch.replay_plan() {
 		renderer.replay_frames(frames, rendered.frame, viewport.height, &layers, mode)?;
+		true
 	} else if batch.frame.size().height == 0 {
 		host.chat.mark_retired(&batch);
 		return Ok(PaintKind::Retired);
 	} else {
 		renderer.retire(&batch.frame, rendered.frame, viewport.height, &layers)?;
-	}
+		false
+	};
 	host.chat.mark_retired(&batch);
-	Ok(PaintKind::Retired)
+	Ok(if replayed {
+		PaintKind::Presented
+	} else {
+		PaintKind::Retired
+	})
 }
 
 fn open_overlay(
@@ -2493,6 +2510,24 @@ mod tests {
 	}
 
 	#[test]
+	fn startup_and_resumed_rows_do_not_issue_a_second_scrollback_clear() {
+		let viewport = Size::new(40, 8);
+		let ctx = UiContext::default();
+		let mut chat = Chat::new(&ctx);
+		chat.push_notice("resumed transcript row");
+		let mut host = ChatHost::new(chat, &ctx, viewport, Vec::new(), 0, false);
+		let mut renderer = Renderer::new(Vec::new());
+
+		paint_host(&mut renderer, &mut host, viewport, Retirement::Disabled).unwrap();
+		while matches!(
+			paint_host(&mut renderer, &mut host, viewport, Retirement::Flush).unwrap(),
+			PaintKind::Retired | PaintKind::Deferred
+		) {}
+		let output = String::from_utf8(renderer.into_inner()).unwrap();
+		assert!(!output.contains("\x1b[3J"), "{output:?}");
+	}
+
+	#[test]
 	fn present_only_tick_leaves_finalized_blocks_pending() {
 		let viewport = Size::new(40, 8);
 		let ctx = UiContext::default();
@@ -2567,7 +2602,7 @@ mod tests {
 	}
 
 	#[test]
-	fn replay_request_survives_an_overlay() {
+	fn replay_request_survives_an_overlay_without_requesting_another_pump() {
 		let viewport = Size::new(40, 20);
 		let ctx = UiContext::default();
 		let mut chat = Chat::new(&ctx);
@@ -2586,7 +2621,7 @@ mod tests {
 		assert_eq!(pending, None);
 		assert_eq!(
 			paint_host(&mut renderer, &mut host, viewport, Retirement::Pressure).unwrap(),
-			PaintKind::Retired
+			PaintKind::Presented
 		);
 	}
 

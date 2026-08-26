@@ -96,3 +96,28 @@ impl SelectionOverlay {
 		}
 	}
 }
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn digit_picks_numbered_label_after_unnumbered_row() {
+		let rows = vec![
+			ListRow {
+				key:    "detected".into(),
+				label:  "Detected item".into(),
+				detail: Str::default(),
+			},
+			ListRow { key: "first".into(), label: "1. First".into(), detail: Str::default() },
+			ListRow { key: "second".into(), label: "2. Second".into(), detail: Str::default() },
+		];
+		let mut overlay =
+			SelectionOverlay::open("Pick one", SelectionPurpose::Hook, rows, &UiContext::default());
+
+		assert_eq!(overlay.handle_key(Key::Char('2')), SelectionEvent::Pick {
+			purpose: SelectionPurpose::Hook,
+			key:     "second".into(),
+		});
+	}
+}

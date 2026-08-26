@@ -20,12 +20,21 @@ pub(super) const AMEND_ID: &str = "git-amend";
 pub(super) const COMMIT_ID: &str = "git-commit";
 pub(super) const VIEW_STYLE_ID: &str = "git-sidebar-view";
 
+/// Visual partition within one staged, unstaged, or commit file section.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SidebarGroup {
+	/// Modified, deleted, renamed, and conflicted tracked paths.
+	Changes,
+	/// Added and untracked paths rendered without redundant status badges.
+	Additions,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum SidebarTarget {
 	ViewStyle,
 	StageAll,
 	UnstageAll,
-	Directory { area: GitArea, path: Str, depth: usize },
+	Directory { area: GitArea, path: Str, depth: usize, group: SidebarGroup },
 	File { area: GitArea, path: Str, depth: usize },
 	Amend,
 	Summary,
@@ -42,6 +51,7 @@ pub(super) struct SidebarRow {
 	pub basename:     Str,
 	pub additions:    Option<u64>,
 	pub deletions:    Option<u64>,
+	pub strike:       bool,
 }
 
 #[derive(Default)]
@@ -56,7 +66,7 @@ impl SidebarTarget {
 			Self::ViewStyle => Str::new_static("sidebar-view"),
 			Self::StageAll => Str::new_static("unstaged-section"),
 			Self::UnstageAll => Str::new_static("staged-section"),
-			Self::Directory { area, path, .. } => sf!("dir:{area:?}:{path}"),
+			Self::Directory { area, path, group, .. } => sf!("dir:{area:?}:{group:?}:{path}"),
 			Self::File { area, path, .. } => sf!("file:{area:?}:{path}"),
 			Self::Amend => Str::new_static("amend"),
 			Self::Summary => Str::new_static("summary"),
@@ -184,7 +194,7 @@ pub(super) fn sidebar_rows(snapshot: &GitSnapshot, tree: bool, ctx: &UiContext) 
 				.cloned()
 				.map(|file| (GitArea::Commit, file))
 				.collect::<Vec<_>>();
-			append_files(&mut rows, &files, tree, ctx);
+			append_partitioned_files(&mut rows, files, tree, ctx);
 		}
 		rows.push(action_row(SidebarTarget::ViewStyle, Str::default()));
 		return rows;
@@ -199,7 +209,7 @@ pub(super) fn sidebar_rows(snapshot: &GitSnapshot, tree: bool, ctx: &UiContext) 
 		.cloned()
 		.map(|file| (GitArea::Unstaged, file))
 		.collect::<Vec<_>>();
-	append_files(&mut rows, &unstaged, tree, ctx);
+	append_partitioned_files(&mut rows, unstaged, tree, ctx);
 	rows
 		.push(action_row(SidebarTarget::UnstageAll, sf!("Staged Files ({})", snapshot.staged.len())));
 	let staged = snapshot
@@ -208,7 +218,7 @@ pub(super) fn sidebar_rows(snapshot: &GitSnapshot, tree: bool, ctx: &UiContext) 
 		.cloned()
 		.map(|file| (GitArea::Staged, file))
 		.collect::<Vec<_>>();
-	append_files(&mut rows, &staged, tree, ctx);
+	append_partitioned_files(&mut rows, staged, tree, ctx);
 	rows.push(action_row(SidebarTarget::ViewStyle, Str::default()));
 	rows.push(action_row(SidebarTarget::Amend, Str::default()));
 	rows.push(action_row(SidebarTarget::Summary, Str::default()));
@@ -226,7 +236,24 @@ fn action_row(target: SidebarTarget, basename: Str) -> SidebarRow {
 		basename,
 		additions: None,
 		deletions: None,
+		strike: false,
 	}
+}
+
+const fn is_addition(file: &GitFileRow) -> bool {
+	matches!(file.kind, GitChangeKind::Added | GitChangeKind::Untracked)
+}
+
+fn append_partitioned_files(
+	rows: &mut Vec<SidebarRow>,
+	files: Vec<(GitArea, GitFileRow)>,
+	tree: bool,
+	ctx: &UiContext,
+) {
+	let (additions, changes): (Vec<_>, Vec<_>) =
+		files.into_iter().partition(|(_, file)| is_addition(file));
+	append_files(rows, &changes, tree, ctx, SidebarGroup::Changes);
+	append_files(rows, &additions, tree, ctx, SidebarGroup::Additions);
 }
 
 fn append_files(
@@ -234,6 +261,7 @@ fn append_files(
 	files: &[(GitArea, GitFileRow)],
 	tree: bool,
 	ctx: &UiContext,
+	group: SidebarGroup,
 ) {
 	if !tree {
 		for (area, file) in files {
@@ -253,7 +281,7 @@ fn append_files(
 			}
 		}
 	}
-	append_tree(rows, &root, "", 0, ctx);
+	append_tree(rows, &root, "", 0, ctx, group);
 }
 
 fn append_tree(
@@ -262,6 +290,7 @@ fn append_tree(
 	prefix: &str,
 	depth: usize,
 	ctx: &UiContext,
+	group: SidebarGroup,
 ) {
 	for (name, child) in &node.children {
 		let mut path = if prefix.is_empty() {
@@ -282,15 +311,16 @@ fn append_tree(
 			.first()
 			.map_or_else(|| subtree_area(current).unwrap_or(GitArea::Unstaged), |(area, _)| *area);
 		rows.push(SidebarRow {
-			target:       SidebarTarget::Directory { area, path: path.clone(), depth },
+			target:       SidebarTarget::Directory { area, path: path.clone(), depth, group },
 			status:       None,
 			status_color: ctx.theme.muted,
 			directory:    Str::default(),
 			basename:     sf!("{compressed}/"),
 			additions:    None,
 			deletions:    None,
+			strike:       false,
 		});
-		append_tree(rows, current, path.as_str(), depth + 1, ctx);
+		append_tree(rows, current, path.as_str(), depth + 1, ctx, group);
 	}
 	for (area, file) in &node.files {
 		rows.push(file_sidebar_row(*area, file, depth, true, ctx));
@@ -323,7 +353,7 @@ fn file_sidebar_row(
 	let (directory, basename) = split_path(file.path.as_str());
 	SidebarRow {
 		target: SidebarTarget::File { area, path: file.path.clone(), depth },
-		status: Some(status.to_str()),
+		status: (!is_addition(file)).then(|| status.to_str()),
 		status_color,
 		directory: if tree {
 			Str::default()
@@ -333,6 +363,7 @@ fn file_sidebar_row(
 		basename: basename.to_str(),
 		additions: file.additions.filter(|count| *count != 0),
 		deletions: file.deletions.filter(|count| *count != 0),
+		strike: file.kind == GitChangeKind::Deleted,
 	}
 }
 
@@ -416,6 +447,9 @@ fn row_node(row: &SidebarRow, collapsed: &BTreeSet<Str>) -> TreeNode {
 				.with(Prop::Dim, true);
 		},
 		SidebarTarget::File { .. } => {
+			if row.strike {
+				node = node.with(Prop::Strike, true);
+			}
 			if let Some(status) = &row.status {
 				node = node
 					.badge(status.clone())

@@ -913,4 +913,31 @@ mod tests {
 		assert!(rendered.contains("<spinner>"));
 		assert!(rendered.contains("3 unread"));
 	}
+
+	/// Every card color in [`super::card_spec`] and the diagnostics payload
+	/// path must survive the TML parser; a rejected attribute value would
+	/// degrade the whole card into raw markup text.
+	#[test]
+	fn typed_card_tml_parses_for_every_card_color() {
+		let payload = serde_json::json!({
+			"title": "Agent error",
+			"message": "terminal turn error (Auth): Authentication failed for provider `anthropic`. Use `/login anthropic` in chat or run `omp auth login anthropic`.",
+			"severity": "error",
+		});
+		for kind in ["diagnostic", "todo", "usage", "skill", "hook", "advisor", "tan", "irc", "async-job", "file-mention", "stripped-tool", "policy"] {
+			let frame = RetainedFrame {
+				key:      Some(RetainedFrameKey {
+					kind:      kind.into(),
+					rev:       "v1".into(),
+					stable_id: "card-1".into(),
+				}),
+				payload:  Bytes::from(serde_json::to_vec(&payload).expect("payload encodes")),
+				fallback: None,
+				actions:  Vec::new(),
+			};
+			let source = render_frame_tml(&frame);
+			let parsed = omp_tui::Ui::from_markup(source.clone(), 80, omp_tui::UiContext::default());
+			assert!(parsed.is_ok(), "{kind} card must parse: {source}");
+		}
+	}
 }

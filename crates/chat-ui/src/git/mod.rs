@@ -18,8 +18,8 @@ use omp_tui::{
 	components::{Col, EditorPane, Tree},
 };
 use sidebar::{
-	AMEND_ID, COMMIT_ID, DESCRIPTION_ID, DESCRIPTION_PANE_ID, SIDEBAR_ID, SUMMARY_ID, SidebarRow,
-	SidebarTarget, VIEW_STYLE_ID, sidebar_rows,
+	AMEND_ID, COMMIT_ID, DESCRIPTION_ID, DESCRIPTION_PANE_ID, SIDEBAR_ID, SUMMARY_ID, SidebarGroup,
+	SidebarRow, SidebarTarget, VIEW_STYLE_ID, sidebar_rows,
 };
 use strum::EnumProperty as _;
 
@@ -114,19 +114,23 @@ pub struct GitSnapshot {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GitFileContents {
 	/// File text on the old side.
-	pub old_text:  Str,
+	pub old_text:        Str,
 	/// File text on the new side.
-	pub new_text:  Str,
+	pub new_text:        Str,
 	/// Whether Git reported binary contents.
-	pub binary:    bool,
+	pub binary:          bool,
 	/// Whether the file exceeded the presentation size limit.
-	pub too_large: bool,
+	pub too_large:       bool,
 	/// Raw old-side bytes when media preview applies.
-	pub old_bytes: Option<bytes::Bytes>,
+	pub old_bytes:       Option<bytes::Bytes>,
 	/// Raw new-side bytes when media preview applies.
-	pub new_bytes: Option<bytes::Bytes>,
+	pub new_bytes:       Option<bytes::Bytes>,
 	/// Lowercase media format token when the file is a previewable image.
-	pub media:     Option<Str>,
+	pub media:           Option<Str>,
+	/// Old-side reason an expected media object cannot be previewed.
+	pub old_placeholder: Option<Str>,
+	/// New-side reason an expected media object cannot be previewed.
+	pub new_placeholder: Option<Str>,
 }
 
 /// Patch mutation requested from an interactive diff selection.
@@ -156,10 +160,10 @@ pub enum GitIntent {
 		/// Monotonic request sequence used to reject stale contents.
 		seq:       u64,
 	},
-	/// Stage one path, or every unstaged path when absent.
-	StageFile(Option<Str>),
-	/// Unstage one path, or every staged path when absent.
-	UnstageFile(Option<Str>),
+	/// Stage the exact paths, or every unstaged path when absent.
+	StageFiles(Option<Vec<Str>>),
+	/// Unstage the exact paths, or every staged path when absent.
+	UnstageFiles(Option<Vec<Str>>),
 	/// Apply an operation to inclusive one-based line ranges.
 	ApplyLines {
 		/// Requested patch operation.
@@ -234,12 +238,13 @@ const SIDEBAR_MIN: u16 = 30;
 const SIDEBAR_MAX: u16 = 48;
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, strum::EnumProperty)]
 pub(super) enum Focus {
-	#[strum(props(Hint = "alt+↓/↑ hunk · ]/[ file · shift+↑/↓ select · s/u stage · x discard · \
-	                      v view · c commit · q quit"))]
+	#[strum(props(Hint = "j/k move · h/l scroll · g/G ends · alt+↓/↑ hunk · ]/[ file · 1–4 view \
+	                      · w wrap · b whitespace · s/u stage · x discard · c commit · r \
+	                      refresh · q quit"))]
 	Diff,
 	#[default]
-	#[strum(props(Hint = "↑/↓ move · ←/→ fold · space stage · enter open · alt+↓/↑ hunk · c \
-	                      commit · t tree · q quit"))]
+	#[strum(props(Hint = "j/k move · h/l fold/open · g/G ends · space/s/u stage · enter open · \
+	                      ]/[ file · alt+↓/↑ hunk · c commit · r refresh · t tree · q quit"))]
 	Sidebar,
 }
 
@@ -693,9 +698,11 @@ impl GitWorkbench {
 			return GitWorkbenchEvent::Consumed;
 		};
 		match target {
-			SidebarTarget::Directory { area, path, .. } if stage => self.stage_target(area, path),
+			SidebarTarget::Directory { area, path, group, .. } if stage => {
+				self.stage_directory(area, path.as_str(), group)
+			},
 			SidebarTarget::Directory { .. } => GitWorkbenchEvent::Consumed,
-			SidebarTarget::File { area, path, .. } if stage => self.stage_target(area, path),
+			SidebarTarget::File { area, path, .. } if stage => self.stage_paths(area, vec![path]),
 			SidebarTarget::File { .. } => {
 				self.focus = Focus::Diff;
 				self.focus_current();
@@ -718,19 +725,54 @@ impl GitWorkbench {
 			return GitWorkbenchEvent::Consumed;
 		};
 		match target {
-			SidebarTarget::File { area, path, .. } | SidebarTarget::Directory { area, path, .. }
+			SidebarTarget::File { area, path, .. }
 				if (stage && area == GitArea::Unstaged) || (!stage && area == GitArea::Staged) =>
 			{
-				self.stage_target(area, path)
+				self.stage_paths(area, vec![path])
+			},
+			SidebarTarget::Directory { area, path, group, .. }
+				if (stage && area == GitArea::Unstaged) || (!stage && area == GitArea::Staged) =>
+			{
+				self.stage_directory(area, path.as_str(), group)
 			},
 			_ => GitWorkbenchEvent::Consumed,
 		}
 	}
 
-	fn stage_target(&self, area: GitArea, path: Str) -> GitWorkbenchEvent {
+	fn stage_directory(
+		&self,
+		area: GitArea,
+		directory: &str,
+		group: SidebarGroup,
+	) -> GitWorkbenchEvent {
+		let files = match area {
+			GitArea::Unstaged => &self.snapshot.unstaged,
+			GitArea::Staged => &self.snapshot.staged,
+			GitArea::Commit => return GitWorkbenchEvent::Consumed,
+		};
+		let paths = files
+			.iter()
+			.filter(|file| {
+				let in_directory = file
+					.path
+					.strip_prefix(directory)
+					.is_some_and(|suffix| suffix.starts_with('/'));
+				let in_group = matches!(file.kind, GitChangeKind::Added | GitChangeKind::Untracked)
+					== (group == SidebarGroup::Additions);
+				in_directory && in_group
+			})
+			.map(|file| file.path.clone())
+			.collect();
+		self.stage_paths(area, paths)
+	}
+
+	fn stage_paths(&self, area: GitArea, paths: Vec<Str>) -> GitWorkbenchEvent {
+		if paths.is_empty() {
+			return GitWorkbenchEvent::Consumed;
+		}
 		match area {
-			GitArea::Unstaged => GitWorkbenchEvent::Intent(GitIntent::StageFile(Some(path))),
-			GitArea::Staged => GitWorkbenchEvent::Intent(GitIntent::UnstageFile(Some(path))),
+			GitArea::Unstaged => GitWorkbenchEvent::Intent(GitIntent::StageFiles(Some(paths))),
+			GitArea::Staged => GitWorkbenchEvent::Intent(GitIntent::UnstageFiles(Some(paths))),
 			GitArea::Commit => GitWorkbenchEvent::Consumed,
 		}
 	}
@@ -844,8 +886,8 @@ impl GitWorkbench {
 			UiEvent::TreeAction { id, key, action } if id.as_str() == SIDEBAR_ID => {
 				self.set_sidebar_index_for_key(key.as_str());
 				match action.as_str() {
-					"Stage All" => GitWorkbenchEvent::Intent(GitIntent::StageFile(None)),
-					"Unstage All" => GitWorkbenchEvent::Intent(GitIntent::UnstageFile(None)),
+					"Stage All" => GitWorkbenchEvent::Intent(GitIntent::StageFiles(None)),
+					"Unstage All" => GitWorkbenchEvent::Intent(GitIntent::UnstageFiles(None)),
 					_ => GitWorkbenchEvent::Consumed,
 				}
 			},
@@ -900,8 +942,10 @@ impl GitWorkbench {
 		};
 		match target {
 			DiffTarget::File => match op {
-				GitPatchOp::Stage => GitWorkbenchEvent::Intent(GitIntent::StageFile(Some(path))),
-				GitPatchOp::Unstage => GitWorkbenchEvent::Intent(GitIntent::UnstageFile(Some(path))),
+				GitPatchOp::Stage => GitWorkbenchEvent::Intent(GitIntent::StageFiles(Some(vec![path]))),
+				GitPatchOp::Unstage => {
+					GitWorkbenchEvent::Intent(GitIntent::UnstageFiles(Some(vec![path])))
+				},
 				GitPatchOp::Discard => GitWorkbenchEvent::Consumed,
 			},
 			DiffTarget::Lines { old, new } => {
@@ -933,14 +977,16 @@ impl GitWorkbench {
 				.selected
 				.as_ref()
 				.map_or(GitWorkbenchEvent::Consumed, |(_, path)| {
-					GitWorkbenchEvent::Intent(GitIntent::StageFile(Some(path.clone())))
+					GitWorkbenchEvent::Intent(GitIntent::StageFiles(Some(vec![path.clone()])))
 				}),
-			"git-unstage-file" => self
-				.selected
-				.as_ref()
-				.map_or(GitWorkbenchEvent::Consumed, |(_, path)| {
-					GitWorkbenchEvent::Intent(GitIntent::UnstageFile(Some(path.clone())))
-				}),
+			"git-unstage-file" => {
+				self
+					.selected
+					.as_ref()
+					.map_or(GitWorkbenchEvent::Consumed, |(_, path)| {
+						GitWorkbenchEvent::Intent(GitIntent::UnstageFiles(Some(vec![path.clone()])))
+					})
+			},
 			"git-up" => self.jump_hunk_or_file(-1),
 			"git-down" => self.jump_hunk_or_file(1),
 			"git-ws" => self.cycle_whitespace(),
@@ -1399,6 +1445,8 @@ impl GitWorkbench {
 					contents.old_bytes,
 					contents.new_bytes,
 					contents.media.unwrap_or_default(),
+					contents.old_placeholder,
+					contents.new_placeholder,
 				),
 				(Some(_), Some(contents)) if contents.binary => {
 					pane.set_document(None, DiffPaneState::Binary)
@@ -1642,8 +1690,8 @@ mod tests {
 
 	use super::{
 		Focus, GitArea, GitChangeKind, GitCommitInfo, GitFileContents, GitFileRow, GitIntent,
-		GitPatchOp, GitSnapshot, GitUpdate, GitWorkbench, GitWorkbenchEvent, SidebarTarget,
-		commit_view::identicon_lines,
+		GitPatchOp, GitSnapshot, GitUpdate, GitWorkbench, GitWorkbenchEvent, SidebarGroup,
+		SidebarTarget, commit_view::identicon_lines,
 	};
 
 	fn file(path: &'static str, area: GitArea) -> GitFileRow {
@@ -1686,13 +1734,15 @@ mod tests {
 
 	fn contents(old: &'static str, new: &'static str) -> GitFileContents {
 		GitFileContents {
-			old_text:  Str::new_static(old),
-			new_text:  Str::new_static(new),
-			binary:    false,
-			too_large: false,
-			old_bytes: None,
-			new_bytes: None,
-			media:     None,
+			old_text:        Str::new_static(old),
+			new_text:        Str::new_static(new),
+			binary:          false,
+			too_large:       false,
+			old_bytes:       None,
+			new_bytes:       None,
+			media:           None,
+			old_placeholder: None,
+			new_placeholder: None,
 		}
 	}
 
@@ -1790,6 +1840,61 @@ mod tests {
 	}
 
 	#[test]
+	fn vim_sidebar_keys_fold_and_expand_directories() {
+		let mut workbench = GitWorkbench::open(dirty(), &UiContext::default());
+		let directory = workbench
+			.sidebar_rows
+			.iter()
+			.position(
+				|row| matches!(&row.target, SidebarTarget::Directory { path, .. } if path.as_str() == "a"),
+			)
+			.expect("directory");
+		let _ = workbench.select_sidebar(directory);
+		let key = workbench.current_sidebar_target().expect("target").key();
+		assert_eq!(workbench.handle_key(Key::Char('h')), GitWorkbenchEvent::Consumed);
+		assert!(workbench.collapsed.contains(&key));
+		assert_eq!(workbench.handle_key(Key::Char('l')), GitWorkbenchEvent::Consumed);
+		assert!(!workbench.collapsed.contains(&key));
+		assert!(matches!(
+			workbench.handle_key(Key::Char('G')),
+			GitWorkbenchEvent::Intent(GitIntent::Load { path, .. })
+				if path.as_str() == "tests/a.rs"
+		));
+		assert!(matches!(workbench.current_sidebar_target(), Some(SidebarTarget::File { .. })));
+		assert_eq!(workbench.handle_key(Key::Char('g')), GitWorkbenchEvent::Consumed);
+	}
+
+	#[test]
+	fn hunk_navigation_rolls_into_files_and_brackets_switch_directly() {
+		let mut workbench = GitWorkbench::open(dirty(), &UiContext::default());
+		let GitIntent::Load { seq, .. } = workbench.initial_intent().expect("initial load") else {
+			panic!("load")
+		};
+		let old = "old-1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\nold-12\n";
+		let new = "new-1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\nnew-12\n";
+		let _ = workbench.apply(GitUpdate::Contents { seq, contents: contents(old, new) });
+		let _ = workbench.set_mode(ViewMode::Hunk);
+		workbench.focus = Focus::Diff;
+		assert_eq!(workbench.handle_key(Key::JumpNext), GitWorkbenchEvent::Consumed);
+		assert_eq!(workbench.selected, Some((GitArea::Unstaged, Str::new_static("a/one.rs"))));
+		assert!(matches!(
+			workbench.handle_key(Key::JumpNext),
+			GitWorkbenchEvent::Intent(GitIntent::Load { path, .. })
+				if path.as_str() == "a/two.rs"
+		));
+		assert!(matches!(
+			workbench.handle_key(Key::Char(']')),
+			GitWorkbenchEvent::Intent(GitIntent::Load { path, .. })
+				if path.as_str() == "b/three.rs"
+		));
+		assert!(matches!(
+			workbench.handle_key(Key::Char('[')),
+			GitWorkbenchEvent::Intent(GitIntent::Load { path, .. })
+				if path.as_str() == "a/two.rs"
+		));
+	}
+
+	#[test]
 	fn starts_in_sidebar_and_enter_opens_while_space_stages() {
 		let mut workbench = GitWorkbench::open(dirty(), &UiContext::default());
 		assert_eq!(workbench.focus, Focus::Sidebar);
@@ -1798,9 +1903,11 @@ mod tests {
 		assert_eq!(workbench.handle_key(Key::Enter), GitWorkbenchEvent::Consumed);
 		assert_eq!(workbench.focus, Focus::Diff);
 		workbench.focus = Focus::Sidebar;
-		assert!(
-			matches!(workbench.handle_key(Key::Space), GitWorkbenchEvent::Intent(GitIntent::StageFile(Some(path))) if path.as_str() == "a/one.rs")
-		);
+		assert!(matches!(
+			workbench.handle_key(Key::Space),
+			GitWorkbenchEvent::Intent(GitIntent::StageFiles(Some(paths)))
+				if paths.as_slice() == [Str::new_static("a/one.rs")]
+		));
 	}
 
 	#[test]
@@ -2005,7 +2112,7 @@ mod tests {
 		let staged_path = events
 			.iter()
 			.find_map(|event| match event {
-				GitWorkbenchEvent::Intent(GitIntent::StageFile(Some(path))) => Some(path.clone()),
+				GitWorkbenchEvent::Intent(GitIntent::StageFiles(Some(paths))) => paths.first().cloned(),
 				_ => None,
 			})
 			.expect("the deliberate Space should stage one file");
@@ -2037,7 +2144,7 @@ mod tests {
 			.filter(|event| {
 				matches!(
 					event,
-					GitWorkbenchEvent::Intent(GitIntent::StageFile(_) | GitIntent::ApplyLines { .. })
+					GitWorkbenchEvent::Intent(GitIntent::StageFiles(_) | GitIntent::ApplyLines { .. })
 				)
 			})
 			.count();
@@ -2081,13 +2188,113 @@ mod tests {
 	}
 
 	#[test]
-	fn directory_space_batches_path_and_explicit_wrong_area_is_noop() {
-		let mut workbench = GitWorkbench::open(dirty(), &UiContext::default());
-		let directory = workbench.sidebar_rows.iter().position(|row| matches!(&row.target, SidebarTarget::Directory { area: GitArea::Unstaged, path, .. } if path.as_str() == "a")).unwrap();
-		let _ = workbench.select_sidebar(directory);
+	fn pure_additions_are_partitioned_and_batch_independently() {
+		let mut snapshot = dirty();
+		snapshot.unstaged.push(GitFileRow {
+			path:      Str::new_static("a/new.rs"),
+			orig_path: None,
+			kind:      GitChangeKind::Untracked,
+			area:      GitArea::Unstaged,
+			additions: Some(3),
+			deletions: None,
+		});
+		snapshot.unstaged.push(GitFileRow {
+			path:      Str::new_static("deleted.rs"),
+			orig_path: None,
+			kind:      GitChangeKind::Deleted,
+			area:      GitArea::Unstaged,
+			additions: None,
+			deletions: Some(3),
+		});
+		let mut workbench = GitWorkbench::open(snapshot, &UiContext::default());
+		let tracked_directory = workbench
+			.sidebar_rows
+			.iter()
+			.position(|row| {
+				matches!(&row.target, SidebarTarget::Directory {
+					path,
+					group: SidebarGroup::Changes,
+					..
+				} if path.as_str() == "a")
+			})
+			.expect("tracked a directory");
+		let additions_directory = workbench
+			.sidebar_rows
+			.iter()
+			.position(|row| {
+				matches!(&row.target, SidebarTarget::Directory {
+					path,
+					group: SidebarGroup::Additions,
+					..
+				} if path.as_str() == "a")
+			})
+			.expect("additions a directory");
+		assert!(tracked_directory < additions_directory);
+		let added = workbench
+			.sidebar_rows
+			.iter()
+			.find(
+				|row| matches!(&row.target, SidebarTarget::File { path, .. } if path.as_str() == "a/new.rs"),
+			)
+			.expect("addition row");
+		assert!(added.status.is_none());
+		let deleted = workbench
+			.sidebar_rows
+			.iter()
+			.find(
+				|row| matches!(&row.target, SidebarTarget::File { path, .. } if path.as_str() == "deleted.rs"),
+			)
+			.expect("deleted row");
+		assert!(deleted.strike);
+		let _ = workbench.select_sidebar(additions_directory);
+		assert!(matches!(
+			workbench.handle_key(Key::Space),
+			GitWorkbenchEvent::Intent(GitIntent::StageFiles(Some(paths)))
+				if paths.as_slice() == [Str::new_static("a/new.rs")]
+		));
+		let mut refreshed = workbench.snapshot.clone();
+		let index = refreshed
+			.unstaged
+			.iter()
+			.position(|file| file.path.as_str() == "a/new.rs")
+			.expect("addition");
+		let mut staged = refreshed.unstaged.remove(index);
+		staged.area = GitArea::Staged;
+		refreshed.staged.push(staged);
+		let _ = workbench.apply(GitUpdate::Snapshot(refreshed));
 		assert!(
-			matches!(workbench.handle_key(Key::Space), GitWorkbenchEvent::Intent(GitIntent::StageFile(Some(path))) if path.as_str() == "a")
+			workbench
+				.current_sidebar_target()
+				.is_some_and(SidebarTarget::is_file_or_directory)
 		);
+		assert!(!matches!(workbench.current_sidebar_target(), Some(SidebarTarget::Directory {
+				path,
+				group: SidebarGroup::Additions,
+				..
+			}) if path.as_str() == "a"));
+	}
+
+	#[test]
+	fn directory_space_batches_exact_subtree_and_explicit_wrong_area_is_noop() {
+		let mut workbench = GitWorkbench::open(dirty(), &UiContext::default());
+		let directory = workbench
+			.sidebar_rows
+			.iter()
+			.position(|row| {
+				matches!(&row.target, SidebarTarget::Directory {
+					area: GitArea::Unstaged,
+					path,
+					..
+				} if path.as_str() == "a")
+			})
+			.unwrap();
+		let _ = workbench.select_sidebar(directory);
+		assert!(matches!(
+			workbench.handle_key(Key::Space),
+			GitWorkbenchEvent::Intent(GitIntent::StageFiles(Some(paths)))
+				if paths.as_slice()
+					== [Str::new_static("a/one.rs"), Str::new_static("a/two.rs")]
+		));
 		assert_eq!(workbench.handle_key(Key::Char('u')), GitWorkbenchEvent::Consumed);
 	}
 
@@ -2096,7 +2303,7 @@ mod tests {
 		let mut workbench = GitWorkbench::open(dirty(), &UiContext::default());
 		assert_eq!(
 			workbench.map_diff_action(DiffActionKind::Stage, DiffTarget::File),
-			GitWorkbenchEvent::Intent(GitIntent::StageFile(Some(Str::new_static("a/one.rs"))))
+			GitWorkbenchEvent::Intent(GitIntent::StageFiles(Some(vec![Str::new_static("a/one.rs",)])))
 		);
 		assert_eq!(
 			workbench
