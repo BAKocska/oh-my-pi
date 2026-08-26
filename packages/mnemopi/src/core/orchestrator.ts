@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { envDisabled } from "../util/env";
 import type { BeamMemoryState, RecallEnhancedOptions, RecallOptions, RecallResult } from "./beam/types";
 import { embedQuery } from "./embeddings";
@@ -155,7 +156,32 @@ function cacheDiscriminator(
 			: 0;
 	const poolFloor =
 		typeof options.poolFloor === "number" && Number.isFinite(options.poolFloor) ? Math.max(0, options.poolFloor) : 0;
-	return `${mode}|k=${topK}|facts=${includeFacts}|len=${lengthNormalization}|floor=${scoreFloor}|pool=${poolFloor}|${visibilityDiscriminator(options)}|sess=${beam.sessionId}|voices=${voiceEnvMask()}`;
+	// `contentPreviewChars` clips returned content, so it shapes the rows a caller receives even
+	// though it does not change which rows are selected. QueryCache tier 1 keys on the normalized
+	// query alone, so without this term a 100-char-preview call and a clipping-disabled call share a
+	// bucket and the second is served the first one's truncated rows.
+	const preview =
+		typeof options.contentPreviewChars === "number" && Number.isFinite(options.contentPreviewChars)
+			? Math.max(0, Math.trunc(options.contentPreviewChars))
+			: "default";
+	// Only a CALLER-SUPPLIED embedding may partition buckets, and the three input states are
+	// semantically distinct, so they must not collapse:
+	//   undefined -> auto-derive; ALL such calls share one bucket, which is what lets QueryCache
+	//                tier 2/3 match a cached result for a similar but DIFFERENT query text
+	//   null      -> explicitly FTS-only, a different result set, so its own bucket
+	//   number[]  -> caller-supplied vector, one bucket per distinct vector
+	// Passing the RESOLVED embedding here instead would give every distinct query text its own
+	// physical bucket and destroy tier 2/3 cross-query reuse entirely.
+	const explicit = options.queryEmbedding;
+	const embedding =
+		explicit === undefined
+			? "auto"
+			: explicit === null
+				? "none"
+				: explicit.length === 0
+					? "empty"
+					: createHash("sha256").update(Array.from(explicit).join(",")).digest("hex");
+	return `${mode}|k=${topK}|facts=${includeFacts}|len=${lengthNormalization}|floor=${scoreFloor}|pool=${poolFloor}|prev=${preview}|emb=${embedding}|${visibilityDiscriminator(options)}|sess=${beam.sessionId}|voices=${voiceEnvMask()}`;
 }
 
 /**
@@ -199,6 +225,17 @@ export class OrchestratorQueryCache {
 	}
 
 	/** Aggregate stats across every discriminator bucket touched so far in this process. */
+	/**
+	 * Number of physical buckets, i.e. distinct discriminators seen.
+	 *
+	 * `stats().size` sums ENTRIES across buckets, so it cannot distinguish one bucket holding two
+	 * queries from two buckets holding one each — exactly the difference between correct keying and
+	 * over-partitioning that destroys tier-2/3 cross-query reuse.
+	 */
+	get bucketCount(): number {
+		return this.#buckets.size;
+	}
+
 	stats(): QueryCacheStats {
 		let hits = 0;
 		let misses = 0;

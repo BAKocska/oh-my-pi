@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { type BeamMemoryState, initBeam, type RecallResult } from "@oh-my-pi/pi-mnemopi/core/beam";
 import { recall as beamRecall, recallEnhanced as beamRecallEnhanced } from "@oh-my-pi/pi-mnemopi/core/beam/recall";
+import { resetEmbeddingProviderForTests, setEmbeddingProviderForTests } from "@oh-my-pi/pi-mnemopi/core/embeddings";
 import {
 	type OrchestratorBeam,
 	OrchestratorQueryCache,
@@ -76,6 +77,9 @@ const previousPolyphonic = process.env.MNEMOPI_POLYPHONIC_RECALL;
 const previousEnhancedRecall = process.env.MNEMOPI_ENHANCED_RECALL;
 
 afterEach(() => {
+	// A leaked embedding provider would silently change every later test in the file, so reset it
+	// here rather than only in the block that installs one.
+	resetEmbeddingProviderForTests();
 	if (previousPolyphonic === undefined) delete process.env.MNEMOPI_POLYPHONIC_RECALL;
 	else process.env.MNEMOPI_POLYPHONIC_RECALL = previousPolyphonic;
 	if (previousEnhancedRecall === undefined) delete process.env.MNEMOPI_ENHANCED_RECALL;
@@ -261,6 +265,130 @@ describe("cacheDiscriminator visibility widening", () => {
 			const cache = beam.caches.queryCache;
 			if (!(cache instanceof OrchestratorQueryCache)) throw new Error("expected an OrchestratorQueryCache");
 			expect(cache.stats().size).toBe(3);
+		} finally {
+			beam.close();
+		}
+	});
+
+	it("separates cache buckets by contentPreviewChars", async () => {
+		// QueryCache tier 1 keys on the normalized query alone and returns BEFORE the embedding is
+		// consulted, so a 100-char-preview call and a clipping-disabled call would otherwise share a
+		// bucket and the second would be served the first one's truncated rows.
+		process.env.MNEMOPI_ENHANCED_RECALL = "1";
+		process.env.MNEMOPI_POLYPHONIC_RECALL = "0";
+		const beam = visibilityBeam("session-preview");
+		try {
+			insertWorking(beam, "prev", `quokka protocol ${"detail ".repeat(80)}`, {
+				sessionId: "session-preview",
+				scope: "session",
+			});
+			const common = { queryEmbedding: null } as const;
+			await orchestrateRecall(beam, "quokka protocol", 2, { ...common } as never);
+			await orchestrateRecall(beam, "quokka protocol", 2, { ...common, contentPreviewChars: 100 } as never);
+			await orchestrateRecall(beam, "quokka protocol", 2, { ...common, contentPreviewChars: 0 } as never);
+			const cache = beam.caches.queryCache;
+			if (!(cache instanceof OrchestratorQueryCache)) throw new Error("expected an OrchestratorQueryCache");
+			expect(cache.stats().size).toBe(3);
+		} finally {
+			beam.close();
+		}
+	});
+
+	it("does NOT partition buckets by the AUTO-DERIVED embedding (provider-backed)", async () => {
+		// The discriminator must key on the CALLER's input, never the resolved embedding. Keying on
+		// the resolved value gives every distinct query text its own physical bucket and destroys the
+		// cross-query similarity matching QueryCache tier 2/3 exists to provide.
+		//
+		// This needs a real provider: with none configured embedQuery returns null for EVERY query,
+		// so all auto calls resolve identically and the test could not tell correct keying from
+		// per-query fragmentation. The provider below returns a DISTINCT, non-null vector per query
+		// text, which is what makes the bug observable.
+		process.env.MNEMOPI_ENHANCED_RECALL = "1";
+		process.env.MNEMOPI_POLYPHONIC_RECALL = "0";
+		// EmbeddingOutput is AsyncIterable<number[][]>, so the provider MUST be an async generator.
+		// Returning a plain array type-checks under a loose cast but is unusable at runtime: embed()
+		// yields nothing, embedQuery returns null for every query, and both auto calls then resolve
+		// identically — which would make this test unable to see per-query fragmentation at all.
+		let embedCalls = 0;
+		const embedded: string[] = [];
+		const resolved: string[] = [];
+		setEmbeddingProviderForTests({
+			embed: async function* embedForTest(texts: readonly string[]) {
+				embedCalls += 1;
+				const vectors = texts.map(text => {
+					embedded.push(text);
+					// Explicit mapping, not a hash: two orthogonal vectors, so cosine similarity is 0
+					// and tier 2/3 cannot conflate the two queries. A hash-mod-N scheme could collide
+					// and silently make the two resolved vectors identical, which is the one condition
+					// under which this test stops being able to see per-query fragmentation.
+					// "quokka protocol" and its restatement share ONE vector; the third text is
+					// orthogonal. The shared pair is what lets the tier-2/3 assertion below prove the
+					// resolved embedding actually reached the cache.
+					const vector: number[] = text === "entirely different question" ? [0, 1] : [1, 0];
+					resolved.push(vector.join(","));
+					return vector;
+				});
+				yield vectors;
+			},
+			available: () => true,
+		});
+		const beam = visibilityBeam("session-auto");
+		try {
+			insertWorking(beam, "auto", "quokka protocol auto embedding", { sessionId: "session-auto", scope: "session" });
+			// All three calls leave queryEmbedding UNDEFINED, so each auto-derives its own vector.
+			await orchestrateRecall(beam, "quokka protocol", 2, {} as never);
+			await orchestrateRecall(beam, "entirely different question", 2, {} as never);
+			// Third text, DIFFERENT wording but the SAME resolved vector as the first query.
+			await orchestrateRecall(beam, "quokka protocol restated differently", 2, {} as never);
+			const cache = beam.caches.queryCache;
+			if (!(cache instanceof OrchestratorQueryCache)) throw new Error("expected an OrchestratorQueryCache");
+			// Non-vacuity: the provider really auto-derived a vector for BOTH distinct query texts.
+			expect(embedCalls).toBeGreaterThanOrEqual(2);
+			expect(new Set(embedded).size).toBeGreaterThanOrEqual(2);
+			// And the vectors really were DISTINCT — otherwise identical resolved values would make
+			// correct keying and per-query fragmentation indistinguishable.
+			expect(new Set(resolved).size).toBeGreaterThanOrEqual(2);
+			// ONE bucket despite two different resolved vectors. stats().size counts ENTRIES, so only
+			// bucketCount distinguishes this from two single-entry buckets.
+			expect(cache.bucketCount).toBe(1);
+			// NON-VACUITY, the assertion that matters: the third query has different text but the same
+			// resolved vector as the first, so it can only be served through embedding-similarity
+			// matching. A provider whose output never reaches the orchestrator (for example returning a
+			// plain array where AsyncIterable is required) yields null embeddings, produces no such hit,
+			// and fails here. Counting provider invocations cannot detect that, because the function is
+			// still called -- only its result is discarded.
+			const stats = cache.stats();
+			expect(stats.tier2_hits + stats.tier3_hits).toBeGreaterThanOrEqual(1);
+		} finally {
+			beam.close();
+			resetEmbeddingProviderForTests();
+		}
+	});
+
+	it("keeps every caller embedding state in its own bucket", async () => {
+		// undefined = auto-derive, null = explicitly FTS-only, number[] = caller-supplied. These
+		// produce different result sets, so collapsing any two of them serves wrong rows.
+		process.env.MNEMOPI_ENHANCED_RECALL = "1";
+		process.env.MNEMOPI_POLYPHONIC_RECALL = "0";
+		const beam = visibilityBeam("session-embed");
+		try {
+			insertWorking(beam, "emb", "quokka protocol embedding discrimination", {
+				sessionId: "session-embed",
+				scope: "session",
+			});
+			const a = new Array(8).fill(0).map((_, index) => (index === 0 ? 1 : 0));
+			const b = new Array(8).fill(0).map((_, index) => (index === 1 ? 1 : 0));
+			await orchestrateRecall(beam, "quokka protocol", 2, {} as never); // auto
+			await orchestrateRecall(beam, "quokka protocol", 2, { queryEmbedding: null } as never); // FTS-only
+			await orchestrateRecall(beam, "quokka protocol", 2, { queryEmbedding: a } as never);
+			await orchestrateRecall(beam, "quokka protocol", 2, { queryEmbedding: b } as never);
+			// An EMPTY array is a fourth state: not auto, not FTS-only, and not a usable vector.
+			await orchestrateRecall(beam, "quokka protocol", 2, { queryEmbedding: [] } as never);
+			// The SAME vector again must reuse its bucket rather than creating a sixth.
+			await orchestrateRecall(beam, "quokka protocol", 2, { queryEmbedding: a } as never);
+			const cache = beam.caches.queryCache;
+			if (!(cache instanceof OrchestratorQueryCache)) throw new Error("expected an OrchestratorQueryCache");
+			expect(cache.bucketCount).toBe(5);
 		} finally {
 			beam.close();
 		}
