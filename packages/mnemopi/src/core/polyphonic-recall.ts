@@ -44,12 +44,26 @@ export interface PolyphonicRecallOptions {
 	readonly queryEmbedding?: readonly number[] | Float32Array | null;
 	readonly lengthNormalization?: RecallLengthNormalization;
 	readonly scoreFloor?: number;
+	readonly poolFloor?: number;
 }
 
 /** Options accepted by {@link PolyphonicRecallEngine.recall}'s fourth argument. */
 export interface PolyphonicRecallEngineOptions {
 	readonly lengthNormalization?: RecallLengthNormalization;
+	/** Abstention floor: fused results below it are dropped; everything below -> empty return. */
 	readonly scoreFloor?: number;
+	/**
+	 * Pool-cleaning floor (round-4 A/B evaluation knob): fused candidates below it are kept out
+	 * of the diversity (MMR) pool so weak rows cannot crowd selection, while the RETURNED COUNT
+	 * stays identical to `poolFloor: 0`. It never abstains and never truncates: if fewer than
+	 * `topK` candidates clear the floor, the pool is topped up with the best below-floor
+	 * candidates as filler. That invariance is deliberate — a floor that could shrink the
+	 * result set would let a metric gain come from dropping weak rows (abstention) rather than
+	 * from better selection, making the two effects inseparable.
+	 * {@link PolyphonicRecallEngineOptions.scoreFloor} remains the only knob that may change
+	 * how many rows are returned. Absent/0 = inert; production callers never pass this.
+	 */
+	readonly poolFloor?: number;
 }
 
 /**
@@ -1067,7 +1081,13 @@ export class PolyphonicRecallEngine {
 		const temporalResults = this.temporalVoice(query);
 		const combined = this.combineVoices(vectorResults, graphResults, factResults, temporalResults);
 		return this.hydrateResults(
-			this.diversityRerank(combined, topK, options.lengthNormalization ?? "none", options.scoreFloor),
+			this.diversityRerank(
+				combined,
+				topK,
+				options.lengthNormalization ?? "none",
+				options.scoreFloor,
+				options.poolFloor,
+			),
 		);
 	}
 
@@ -1591,6 +1611,7 @@ export class PolyphonicRecallEngine {
 		topK: number,
 		lengthNormalization: RecallLengthNormalization = "none",
 		scoreFloor?: number,
+		poolFloor?: number,
 	): PolyphonicResult[] {
 		const limit = Math.max(0, Math.trunc(topK));
 		if (limit === 0) return [];
@@ -1639,13 +1660,36 @@ export class PolyphonicRecallEngine {
 			}
 		}
 		const floor = typeof scoreFloor === "number" && Number.isFinite(scoreFloor) ? Math.max(0, scoreFloor) : 0;
-		const eligible = floor > 0 ? visible.filter(candidate => candidate.combinedScore >= floor) : visible;
-		const items = eligible.map(candidate => ({
+		const toItem = (candidate: PolyphonicResult) => ({
 			candidate,
 			content: contents.get(candidate.memoryId) ?? "",
 			score: candidate.combinedScore,
-		}));
-		return mmrRerank(items, MMR_LAMBDA, limit).map(item => item.candidate);
+		});
+		// `scoreFloor` (abstention) gates everything and is the ONLY knob allowed to change how
+		// many rows come back.
+		const admitted = floor > 0 ? visible.filter(candidate => candidate.combinedScore >= floor) : visible;
+		const baseline = () => mmrRerank(admitted.map(toItem), MMR_LAMBDA, limit).map(item => item.candidate);
+		const cleaning = typeof poolFloor === "number" && Number.isFinite(poolFloor) ? Math.max(0, poolFloor) : 0;
+		if (cleaning === 0) return baseline();
+		/**
+		 * Pool cleaning (round-4 knob). MMR runs over the above-floor candidates ONLY, so a weak
+		 * row can never be selected ahead of a kept one on diversity grounds — that crowding is
+		 * exactly the effect under test. The baseline result COUNT is then restored by appending
+		 * the best below-floor rows AFTER selection: filler, never crowders. Count invariance
+		 * matters because a floor that shrank the result set could raise a metric by dropping
+		 * weak rows (abstention) rather than by selecting better, making the two inseparable.
+		 */
+		const kept = admitted.filter(candidate => candidate.combinedScore >= cleaning);
+		if (kept.length === 0) return baseline();
+		const selected = mmrRerank(kept.map(toItem), MMR_LAMBDA, limit).map(item => item.candidate);
+		const baselineCount = Math.min(limit, admitted.length);
+		if (selected.length >= baselineCount) return selected;
+		const chosen = new Set(selected.map(candidate => candidate.memoryId));
+		const filler = admitted
+			.filter(candidate => candidate.combinedScore < cleaning && !chosen.has(candidate.memoryId))
+			.sort((a, b) => b.combinedScore - a.combinedScore || a.memoryId.localeCompare(b.memoryId))
+			.slice(0, baselineCount - selected.length);
+		return [...selected, ...filler];
 	}
 	getStats(): Record<string, JsonValue> {
 		let embeddedRows = 0;
@@ -1774,5 +1818,6 @@ export function polyphonicRecall(
 	return getPolyphonicEngine(beam).recall(query, options.queryEmbedding ?? null, topK, {
 		lengthNormalization: options.lengthNormalization,
 		scoreFloor: options.scoreFloor,
+		poolFloor: options.poolFloor,
 	});
 }

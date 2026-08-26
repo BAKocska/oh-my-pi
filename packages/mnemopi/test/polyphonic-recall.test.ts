@@ -181,6 +181,77 @@ describe("PolyphonicRecallEngine", () => {
 		}
 	});
 
+	it("pool floor cleans the MMR pool without changing the returned count", () => {
+		const beam = makeBeam();
+		try {
+			// Three vector-only candidates at deterministic cosine ranks 1..3. Weighted RRF
+			// fused scores: .2/61 = .0032787, .2/62 = .0032258, .2/63 = .0031746.
+			// rank2 is a near-duplicate of rank1 (high content Jaccard); rank3 is lexically
+			// disjoint, so at topK=2 MMR prefers rank3's diversity over rank2's relevance —
+			// which is exactly the "weak row crowds selection" effect the knob removes.
+			insertWorking(beam, "rank1", "quokka protocol primary answer alpha beta gamma");
+			insertWorking(beam, "rank2", "quokka protocol primary answer alpha beta delta");
+			insertWorking(beam, "rank3", "quokka zulu yankee xray whiskey victor uniform");
+			const embeddings: Record<string, readonly number[]> = {
+				rank1: [1, 0],
+				rank2: [0.98, 0.19899748],
+				rank3: [0.9, 0.43588989],
+			};
+			for (const [id, embedding] of Object.entries(embeddings)) {
+				beam.db.run("INSERT INTO memory_embeddings (memory_id, embedding_json, model) VALUES (?, ?, 'test')", [
+					id,
+					JSON.stringify(embedding),
+				]);
+			}
+			const engine = new PolyphonicRecallEngine({
+				db: beam.db,
+				sessionId: beam.sessionId,
+				channelId: beam.channelId,
+			});
+			const recall = engine.recall.bind(engine) as unknown as (
+				query: string,
+				embedding: readonly number[],
+				topK: number,
+				options: { poolFloor?: number; scoreFloor?: number },
+			) => ReturnType<PolyphonicRecallEngine["recall"]>;
+			const ids = (rows: ReturnType<PolyphonicRecallEngine["recall"]>) => rows.map(row => row.id);
+			// A floor between rank2 (.0032258) and rank3 (.0031746).
+			const FLOOR = 0.0032;
+
+			// Inert by default: absent and 0 are byte-identical to each other.
+			const bare = recall("quokka protocol", [1, 0], 8, {});
+			expect(ids(recall("quokka protocol", [1, 0], 8, { poolFloor: 0 }))).toEqual(ids(bare));
+			expect(bare.length).toBe(3);
+
+			// COUNT INVARIANCE with partial survivors: only rank1+rank2 clear the floor, but the
+			// baseline returns 3, so the cleaned result must also return 3 — the below-floor row
+			// comes back as FILLER, appended after selection, never ahead of a kept row.
+			const partial = recall("quokka protocol", [1, 0], 8, { poolFloor: FLOOR });
+			expect(partial.length).toBe(bare.length);
+			expect(ids(partial).slice(0, 2).sort()).toEqual(["rank1", "rank2"]);
+			expect(ids(partial)[2]).toBe("rank3");
+
+			// CLEANING CHANGES SELECTION, NOT COUNT: at topK=2 the baseline trades rank2's
+			// relevance for rank3's diversity; cleaning keeps rank3 out of the MMR pool entirely,
+			// so the same number of rows comes back with a different second slot.
+			const baselineTop2 = recall("quokka protocol", [1, 0], 2, {});
+			const cleanedTop2 = recall("quokka protocol", [1, 0], 2, { poolFloor: FLOOR });
+			expect(cleanedTop2.length).toBe(baselineTop2.length);
+			expect(ids(baselineTop2)).toEqual(["rank1", "rank3"]);
+			expect(ids(cleanedTop2)).toEqual(["rank1", "rank2"]);
+
+			// ALL BELOW FLOOR: falls back to the baseline result byte-identically (contrast
+			// scoreFloor, which abstains and returns nothing).
+			expect(ids(recall("quokka protocol", [1, 0], 8, { poolFloor: 1 }))).toEqual(ids(bare));
+			expect(recall("quokka protocol", [1, 0], 8, { scoreFloor: 1 })).toEqual([]);
+
+			// poolFloor never rescues rows scoreFloor excluded: abstention still governs count.
+			expect(recall("quokka protocol", [1, 0], 8, { scoreFloor: 1, poolFloor: FLOOR })).toEqual([]);
+		} finally {
+			closeQuietly(beam.db);
+		}
+	});
+
 	it("returns a full topK when a single voice nominates every candidate", () => {
 		const beam = makeBeam();
 		try {
