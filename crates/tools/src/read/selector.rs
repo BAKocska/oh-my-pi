@@ -31,6 +31,8 @@ pub enum ParsedSelector {
 	Raw,
 	/// Summarize unresolved conflict regions.
 	Conflicts,
+	/// Rasterize a local SVG or SVGZ resource as a PNG image.
+	Image,
 	/// Return one or more line ranges, optionally verbatim.
 	Lines {
 		/// Sorted, merged ranges.
@@ -260,6 +262,9 @@ pub fn parse_selector(input: Option<&str>) -> Result<ParsedSelector, SelectorErr
 	if input.eq_ignore_ascii_case("conflicts") {
 		return Ok(ParsedSelector::Conflicts);
 	}
+	if input.eq_ignore_ascii_case("img") {
+		return Ok(ParsedSelector::Image);
+	}
 	Ok(match parse_line_ranges(input)? {
 		Some(ranges) => ParsedSelector::Lines { ranges, raw: false },
 		None => ParsedSelector::None,
@@ -268,6 +273,9 @@ pub fn parse_selector(input: Option<&str>) -> Result<ParsedSelector, SelectorErr
 
 fn selector_chunk_looks_read_like(input: &str) -> Result<bool, SelectorError> {
 	if input.eq_ignore_ascii_case("raw") || input.eq_ignore_ascii_case("conflicts") {
+		return Ok(true);
+	}
+	if input.eq_ignore_ascii_case("img") {
 		return Ok(true);
 	}
 	if parse_line_ranges(input)?.is_some() {
@@ -293,7 +301,7 @@ fn selector_chunk_looks_read_like(input: &str) -> Result<bool, SelectorError> {
 fn invalid_selector(input: &str) -> SelectorError {
 	SelectorError::from_message(format!(
 		"Invalid selector ':{input}'. Use :N, :N-M, :N+K, :N- (open-ended), a comma-separated list \
-		 of ranges, :raw, or a range combined with raw (e.g. :raw:50-100)."
+		 of ranges, :raw, :img for SVG rendering, or a range combined with raw (e.g. :raw:50-100)."
 	))
 }
 
@@ -332,6 +340,7 @@ pub fn split_path_and_selector(raw_path: &str) -> SplitPath<'_> {
 fn is_simple_selector(input: &str) -> bool {
 	input.eq_ignore_ascii_case("raw")
 		|| input.eq_ignore_ascii_case("conflicts")
+		|| input.eq_ignore_ascii_case("img")
 		|| is_range_list(input)
 }
 
@@ -774,7 +783,8 @@ mod tests {
 				.unwrap_err()
 				.to_string(),
 			"Invalid selector ':raw:conflicts'. Use :N, :N-M, :N+K, :N- (open-ended), a \
-			 comma-separated list of ranges, :raw, or a range combined with raw (e.g. :raw:50-100)."
+			 comma-separated list of ranges, :raw, :img for SVG rendering, or a range combined with \
+			 raw (e.g. :raw:50-100)."
 		);
 		assert_eq!(parse_selector(Some("table:key")).unwrap(), ParsedSelector::None);
 	}
@@ -908,6 +918,7 @@ mod tests {
 			}),
 			("raw", ParsedSelector::Raw),
 			("conflicts", ParsedSelector::Conflicts),
+			("img", ParsedSelector::Image),
 			("raw:5-16", ParsedSelector::Lines {
 				ranges: Box::from([LineRange { start_line: 5, end_line: Some(16) }]),
 				raw:    true,

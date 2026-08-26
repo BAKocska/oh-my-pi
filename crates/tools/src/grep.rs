@@ -552,7 +552,8 @@ fn parse_root(original: Str) -> Result<SearchRoot, Fault> {
 			ParsedSelector::Lines { ranges: selected, raw: false } => ranges = selected,
 			ParsedSelector::Lines { raw: true, .. }
 			| ParsedSelector::Raw
-			| ParsedSelector::Conflicts => {
+			| ParsedSelector::Conflicts
+			| ParsedSelector::Image => {
 				return Err(Fault::InvalidSelector {
 					message: sf!(
 						"path entry \"{original}\" — only line-range selectors like \":50-100\" are \

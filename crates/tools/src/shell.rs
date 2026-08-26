@@ -36,10 +36,6 @@ use crate::{
 	shell_intercept::{CompiledRule, Rule},
 };
 
-fn omit_schema_format(schema: &mut schemars::Schema) {
-	schema.remove("format");
-}
-
 /// Exposes conservative shell segments for admission and interception.
 ///
 /// Each segment retains original spelling and identifies whether it consumes
@@ -55,13 +51,10 @@ pub fn command_segments(
 #[schemars(description = "")]
 #[serde(deny_unknown_fields)]
 #[schemars(extend(
-	"allOf" = [{
-		"if": {
-			"properties": { "async": { "const": true } },
-			"required": ["async"]
-		},
-		"then": { "required": ["name"] }
-	}]
+	"anyOf" = [
+		{ "properties": { "async": { "const": false } } },
+		{ "required": ["name"] }
+	]
 ))]
 pub struct Params {
 	/// Shell script to execute.
@@ -74,8 +67,8 @@ pub struct Params {
 		skip_serializing_if = "Option::is_none",
 		with = "u64",
 		range(min = 0),
-		transform = omit_schema_format,
-		description = "Host-enforced execution timeout in milliseconds; zero disables the deadline; nonzero values do not extend the foreground auto-background threshold."
+		description = "Host-enforced execution timeout in milliseconds; zero disables the deadline; \
+		               nonzero values do not extend the foreground auto-background threshold."
 	)]
 	pub timeout_ms:   Option<u64>,
 	/// Environment additions scoped to this command.
@@ -1217,5 +1210,44 @@ mod tests {
 		let disabled = prompt_snapshot(false).description();
 		assert!(!disabled.contains("`xd`"));
 		assert!(!disabled.contains("`dyn`"));
+	}
+	#[test]
+	fn params_schema_stays_strict_and_couples_async_to_name() {
+		use omp_inference::recovery::tools::{
+			ToolAssemblyLimits, schema_within_strict_subset, validate_schema,
+		};
+		let schema_bytes = omp_tool::schema::<Params>();
+		let schema: serde_json::Value =
+			serde_json::from_slice(&schema_bytes).expect("generated schema is JSON");
+		// Out-of-subset keywords would make strict recovery validation reject
+		// every shell call at runtime (the aborted-turn regression behind
+		// `tool.assembly-rejected`).
+		assert!(
+			schema_within_strict_subset(&schema, ToolAssemblyLimits::default()),
+			"shell schema left the strict validation subset: {schema}"
+		);
+		let limits = ToolAssemblyLimits::default();
+		let valid = [
+			serde_json::json!({"command": "echo hi"}),
+			serde_json::json!({"command": "echo hi", "async": false}),
+			serde_json::json!({"command": "sleep 5", "async": true, "name": "napper"}),
+			serde_json::json!({"command": "make", "timeout_ms": 0}),
+		];
+		for arguments in valid {
+			assert!(
+				validate_schema(&schema, &arguments, true, limits).is_ok(),
+				"expected valid shell call rejected: {arguments}"
+			);
+		}
+		assert!(
+			validate_schema(
+				&schema,
+				&serde_json::json!({"command": "sleep 5", "async": true}),
+				true,
+				limits,
+			)
+			.is_err(),
+			"async without a job name must stay invalid"
+		);
 	}
 }

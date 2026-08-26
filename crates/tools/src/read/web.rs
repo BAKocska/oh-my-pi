@@ -82,6 +82,11 @@ pub fn parse_target(input: &str) -> Result<Option<ParsedTarget>, WebError> {
 			"The :conflicts selector is only valid for local text files",
 		)));
 	}
+	if matches!(parsed_selector, selector::ParsedSelector::Image) {
+		return Err(WebError::InvalidUrl(sf!(
+			"The :img selector only supports local .svg and .svgz files",
+		)));
+	}
 	let normalized = if has_http_scheme(path) {
 		path.to_owned()
 	} else if path

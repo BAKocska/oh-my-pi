@@ -64,6 +64,7 @@ const DESCRIPTION: &str = r"Read files, directories, archives, SQLite, images, d
 - `:50` / `:50-` — from line 50 | `:50-200` — inclusive | `:50+150` — 150 lines from 50 | `:5-16,960-973` — multiple ranges
 - `:raw` — verbatim, no anchors/prefixes | `:2-4:raw` / `:raw:2-4` — range + verbatim
 - `:conflicts` — one line per unresolved git merge conflict block
+- `:img` — rasterize a local `.svg`/`.svgz` as a PNG image; use when visual layout matters
 - Multiple local paths: semicolon/comma lists or a JSON string array. An existing literal path always wins over splitting.
 
 ## Source kinds
@@ -72,7 +73,7 @@ const DESCRIPTION: &str = r"Read files, directories, archives, SQLite, images, d
 - Directory → deterministic alphabetical depth-limited entries; directories end in / and listings are edit-locked.
 - SQLite (`.sqlite`, `.sqlite3`, `.db`, `.db3`): `file.db` (tables), `file.db:table` (schema+rows), `file.db:table:key` (by PK), `?limit=`/`?where=`/`?q=SELECT`.
 - Archives (`.tar`, `.tar.gz`, `.tgz`, `.zip`, `.asar`, plus ZIP-based `.jar`/`.war`/`.ear`/`.apk`): `archive.ext:path/inside/archive` reads a member.
-- Documents → extracted text. Notebooks → editable cells. Images → decoded inline. `:raw` bypasses converters.
+- Documents → extracted text. Notebooks → editable cells. Images → decoded inline. SVGs read as text unless `:img` is specified. `:raw` bypasses converters.
 - URLs → reader-mode clean text/markdown; `:raw` → untouched HTML. Bare `host:port` needs trailing slash.
 - Internal resources enforce owner byte/entry ceilings; path-only resolution returns metadata without content. Binary/oversized resources return selector or materialized-path guidance rather than inline bytes.
 - `ssh://host/<path>` reads remote files/directories; bare `ssh://` lists hosts; specific remote files are searchable with `grep`.
@@ -823,6 +824,11 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 				return Ok(vec![PayloadPart::Text { text: Str::new(text) }]);
 			},
 			Some(uri) => {
+				if matches!(uri.selector, selector::ParsedSelector::Image)
+					&& uri.scheme != resolver::Scheme::Local
+				{
+					return Err(svg_image_selector_fault());
+				}
 				let Some(result) = self
 					.resolvers
 					.read_query(uri.scheme, uri.resource, uri.query, &uri.selector)
@@ -837,6 +843,11 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 					});
 				};
 				let bytes = result?;
+				if matches!(uri.selector, selector::ParsedSelector::Image) {
+					let gzip =
+						svg_gzip_path(Path::new(uri.resource)).ok_or_else(svg_image_selector_fault)?;
+					return self.read_svg_image(bytes.into_bytes(), gzip).await;
+				}
 				if uri.scheme == resolver::Scheme::Artifact
 					&& uri.selector.is_raw()
 					&& bytes.len() > SNAPSHOT_MAX_BYTES
@@ -1010,6 +1021,9 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 			stat = self.sources.stat(stat.canonical_path.clone()).await?;
 		}
 		if stat.kind == SourceKind::Directory {
+			if matches!(parsed, selector::ParsedSelector::Image) {
+				return Err(svg_image_selector_fault());
+			}
 			return self.read_directory(&stat, &parsed, suffix_from).await;
 		}
 		if matches!(parsed, selector::ParsedSelector::Conflicts) {
@@ -1029,6 +1043,22 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 				suffix_from.map(|from| format::SuffixResolution { from, to: &stat.display_path }),
 			);
 			return Ok(vec![PayloadPart::Text { text: Str::new(text) }]);
+		}
+
+		if matches!(parsed, selector::ParsedSelector::Image) {
+			let path = Path::new(stat.canonical_path.as_str());
+			let gzip = svg_gzip_path(path).ok_or_else(svg_image_selector_fault)?;
+			if stat.byte_len > image::MAX_IMAGE_INPUT_BYTES as u64 {
+				return Err(Fault::Source {
+					message: sf!(
+						"SVG file too large: {} bytes exceeds {} byte limit.",
+						stat.byte_len,
+						image::MAX_IMAGE_INPUT_BYTES
+					),
+				});
+			}
+			let bytes = self.sources.read_bytes(stat.canonical_path.clone()).await?;
+			return self.read_svg_image(bytes, gzip).await;
 		}
 
 		let raw = parsed.is_raw();
@@ -1350,6 +1380,22 @@ impl<S: ReadSources, B: ReadBlobs, R: resolver::Resolve> ReadTool<S, B, R> {
 		}]))
 	}
 
+	async fn read_svg_image(&self, source: Bytes, gzip: bool) -> Result<Vec<PayloadPart>, Fault> {
+		let png = image::rasterize_svg(&source, gzip)
+			.map_err(|error| Fault::Source { message: Str::new(error.to_string()) })?;
+		let loaded = image::process_image_with_policy(png, false)
+			.map_err(|error| Fault::Source { message: error.message() })?
+			.expect("SVG rasterizer always returns PNG bytes");
+		let blob = self
+			.blobs
+			.store(loaded.data, loaded.media_type.clone())
+			.await?;
+		Ok(vec![PayloadPart::Text { text: loaded.description.clone() }, PayloadPart::Blob {
+			blob,
+			alt: loaded.description,
+		}])
+	}
+
 	fn structural_parts(
 		&self,
 		stat: &SourceStat,
@@ -1595,6 +1641,23 @@ fn append_visible_conflict_warning(
 		scan_truncated: false,
 	});
 	formatted.append_conflict_warning(&warning);
+}
+
+fn svg_gzip_path(path: &Path) -> Option<bool> {
+	let extension = path.extension()?.to_str()?;
+	if extension.eq_ignore_ascii_case("svg") {
+		Some(false)
+	} else if extension.eq_ignore_ascii_case("svgz") {
+		Some(true)
+	} else {
+		None
+	}
+}
+
+fn svg_image_selector_fault() -> Fault {
+	Fault::Invalid {
+		message: Str::new_static("The ':img' selector only supports local .svg and .svgz files."),
+	}
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

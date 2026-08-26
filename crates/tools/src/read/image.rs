@@ -1,10 +1,16 @@
 //! Pure image classification and model-boundary normalization.
 
 use std::{
-	collections::HashMap, env, error, fmt, fmt::Display, io, io::Cursor, path::Path, sync::LazyLock,
+	collections::HashMap,
+	env, error, fmt,
+	fmt::Display,
+	io::{self, Cursor, Read as _},
+	path::Path,
+	sync::LazyLock,
 };
 
 use bytes::Bytes;
+use flate2::read::GzDecoder;
 use image::{
 	AnimationDecoder, DynamicImage, ImageEncoder, ImageFormat,
 	codecs::{
@@ -34,6 +40,7 @@ const IMAGE_METADATA_HEADER_BYTES: usize = 256 * 1024;
 const DATA_URL_HEADER_MAX_BYTES: usize = 1_024;
 const IMAGE_CACHE_MAX_BYTES: usize = 64 * 1024 * 1024;
 const IMAGE_CACHE_MAX_ENTRIES: usize = 128;
+const SVG_IMAGE_MAX_EDGE: u32 = 2_048;
 const COMFORTABLE_IMAGE_BYTES: usize = MAX_IMAGE_OUTPUT_BYTES / 4;
 const JPEG_QUALITY: u8 = 80;
 const QUALITY_STEPS: [u8; 4] = [70, 60, 50, 40];
@@ -193,6 +200,26 @@ pub enum ImageFault {
 	WebpConversionFailed,
 }
 
+/// Typed SVG/SVGZ rasterization failure.
+#[derive(Debug, thiserror::Error)]
+pub enum SvgRasterFault {
+	/// The compressed or decoded SVG exceeds the read image boundary.
+	#[error("SVG source exceeds the 20MB image input limit")]
+	TooLarge,
+	/// A gzip-compressed SVG could not be decoded.
+	#[error("Could not decompress SVGZ source")]
+	Decompression(#[source] io::Error),
+	/// The decoded source was not a valid supported SVG document.
+	#[error("Could not parse SVG source")]
+	Parse(#[source] resvg::usvg::Error),
+	/// The SVG dimensions could not be represented by the bounded raster.
+	#[error("SVG dimensions cannot be rasterized")]
+	Dimensions,
+	/// The rendered pixels could not be encoded as PNG.
+	#[error("Could not encode rasterized SVG as PNG")]
+	Encode,
+}
+
 impl ImageFault {
 	/// Exact model-facing failure text used by pi.
 	pub fn message(&self) -> Str {
@@ -231,6 +258,51 @@ pub fn is_supported_extension(path: &Path) -> bool {
 				.into_iter()
 				.any(|supported| extension.eq_ignore_ascii_case(supported))
 		})
+}
+
+/// Rasterizes SVG or gzip-compressed SVGZ bytes to a bounded PNG.
+///
+/// The source is rejected above the ordinary image input limit, including
+/// after decompression, and is proportionally scaled so neither output edge
+/// exceeds 2048 pixels.
+pub fn rasterize_svg(source: &[u8], gzip: bool) -> Result<Bytes, SvgRasterFault> {
+	if source.len() > MAX_IMAGE_INPUT_BYTES {
+		return Err(SvgRasterFault::TooLarge);
+	}
+	let mut decoded = Vec::new();
+	let source = if gzip {
+		let mut decoder = GzDecoder::new(source).take((MAX_IMAGE_INPUT_BYTES + 1) as u64);
+		decoder
+			.read_to_end(&mut decoded)
+			.map_err(SvgRasterFault::Decompression)?;
+		if decoded.len() > MAX_IMAGE_INPUT_BYTES {
+			return Err(SvgRasterFault::TooLarge);
+		}
+		decoded.as_slice()
+	} else {
+		source
+	};
+	let tree = resvg::usvg::Tree::from_data(source, &resvg::usvg::Options::default())
+		.map_err(SvgRasterFault::Parse)?;
+	let size = tree.size();
+	let scale = (SVG_IMAGE_MAX_EDGE as f32 / size.width().max(size.height())).min(1.0);
+	let width = (size.width() * scale)
+		.round()
+		.clamp(1.0, SVG_IMAGE_MAX_EDGE as f32) as u32;
+	let height = (size.height() * scale)
+		.round()
+		.clamp(1.0, SVG_IMAGE_MAX_EDGE as f32) as u32;
+	let mut pixmap =
+		resvg::tiny_skia::Pixmap::new(width, height).ok_or(SvgRasterFault::Dimensions)?;
+	resvg::render(
+		&tree,
+		resvg::tiny_skia::Transform::from_scale(scale, scale),
+		&mut pixmap.as_mut(),
+	);
+	pixmap
+		.encode_png()
+		.map(Bytes::from)
+		.map_err(|_| SvgRasterFault::Encode)
 }
 
 /// Classifies PNG, JPEG, GIF, and WebP bytes.
@@ -927,7 +999,39 @@ fn format_bytes(bytes: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+	use std::io::Write as _;
+
+	use flate2::{Compression, write::GzEncoder};
+
 	use super::*;
+
+	#[test]
+	fn rasterizes_inline_svg_to_bounded_png() {
+		let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="12" height="7">
+			<rect width="12" height="7" fill="red"/>
+		</svg>"#;
+		let png = rasterize_svg(svg, false).expect("tiny SVG rasterizes");
+
+		assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+		assert_eq!(
+			sniff_metadata(&png),
+			Some(ImageMetadata { kind: ImageKind::Png, width: Some(12), height: Some(7) })
+		);
+	}
+
+	#[test]
+	fn rasterizes_gzip_compressed_svgz() {
+		let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="3" height="2"></svg>"#;
+		let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+		encoder.write_all(svg).expect("compress SVG");
+		let svgz = encoder.finish().expect("finish compressed SVG");
+		let png = rasterize_svg(&svgz, true).expect("tiny SVGZ rasterizes");
+
+		assert_eq!(
+			sniff_metadata(&png),
+			Some(ImageMetadata { kind: ImageKind::Png, width: Some(3), height: Some(2) })
+		);
+	}
 
 	fn assert_reported_dimensions_match_bytes(encoded: &EncodedImage) {
 		let (decoded, animated) =

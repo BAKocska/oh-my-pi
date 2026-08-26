@@ -471,9 +471,25 @@ impl<R: Read + Seek> ArchiveReader<R> {
 					ParsedSelector::None => {
 						return Err(ArchiveError::NotFound { path: target.to_owned() });
 					},
+					ParsedSelector::Image => {
+						return Err(
+							SelectorError::from_message(
+								"The ':img' selector only supports local .svg and .svgz files.",
+							)
+							.into(),
+						);
+					},
 				}
 			}
 		};
+		if matches!(selector, ParsedSelector::Image) {
+			return Err(
+				SelectorError::from_message(
+					"The ':img' selector only supports local .svg and .svgz files.",
+				)
+				.into(),
+			);
+		}
 		let content = if node.is_directory {
 			if selector.is_multi_range() {
 				return Err(ArchiveError::DirectoryMultiRange);

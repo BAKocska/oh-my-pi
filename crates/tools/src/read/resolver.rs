@@ -1102,6 +1102,11 @@ impl<C: ArtifactCatalog, B: BlobAuthority> Resolve for ArtifactResolver<C, B> {
 			ParsedSelector::None | ParsedSelector::Raw | ParsedSelector::Conflicts => {
 				self.all_bytes(&record, size).await
 			},
+			ParsedSelector::Image => Err(Fault::Invalid {
+				message: Str::new_static(
+					"The ':img' selector only supports local .svg and .svgz files.",
+				),
+			}),
 		}
 	}
 }

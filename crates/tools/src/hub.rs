@@ -17,6 +17,10 @@ const DESCRIPTION: &str = "Coordinates peer agents, detached jobs, and project-s
                            processes. Peer operations use `to`; process operations use `name`. \
                            `wait` races every selected source and returns the first peer message \
                            or settled job without consuming unrelated events.";
+/// Default model-facing peer roster page size.
+pub const DEFAULT_LIST_LIMIT: usize = 32;
+/// Maximum model-facing peer roster page size.
+pub const MAX_LIST_LIMIT: usize = 100;
 
 /// Hub operation vocabulary.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
@@ -46,6 +50,17 @@ pub enum Op {
 	Restart,
 	/// Describe one named process.
 	Describe,
+}
+/// Lifecycle filter accepted by `hub list`.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ListStatus {
+	/// Include only agents with an active turn.
+	Running,
+	/// Include only live agents waiting for work.
+	Idle,
+	/// Include only journal-backed parked agents.
+	Parked,
 }
 
 /// Environment process restart policy.
@@ -117,6 +132,10 @@ pub struct Params {
 	/// Inspect inbox without consuming it.
 	#[serde(default)]
 	pub peek:                 bool,
+	/// Agent lifecycle filter for `list`; omitted means running plus idle.
+	pub status:               Option<ListStatus>,
+	/// Maximum peer rows returned by `list`.
+	pub limit:                Option<u16>,
 	/// Stable process name.
 	pub name:                 Option<Str>,
 	/// Process executable.
@@ -445,6 +464,12 @@ pub fn validate(mut params: Params, caller_id: &str) -> Result<Request, Fault> {
 		return Err(invalid("logs `lines` must be between 1 and 1000"));
 	}
 	if params
+		.limit
+		.is_some_and(|limit| limit == 0 || usize::from(limit) > MAX_LIST_LIMIT)
+	{
+		return Err(invalid("list `limit` must be between 1 and 100"));
+	}
+	if params
 		.timeout
 		.is_some_and(|timeout| !timeout.is_finite() || timeout <= 0.0)
 	{
@@ -498,7 +523,7 @@ fn protocol_issue(message: Str) -> ArgIssue {
 mod tests {
 	use std::collections::BTreeMap;
 
-	use super::{Op, Params, Ready, RestartPolicy, validate};
+	use super::{ListStatus, Op, Params, Ready, RestartPolicy, validate};
 
 	fn params(op: Op) -> Params {
 		Params {
@@ -511,6 +536,8 @@ mod tests {
 			ids: None,
 			timeout_ms: None,
 			peek: false,
+			status: None,
+			limit: None,
 			name: None,
 			application: None,
 			args: None,
@@ -574,5 +601,14 @@ mod tests {
 		let mut wait = params(Op::Wait);
 		wait.timeout_ms = Some(0);
 		assert_eq!(validate(wait, "main").unwrap().params.timeout_ms, Some(0));
+	}
+	#[test]
+	fn list_limit_is_bounded() {
+		let mut list = params(Op::List);
+		list.status = Some(ListStatus::Parked);
+		list.limit = Some(100);
+		assert!(validate(list.clone(), "main").is_ok());
+		list.limit = Some(101);
+		assert!(validate(list, "main").is_err());
 	}
 }

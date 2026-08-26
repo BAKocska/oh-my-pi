@@ -457,7 +457,9 @@ fn canonical_url_vocabulary_matches_dense_rust_dispatch_and_selector_parser() {
 		}
 	}
 	assert_eq!(Scheme::parse("xd"), Scheme::Unknown);
-	for selector in ["5", "5-16,960-973", "5..16", "5+12", "5-", "raw", "conflicts", "raw:5-16"] {
+	for selector in
+		["5", "5-16,960-973", "5..16", "5+12", "5-", "raw", "conflicts", "img", "raw:5-16"]
+	{
 		assert_ne!(read::selector::parse_selector(Some(selector)).unwrap(), ParsedSelector::None);
 	}
 }
@@ -1320,6 +1322,27 @@ async fn image_read_emits_description_and_blob_and_rejects_over_twenty_mibibytes
 		text(sources, r#"{"path":"huge.png"}"#).await,
 		"Image file too large: 20.0MB exceeds 20.0MB limit."
 	);
+}
+
+#[tokio::test]
+async fn svg_image_selector_rasterizes_to_png_blob() {
+	let sources = Sources::default();
+	sources.file(
+		"diagram.svg",
+		r#"<svg xmlns="http://www.w3.org/2000/svg" width="12" height="7">
+			<rect width="12" height="7" fill="red"/>
+		</svg>"#,
+	);
+	let blobs = Blobs::default();
+	let parts = project(sources, blobs.clone(), r#"{"path":"diagram.svg:img"}"#, true).await;
+	let [Part::Text { .. }, Part::Blob { blob, .. }] = parts.as_slice() else {
+		panic!("selected SVG must emit text plus image blob: {parts:?}");
+	};
+
+	assert_eq!(blob.media_type, "image/png");
+	let stored = blobs.stored.lock();
+	assert_eq!(stored.len(), 1);
+	assert_eq!(&stored[0].0[..8], b"\x89PNG\r\n\x1a\n");
 }
 
 #[tokio::test]
