@@ -1,15 +1,20 @@
 //! Native tool-renderer lifecycle gallery and PNG capture command.
 
-use std::{fs, path::PathBuf};
+use std::{
+	fs,
+	io::{self, IsTerminal},
+	path::PathBuf,
+	time::Duration,
+};
 
 use bytes::Bytes;
 use clap::{Args, ValueEnum};
 use miette::{IntoDiagnostic, miette};
-use omp_chat_ui::Chat;
+use omp_chat_ui::{Chat, ViewportFrame};
 use omp_core::Str;
 use omp_tool::render::{RenderRegistry, ViewState};
 use omp_tools::{gallery::RendererGalleryFixture, register_builtin_renderers};
-use omp_tui::{Size, UiContext};
+use omp_tui::{CellContent, Frame, Size, UiContext};
 use strum::{Display, EnumIter, IntoEnumIterator};
 
 /// Tool lifecycle states rendered by the gallery, in display order.
@@ -83,8 +88,8 @@ pub fn run(args: GalleryArgs) -> miette::Result<()> {
 			if args.screenshot {
 				let context = UiContext::default();
 				let mut chat = fixture_chat(&context, &registry, fixture, *state)?;
-				let rendered = chat.render(Size::new(width, 18));
-				let png = omp_tui::frame_png(rendered.frame).into_diagnostic()?;
+				let rendered = render_settled(&mut chat, Size::new(width, 18));
+				let png = omp_tui::frame_png(&card_frame(rendered.frame)).into_diagnostic()?;
 				let state_name = state.to_string();
 				let path = args
 					.out
@@ -110,8 +115,38 @@ fn render_fixture(
 ) -> miette::Result<String> {
 	let context = UiContext::default();
 	let mut chat = fixture_chat(&context, registry, fixture, state)?;
-	let rendered = chat.render(Size::new(width, 18));
-	Ok(omp_tui::frame_text(rendered.frame))
+	let rendered = render_settled(&mut chat, Size::new(width, 18));
+	let card = card_frame(rendered.frame);
+	Ok(if io::stdout().is_terminal() {
+		omp_tui::frame_ansi(&card)
+	} else {
+		omp_tui::frame_text(&card)
+	})
+}
+
+/// Settles admission and entrance animation on a fixed timeline, then renders
+/// the final deterministic frame.
+fn render_settled(chat: &mut Chat, viewport: Size) -> ViewportFrame<'_> {
+	for frame in 0..8 {
+		let _ = chat.render_at(viewport, Duration::from_millis(frame * 60));
+	}
+	chat.render_at(viewport, Duration::from_secs(1))
+}
+
+/// Crops a chat viewport to the tool card at its top, dropping the blank
+/// filler rows and the composer chrome pinned to the viewport bottom.
+fn card_frame(frame: &Frame) -> Frame {
+	let blank_row = |row: u16| {
+		(0..frame.size().width).all(|x| {
+			matches!(frame.cell(x, row).content(), CellContent::Blank | CellContent::Continuation)
+		})
+	};
+	let height = (0..frame.size().height)
+		.find(|row| blank_row(*row))
+		.unwrap_or(frame.size().height);
+	let mut card = Frame::new(Size::new(frame.size().width, height));
+	card.blit(frame, 0, height, 0, 0);
+	card
 }
 
 fn fixture_chat<'a>(
@@ -137,6 +172,7 @@ fn fixture_chat<'a>(
 		.view(&fixture.identity, &fold, outcome)
 		.into_diagnostic()?;
 	let mut chat = Chat::new(context);
+	chat.set_reduced_motion(true);
 	let revision = if fixture.identity.rev.family.is_empty() {
 		fixture.identity.rev.n.to_string()
 	} else {

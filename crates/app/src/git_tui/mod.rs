@@ -106,9 +106,7 @@ impl GitSession {
 			GitIntent::Load { area, path, orig_path, seq } => {
 				let load_cancel = self.cancel.child_token();
 				{
-					let mut active = self
-						.load_cancel
-						.lock();
+					let mut active = self.load_cancel.lock();
 					active.cancel();
 					*active = load_cancel.clone();
 				}
