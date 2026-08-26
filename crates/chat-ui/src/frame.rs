@@ -924,7 +924,20 @@ mod tests {
 			"message": "terminal turn error (Auth): Authentication failed for provider `anthropic`. Use `/login anthropic` in chat or run `omp auth login anthropic`.",
 			"severity": "error",
 		});
-		for kind in ["diagnostic", "todo", "usage", "skill", "hook", "advisor", "tan", "irc", "async-job", "file-mention", "stripped-tool", "policy"] {
+		for kind in [
+			"diagnostic",
+			"todo",
+			"usage",
+			"skill",
+			"hook",
+			"advisor",
+			"tan",
+			"irc",
+			"async-job",
+			"file-mention",
+			"stripped-tool",
+			"policy",
+		] {
 			let frame = RetainedFrame {
 				key:      Some(RetainedFrameKey {
 					kind:      kind.into(),

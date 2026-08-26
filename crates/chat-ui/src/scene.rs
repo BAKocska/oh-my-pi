@@ -13,7 +13,7 @@ use std::{
 use omp_core::{IntoStr, Str, StrMut, fmts_mut, sf};
 use omp_tui::{
 	Border, Cached, Charset, Color, Command, Component, Decor, DecorKind, Frame, HistoryReplay,
-	Icon, Key, MouseReport, PaintCtx, Prop, Props, Rect, Size, SlashCommands, Slot,
+	Icon, Key, MarkupOrigin, MouseReport, PaintCtx, Prop, Props, Rect, Size, SlashCommands, Slot,
 	SpellingFeatures, Style, Theme, Ui, UiContext, UiEvent,
 	anim::{self, Easing, Shimmer, Tween},
 	components::{
@@ -23,7 +23,7 @@ use omp_tui::{
 		collapse_hud_line, compaction_boundary_color, compaction_threshold_color,
 		hr::truncate_to_width, spend_label, write_compact_count,
 	},
-	next_slot,
+	next_slot, parse_with_origin,
 };
 use smallvec::SmallVec;
 
@@ -614,12 +614,25 @@ struct ToolView {
 	source:   Str,
 	width:    u16,
 	rendered: Ui,
+	/// The source is appended plain output, never markup.
+	plain:    bool,
 }
 
 impl ToolView {
 	fn structured(source: Str, width: u16, ctx: &UiContext) -> Self {
 		let rendered = Self::render(&source, width, ctx);
-		Self { source, width, rendered }
+		Self { source, width, rendered, plain: false }
+	}
+
+	/// The card-embeddable body: the parsed markup tree, or a text leaf for
+	/// plain appended output and unparseable markup.
+	fn body(&self, ctx: &UiContext) -> Cached {
+		if !self.plain
+			&& let Ok(root) = parse_with_origin(&self.source, ctx, MarkupOrigin::Core)
+		{
+			return root;
+		}
+		Cached::new(Box::new(TextLeaf::new().text(self.source.clone())))
 	}
 
 	fn render(source: &Str, width: u16, ctx: &UiContext) -> Ui {
@@ -634,6 +647,7 @@ impl ToolView {
 		}
 		self.rendered = Self::render(&source, self.width, ctx);
 		self.source = source;
+		self.plain = false;
 	}
 
 	fn append_plain(&mut self, chunk: &str, ctx: &UiContext) {
@@ -643,13 +657,18 @@ impl ToolView {
 		self.rendered =
 			Ui::from_root(TextLeaf::new().text(source.clone()), self.width.max(1), ctx.clone());
 		self.source = source;
+		self.plain = true;
 	}
 
 	fn resize(&mut self, width: u16, ctx: &UiContext) {
 		let width = width.max(1);
 		if self.width != width {
 			self.width = width;
-			self.rendered = Self::render(&self.source, width, ctx);
+			self.rendered = if self.plain {
+				Ui::from_root(TextLeaf::new().text(self.source.clone()), width, ctx.clone())
+			} else {
+				Self::render(&self.source, width, ctx)
+			};
 		}
 	}
 
@@ -2885,7 +2904,10 @@ impl Chat {
 		}
 	}
 
-	fn render_at(&mut self, viewport: Size, elapsed: Duration) -> ViewportFrame<'_> {
+	/// Renders one exactly viewport-sized frame at an explicit timeline
+	/// instant, letting deterministic hosts (galleries, snapshots, tests)
+	/// settle admission and entrance animation without waiting on wall time.
+	pub fn render_at(&mut self, viewport: Size, elapsed: Duration) -> ViewportFrame<'_> {
 		let frontier = self.blocks.frontier();
 		self.render_at_with_frontier(viewport, elapsed, frontier, AdmissionMode::Allow)
 	}
@@ -2951,6 +2973,9 @@ impl Chat {
 			if tool.card_ui.frame().size().width != content_width {
 				tool.card_ui.resize(content_width);
 			}
+			tool
+				.view
+				.resize(Self::tool_view_width(content_width), &self.ctx);
 			tool.card_ui.tick(elapsed);
 			sampled.push((tool.ordinal, tool.card_ui.height()));
 			natural.push((
@@ -3607,7 +3632,7 @@ impl Chat {
 	fn refresh_live_tool_card(tool: &mut LiveTool, width: u16, ctx: &UiContext) {
 		let presentation = tool.presentation();
 		let mut body = Vec::with_capacity(tool.images.len().saturating_add(1));
-		body.push(Cached::new(Box::new(TextLeaf::new().text(presentation.live_body))));
+		body.push(tool.view.body(ctx));
 		for image in &tool.images {
 			let (cols, rows) = tool_image_box(image, width);
 			body.push(Cached::new(Box::new(
