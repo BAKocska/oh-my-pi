@@ -885,6 +885,29 @@ mod tests {
 	}
 
 	#[test]
+	fn formatting_demotion_preserves_real_source_ranges_for_staging() {
+		let options =
+			DiffBuildOptions { whitespace: DiffWhitespaceMode::Formatting, language: None };
+		let doc = DiffDocument::build(
+			"call(a, b);\nmid\nvalue = 1;",
+			"call(\n a,\n b\n);\nmid\nvalue = 2;",
+			"x.rs",
+			&options,
+		);
+		let changed = doc
+			.rows
+			.iter()
+			.find(|row| row.kind == DiffRowKind::Change)
+			.expect("real change remains");
+		assert_eq!(changed.old.as_ref().map(|side| side.number), Some(3));
+		assert_eq!(changed.new.as_ref().map(|side| side.number), Some(6));
+		assert_eq!(doc.hunks.len(), 1);
+		let hunk = &doc.hunks[0];
+		assert!(hunk.old_range.0 <= 3 && 3 < hunk.old_range.0 + hunk.old_range.1);
+		assert!(hunk.new_range.0 <= 6 && 6 < hunk.new_range.0 + hunk.new_range.1);
+	}
+
+	#[test]
 	fn formatting_mode_demotes_language_import_changes() {
 		let options =
 			DiffBuildOptions { whitespace: DiffWhitespaceMode::Formatting, language: None };

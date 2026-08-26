@@ -176,14 +176,14 @@ impl Palette {
 	}
 }
 
-struct AssetSide {
-	image:    Img,
-	metadata: Str,
+enum AssetSide {
+	Image { image: Img, metadata: Str },
+	Placeholder(Str),
 }
 
 struct AssetPreview {
-	old: Option<AssetSide>,
-	new: Option<AssetSide>,
+	old: AssetSide,
+	new: AssetSide,
 }
 
 struct HighlightSide {
@@ -394,16 +394,24 @@ impl DiffPane {
 		self.rebuild_layout(self.last_width);
 	}
 
-	/// Replaces the pane contents with old/new encoded image bytes.
+	/// Replaces the pane contents with side-by-side old/new asset presentations.
 	///
-	/// Added and deleted assets pass bytes for only the present side. The
-	/// lowercase format token is displayed with detected dimensions and size.
-	pub fn set_asset(&mut self, old: Option<Bytes>, new: Option<Bytes>, format: impl IntoStr) {
+	/// Present sides display encoded image bytes with detected dimensions and
+	/// size. Absent sides display their supplied placeholder, or "Not present"
+	/// when the file only exists on the opposite side.
+	pub fn set_asset(
+		&mut self,
+		old: Option<Bytes>,
+		new: Option<Bytes>,
+		format: impl IntoStr,
+		old_placeholder: Option<Str>,
+		new_placeholder: Option<Str>,
+	) {
 		self.set_document(None, DiffPaneState::Asset);
 		let format = format.into_str();
 		self.asset = Some(AssetPreview {
-			old: old.map(|bytes| asset_side(bytes, &format)),
-			new: new.map(|bytes| asset_side(bytes, &format)),
+			old: asset_side(old, old_placeholder, &format),
+			new: asset_side(new, new_placeholder, &format),
 		});
 	}
 
@@ -974,45 +982,32 @@ impl DiffPane {
 		let Some(asset) = &mut self.asset else {
 			return;
 		};
-		match (&mut asset.old, &mut asset.new) {
-			(Some(old), Some(new)) if rect.width > 1 => {
-				let left_width = rect.width.saturating_sub(1) / 2;
-				let right_width = rect.width.saturating_sub(left_width + 1);
-				Self::paint_asset_side(
-					pc,
-					Rect::new(rect.x, rect.y, left_width, rect.height),
-					"Before",
-					old,
-				);
-				pc.frame.fill(
-					Rect::new(rect.x.saturating_add(left_width), rect.y, 1, rect.height),
-					Style::new().fg(pc.ctx.theme.border),
-				);
-				for row in 0..rect.height {
-					pc.frame.put(
-						rect.x.saturating_add(left_width),
-						rect.y.saturating_add(row),
-						"│",
-						Style::new().fg(pc.ctx.theme.border),
-					);
-				}
-				Self::paint_asset_side(
-					pc,
-					Rect::new(rect.x.saturating_add(left_width + 1), rect.y, right_width, rect.height),
-					"After",
-					new,
-				);
-			},
-			(Some(old), _) => Self::paint_asset_side(pc, rect, "Before", old),
-			(_, Some(new)) => Self::paint_asset_side(pc, rect, "After", new),
-			(None, None) => Self::paint_centered(
-				pc,
-				rect,
-				rect.y.saturating_add(rect.height / 2),
-				"No image data",
-				Style::new().fg(pc.ctx.theme.muted),
-			),
+		if rect.width <= 1 {
+			Self::paint_asset_side(pc, rect, "After", &mut asset.new);
+			return;
 		}
+		let left_width = rect.width.saturating_sub(1) / 2;
+		let right_width = rect.width.saturating_sub(left_width + 1);
+		Self::paint_asset_side(
+			pc,
+			Rect::new(rect.x, rect.y, left_width, rect.height),
+			"Before",
+			&mut asset.old,
+		);
+		for row in 0..rect.height {
+			pc.frame.put(
+				rect.x.saturating_add(left_width),
+				rect.y.saturating_add(row),
+				"│",
+				Style::new().fg(pc.ctx.theme.border),
+			);
+		}
+		Self::paint_asset_side(
+			pc,
+			Rect::new(rect.x.saturating_add(left_width + 1), rect.y, right_width, rect.height),
+			"After",
+			&mut asset.new,
+		);
 	}
 
 	fn paint_asset_side(pc: &mut PaintCtx<'_>, rect: Rect, label: &str, side: &mut AssetSide) {
@@ -1020,19 +1015,28 @@ impl DiffPane {
 			return;
 		}
 		Self::paint_centered(pc, rect, rect.y, label, Style::new().fg(pc.ctx.theme.fg).bold());
-		if rect.height > 1 {
-			Self::paint_centered(
+		match side {
+			AssetSide::Image { image, metadata } => {
+				if rect.height > 1 {
+					Self::paint_centered(
+						pc,
+						rect,
+						rect.y + 1,
+						metadata,
+						Style::new().fg(pc.ctx.theme.muted),
+					);
+				}
+				if rect.width > 2 && rect.height > 2 {
+					image.paint(pc, Rect::new(rect.x + 1, rect.y + 2, rect.width - 2, rect.height - 2));
+				}
+			},
+			AssetSide::Placeholder(message) => Self::paint_centered(
 				pc,
 				rect,
-				rect.y + 1,
-				&side.metadata,
+				rect.y.saturating_add(rect.height / 2),
+				message,
 				Style::new().fg(pc.ctx.theme.muted),
-			);
-		}
-		if rect.width > 2 && rect.height > 2 {
-			side
-				.image
-				.paint(pc, Rect::new(rect.x + 1, rect.y + 2, rect.width - 2, rect.height - 2));
+			),
 		}
 	}
 
@@ -1745,11 +1749,14 @@ fn highlight_side(side: &mut HighlightSide, lines: &[Str], styles: &HighlightSty
 	side.offset = end;
 }
 
-fn asset_side(bytes: Bytes, format: &str) -> AssetSide {
+fn asset_side(bytes: Option<Bytes>, placeholder: Option<Str>, format: &str) -> AssetSide {
+	let Some(bytes) = bytes else {
+		return AssetSide::Placeholder(placeholder.unwrap_or_else(|| Str::new_static("Not present")));
+	};
 	let byte_len = bytes.len();
 	let image = Img::from_bytes(bytes);
 	let metadata = asset_metadata(format, image.dimensions(), byte_len);
-	AssetSide { image, metadata }
+	AssetSide::Image { image, metadata }
 }
 
 fn asset_metadata(format: &str, dimensions: Option<ImageDimensions>, byte_len: usize) -> Str {
@@ -2101,7 +2108,7 @@ mod tests {
 	}
 
 	#[test]
-	fn asset_mode_paints_split_and_single_side_previews() {
+	fn asset_mode_paints_split_previews_and_unavailable_placeholders() {
 		let png = || {
 			let mut encoded = Vec::new();
 			{
@@ -2114,17 +2121,24 @@ mod tests {
 			Bytes::from(encoded)
 		};
 		let mut pane = DiffPane::new();
-		pane.set_asset(Some(png()), Some(png()), "png");
+		pane.set_asset(Some(png()), Some(png()), "png", None, None);
 		let split = paint(&mut pane, 60, 6).0;
 		assert!(frame_row_text(&split, 0).contains("Before"));
 		assert!(frame_row_text(&split, 0).contains("After"));
 		assert!(frame_row_text(&split, 1).contains("PNG · 2×3"));
 		assert!(frame_row_text(&split, 0).contains('│'));
 
-		pane.set_asset(None, Some(png()), "png");
+		pane.set_asset(
+			None,
+			Some(png()),
+			"png",
+			Some(Str::new_static("Git LFS object unavailable")),
+			None,
+		);
 		let single = paint(&mut pane, 60, 6).0;
-		assert!(!frame_row_text(&single, 0).contains("Before"));
+		assert!(frame_row_text(&single, 0).contains("Before"));
 		assert!(frame_row_text(&single, 0).contains("After"));
+		assert!(frame_row_text(&single, 3).contains("Git LFS object unavailable"));
 	}
 
 	#[test]

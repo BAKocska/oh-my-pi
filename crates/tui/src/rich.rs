@@ -361,6 +361,27 @@ impl RichText {
 		self.open = false;
 	}
 
+	/// Drops `row` and every following row while retaining the backing arenas.
+	///
+	/// The next run starts a fresh row. A retained soft-wrap marker therefore
+	/// remains connected to a replacement tail appended through [`RichSink`].
+	pub(crate) fn truncate_rows(&mut self, rows: u16) {
+		let keep = usize::from(rows).min(self.rows.len());
+		let run_end = self
+			.rows
+			.get(keep.wrapping_sub(1))
+			.map_or(0, |row| row.run_end as usize);
+		let byte_end = self
+			.runs
+			.get(run_end.wrapping_sub(1))
+			.map_or(0, |run| run.end as usize);
+		self.text.truncate(byte_end);
+		self.runs.truncate(run_end);
+		self.rows.truncate(keep);
+		self.current_width = 0;
+		self.open = false;
+	}
+
 	/// Returns retained arena capacities for steady-state allocation tests.
 	#[cfg(test)]
 	pub(crate) const fn capacities(&self) -> (usize, usize, usize) {
@@ -525,6 +546,7 @@ pub struct Measure {
 	/// Width of the widest row observed.
 	pub widest: u16,
 	current:    u16,
+	last:       u16,
 	open:       bool,
 }
 
@@ -546,8 +568,16 @@ impl RichSink for Measure {
 			self.rows = self.rows.saturating_add(1);
 		}
 		self.widest = self.widest.max(self.current);
+		self.last = self.current;
 		self.current = 0;
 		self.open = false;
+	}
+}
+
+impl Measure {
+	/// Width of the most recently terminated row, or the open trailing row.
+	pub(crate) const fn final_width(&self) -> u16 {
+		if self.open { self.current } else { self.last }
 	}
 }
 

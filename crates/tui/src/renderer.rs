@@ -32,7 +32,9 @@ const SYNC_OUTPUT_BEGIN: &str = esc!(sync_output);
 const SYNC_OUTPUT_END: &str = esc!(!sync_output);
 const HIDE_CURSOR: &str = esc!(!cursor_visible);
 const SHOW_CURSOR: &str = esc!(cursor_visible);
-const RESET_HISTORY: &str = esc!(cursor_home, erase_scrollback, erase_display);
+// ED2 must precede ED3: tmux implements ED2 by pushing the visible screen into
+// pane history, so ED3-first would immediately re-poison the history it wiped.
+const RESET_HISTORY: &str = esc!(cursor_home, erase_display, erase_scrollback);
 // CUD clamps at the bottom without changing the user's scrollback viewport.
 const VIEWPORT_BOTTOM: &str = esc!(viewport_bottom);
 const DEFAULT_CELL_PIXEL_WIDTH: u16 = 9;
@@ -2535,6 +2537,15 @@ mod tests {
 				.windows(RESET_HISTORY.len())
 				.any(|bytes| bytes == RESET_HISTORY.as_bytes())
 		);
+	}
+	#[test]
+	fn destructive_reset_emits_display_erase_before_scrollback_erase() {
+		let mut renderer = Renderer::new(Vec::new());
+		renderer.reset_history().unwrap();
+
+		let output = String::from_utf8(mem::take(renderer.writer_mut())).unwrap();
+		assert!(output.ends_with("\x1b[H\x1b[2J\x1b[3J"), "{output:?}");
+		assert!(!output.contains("\x1b[3J\x1b[2J"), "{output:?}");
 	}
 
 	#[test]

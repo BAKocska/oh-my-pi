@@ -1755,6 +1755,18 @@ mod tests {
 		assert!(parse(&Str::new("<text fg=\"rgb💥(1,2,3)\">x</text>"), &ctx).is_err());
 		assert!(parse(&Str::new("<text fg=#héx>x</text>"), &ctx).is_err());
 	}
+	#[test]
+	fn long_semantic_color_aliases_parse_everywhere() {
+		let ctx = UiContext::default();
+		for markup in [
+			"<box bc=warning><text>x</text></box>",
+			"<text fg=error>x</text>",
+			"<text fg=success>x</text>",
+			"<text bg=warning>x</text>",
+		] {
+			assert!(parse(&Str::new(markup), &ctx).is_ok(), "{markup}");
+		}
+	}
 
 	#[test]
 	fn chrome_attributes_parse_with_aliases_and_flags() {

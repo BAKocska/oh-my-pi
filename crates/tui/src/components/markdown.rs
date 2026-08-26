@@ -9,7 +9,7 @@ use crate::{
 	markdown::MdTheme,
 	markup,
 	props::{Prop, PropValue, Props},
-	rich::{Measure, RichText},
+	rich::{Measure, RichText, cell_width},
 };
 
 /// Rendered Markdown content backing the `<markdown>` markup tag.
@@ -24,6 +24,8 @@ pub struct Markdown {
 	cached_width:   u16,
 	cached_partial: bool,
 	cached:         Option<MemoKey>,
+	fast_tail:      Option<markdown::FastTail>,
+	measured:       Option<(MemoKey, (u16, u16), u16)>,
 }
 
 impl Markdown {
@@ -40,6 +42,8 @@ impl Markdown {
 			cached_width:   0,
 			cached_partial: false,
 			cached:         None,
+			fast_tail:      None,
+			measured:       None,
 		}
 	}
 
@@ -88,13 +92,30 @@ impl Markdown {
 		}
 		let theme = self.theme(ctx);
 		let style = self.props.style(&ctx.theme);
+		if partial
+			&& self.props.truncate().is_none()
+			&& self
+				.fast_tail
+				.as_mut()
+				.is_some_and(|tail| tail.splice(&self.text, width, &theme, &mut self.rich))
+		{
+			self.cached_width = width;
+			self.cached_partial = true;
+			self.cached = Some(key);
+			return;
+		}
 		self.rich.clear();
 		if partial {
-			markdown::render_partial(&self.text, width, &theme, &mut self.rich);
+			self.fast_tail =
+				markdown::render_partial_capturing(&self.text, width, &theme, &mut self.rich);
 		} else {
 			markdown::render(&self.text, width, &theme, &mut self.rich);
+			self.fast_tail = None;
 		}
 		truncate_rich(&mut self.rich, width, style, self.props.truncate());
+		if self.props.truncate().is_some() {
+			self.fast_tail = None;
+		}
 		self.cached_width = width;
 		self.cached_partial = partial;
 		self.cached = Some(key);
@@ -129,6 +150,14 @@ impl Component for Markdown {
 	}
 
 	fn measure(&mut self, ctx: &UiContext) -> (u16, u16) {
+		let key = MemoKey::new(self.version, ctx);
+		if self.props.partial()
+			&& self.embedded.is_empty()
+			&& let Some((cached, measured, _)) = self.measured
+			&& cached == key
+		{
+			return measured;
+		}
 		let theme = self.theme(ctx);
 		let mut natural = Measure::default();
 		if self.props.partial() {
@@ -145,7 +174,13 @@ impl Component for Markdown {
 				nat = nat.max(child_nat);
 			}
 		}
-		(min, nat)
+		let measured = (min, nat);
+		self.measured = (self.props.partial() && self.embedded.is_empty()).then_some((
+			key,
+			measured,
+			natural.final_width(),
+		));
+		measured
 	}
 
 	fn height(&mut self, ctx: &UiContext, width: u16) -> u16 {
@@ -209,8 +244,30 @@ impl Component for Markdown {
 		if self.source == text {
 			return false;
 		}
+		let embeds_markup = markup::md_embeds_markup(&text);
+		let old_key = MemoKey::new(self.version, ctx);
+		let delta_width = text
+			.as_str()
+			.strip_prefix(self.source.as_str())
+			.filter(|delta| !delta.contains('\t'))
+			.filter(|delta| {
+				delta
+					.chars()
+					.last()
+					.is_none_or(|character| !character.is_whitespace())
+			})
+			.map(cell_width);
+		let theme = self.theme(ctx);
+		let fast = !embeds_markup
+			&& self.embedded.is_empty()
+			&& self.props.partial()
+			&& self.props.truncate().is_none()
+			&& self.cached == Some(old_key)
+			&& self.fast_tail.as_mut().is_some_and(|tail| {
+				tail.splice(&text, self.cached_width.max(1), &theme, &mut self.rich)
+			});
 		self.source = text.clone();
-		if markup::md_embeds_markup(&text) {
+		if embeds_markup {
 			if let Ok(children) = markup::parse_md_fragment_inheriting(&text, ctx, &self.props) {
 				self.text = Str::default();
 				self.embedded = children;
@@ -223,6 +280,24 @@ impl Component for Markdown {
 			self.embedded.clear();
 		}
 		self.version = self.version.wrapping_add(1);
+		if fast {
+			let key = MemoKey::new(self.version, ctx);
+			self.cached = Some(key);
+			if let (Some(delta_width), Some((measured_key, measured, tail_width))) =
+				(delta_width, self.measured)
+				&& measured_key == old_key
+			{
+				let tail_width = tail_width.saturating_add(delta_width);
+				let widest = measured.1.max(tail_width);
+				let min = widest.clamp(1, 12);
+				self.measured = Some((key, (min, widest.max(min)), tail_width));
+			} else {
+				self.measured = None;
+			}
+		} else {
+			self.fast_tail = None;
+			self.measured = None;
+		}
 		true
 	}
 }
@@ -249,6 +324,36 @@ mod tests {
 			assert!(markdown.set_text(&ctx, Str::new(source)));
 			assert_eq!(markdown.text, source);
 			assert!(markdown.embedded.is_empty());
+		}
+	}
+
+	#[test]
+	fn retained_partial_text_splices_plain_streaming_delta() {
+		let ctx = UiContext::default();
+		let mut markdown = Markdown::new()
+			.with(Prop::Partial, true)
+			.text("A plain paragraph tail");
+		let _ = markdown.measure(&ctx);
+		markdown.render(&ctx, 12);
+		assert!(markdown.set_text(&ctx, Str::new("A plain paragraph tail grows")));
+		assert_eq!(
+			markdown
+				.fast_tail
+				.as_ref()
+				.expect("plain paragraph remains captured")
+				.splice_count(),
+			1,
+		);
+		let theme = markdown.theme(&ctx);
+		let mut cold = RichText::default();
+		markdown::render_partial(&markdown.text, 12, &theme, &mut cold);
+		assert_eq!(markdown.rich.rows(), cold.rows());
+		for row in 0..cold.rows() {
+			assert_eq!(markdown.rich.row_text(row), cold.row_text(row));
+			assert_eq!(
+				markdown.rich.row_runs(row).collect::<Vec<_>>(),
+				cold.row_runs(row).collect::<Vec<_>>(),
+			);
 		}
 	}
 }

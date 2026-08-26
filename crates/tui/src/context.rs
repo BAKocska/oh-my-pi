@@ -513,15 +513,18 @@ impl Theme {
 
 	/// Resolves a semantic token name (`accent`, `warn`, …) or a CSS
 	/// system color keyword (`Canvas`, `LinkText`, …) to its color.
+	///
+	/// `warning`, `error`, and `success` are accepted aliases of `warn`,
+	/// `err`, and `ok`; producers routinely emit the long spellings.
 	pub(crate) fn token(&self, name: &str) -> Option<Color> {
 		Some(match name {
 			"fg" => self.fg,
 			"accent" => self.accent,
 			"info" => self.info,
 			"secondary" => self.secondary,
-			"ok" => self.ok,
-			"warn" => self.warn,
-			"err" => self.err,
+			"ok" | "success" => self.ok,
+			"warn" | "warning" => self.warn,
+			"err" | "error" => self.err,
 			"muted" => self.muted,
 			"border" => self.border,
 			"code_border" => self.code_border,
@@ -543,6 +546,9 @@ impl Theme {
 				| "accent"
 				| "info" | "ok"
 				| "warn" | "err"
+				| "success"
+				| "warning"
+				| "error"
 				| "muted"
 				| "panel"
 				| "secondary"

@@ -14,12 +14,14 @@ use crate::{
 	rich::{Pipeline, Prefix, RichSink, RichText, cell_width},
 };
 
+mod fast_tail;
 mod graphviz;
 pub(crate) mod highlight;
 mod inline;
 mod mermaid;
 mod table;
 
+pub(crate) use fast_tail::FastTail;
 use inline::code_span_len;
 pub(crate) use inline::{math_span, parse_inline};
 
@@ -72,7 +74,7 @@ fn ordinal_marker_unordered() -> MarkerText {
 }
 
 /// Styles used by the Markdown renderer.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub struct MdTheme {
 	/// Ordinary prose.
 	pub base:        Style,
@@ -227,6 +229,23 @@ pub(crate) fn render_partial(src: &Str, width: u16, theme: &MdTheme, sink: &mut 
 	render_inner(src, width, theme, sink, true);
 }
 
+/// Renders an incomplete stream and captures an append-only plain paragraph
+/// tail.
+pub(crate) fn render_partial_capturing(
+	src: &Str,
+	width: u16,
+	theme: &MdTheme,
+	sink: &mut dyn RichSink,
+) -> Option<FastTail> {
+	let normalized = normalize_source(src, false);
+	let width = width.max(1);
+	let tail = render_document(&normalized, width, theme, sink);
+	(tail == Some(BlockKind::Paragraph)
+		&& !src.as_str().ends_with('\n')
+		&& !src.as_str().ends_with('\r'))
+	.then(|| FastTail::capture(src, width, *theme))
+}
+
 fn render_inner(src: &Str, width: u16, theme: &MdTheme, sink: &mut dyn RichSink, partial: bool) {
 	let normalized = normalize_source(src, !partial);
 	// degenerate viewports still make progress: every block renders at
@@ -234,7 +253,12 @@ fn render_inner(src: &Str, width: u16, theme: &MdTheme, sink: &mut dyn RichSink,
 	render_document(&normalized, width.max(1), theme, sink);
 }
 
-fn render_document(source: &Str, width: u16, theme: &MdTheme, sink: &mut dyn RichSink) {
+fn render_document(
+	source: &Str,
+	width: u16,
+	theme: &MdTheme,
+	sink: &mut dyn RichSink,
+) -> Option<BlockKind> {
 	let mut lines: SmallVec<&str, 64> = source.as_str().split('\n').collect();
 	while lines.last().is_some_and(|line| line.is_empty()) {
 		lines.pop();
@@ -295,6 +319,7 @@ fn render_document(source: &Str, width: u16, theme: &MdTheme, sink: &mut dyn Ric
 		}
 		previous = Some(kind);
 	}
+	previous
 }
 
 const fn should_separate(previous: Option<BlockKind>, current: BlockKind, had_blank: bool) -> bool {

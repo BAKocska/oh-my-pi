@@ -92,6 +92,18 @@ impl Component for Countdown {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::{Frame, Size, test_support::frame_row_text};
+
+	fn render_at(countdown: &mut Countdown, now: Duration) -> String {
+		let mut ctx = UiContext::default();
+		ctx.now = now;
+		let mut frame = Frame::new(Size::new(24, 1));
+		let mut hits = Vec::new();
+		let mut wakes = Vec::new();
+		let mut pc = PaintCtx::new(&mut frame, &ctx, &mut hits, &mut wakes);
+		countdown.paint(&mut pc, Rect::new(0, 0, 24, 1));
+		frame_row_text(&frame, 0)
+	}
 
 	#[test]
 	fn rounds_partial_seconds_and_expires_at_deadline() {
@@ -101,5 +113,15 @@ mod tests {
 		assert_eq!(countdown.remaining(Duration::from_secs(12)), 1);
 		assert!(!countdown.expired(Duration::from_millis(12_499)));
 		assert!(countdown.expired(Duration::from_millis(12_500)));
+	}
+
+	#[test]
+	fn presentation_clock_ticks_retry_message_down_and_clamps_at_zero() {
+		let mut countdown =
+			Countdown::new("Retrying", Duration::from_secs(10), Duration::from_millis(2500));
+
+		assert!(render_at(&mut countdown, Duration::from_secs(10)).contains("Retrying · 3s"));
+		assert!(render_at(&mut countdown, Duration::from_secs(12)).contains("Retrying · 1s"));
+		assert!(render_at(&mut countdown, Duration::from_secs(30)).contains("Retrying · 0s"));
 	}
 }

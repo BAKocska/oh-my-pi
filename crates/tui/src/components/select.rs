@@ -451,6 +451,33 @@ impl Select {
 		true
 	}
 
+	/// Jumps to an explicitly numbered option while the filter query is empty.
+	///
+	/// Numbered rows may follow unnumbered context rows, so the digit matches
+	/// the visible label prefix rather than its list position. Multi-selects
+	/// only move the cursor; single-selects commit immediately.
+	fn quick_select(&mut self, key: Key) -> Option<Flow> {
+		if !self.state.filter_q.is_empty() {
+			return None;
+		}
+		let Key::Char(digit @ '1'..='9') = key else {
+			return None;
+		};
+		let mut encoded = [0_u8; 4];
+		let digit = digit.encode_utf8(&mut encoded).as_bytes()[0];
+		let target = self.state.options.iter().position(|option| {
+			let label = option.label.as_bytes();
+			label.len() >= 3 && label[0] == digit && label[1] == b'.' && label[2] == b' '
+		})?;
+		let target = u16::try_from(target).ok()?;
+		self.state.cursor = target;
+		if self.state.multi {
+			Some(self.highlight_flow())
+		} else {
+			Some(self.commit(target))
+		}
+	}
+
 	/// Routes one key: custom-option editing, then query editing (always-on
 	/// for filterable single selects, `/`-armed otherwise), then list
 	/// navigation. Identified selects surface cursor, query, and commit
@@ -480,6 +507,9 @@ impl Select {
 				_ => {},
 			}
 			return Flow::Consumed;
+		}
+		if let Some(flow) = self.quick_select(key) {
+			return flow;
 		}
 		let typing = self.state.types_to_filter() || self.state.searching;
 		if typing && !matches!(key, Key::Up | Key::Down) {
@@ -1392,5 +1422,58 @@ mod tests {
 		values.clear();
 		select.value(&mut values);
 		assert_eq!(values["checks"], serde_json::json!(["lint"]));
+	}
+
+	#[test]
+	fn digit_selects_matching_numbered_label_after_unnumbered_row() {
+		let mut select = Select::new()
+			.with(Prop::Id, "pick")
+			.with(Prop::Filter, true)
+			.option(
+				SelectOption::new()
+					.label("Detected item")
+					.with(Prop::Value, "detected"),
+			)
+			.option(
+				SelectOption::new()
+					.label("1. First")
+					.with(Prop::Value, "first"),
+			)
+			.option(
+				SelectOption::new()
+					.label("2. Second")
+					.with(Prop::Value, "second"),
+			);
+		let ctx = UiContext::default();
+
+		assert_eq!(
+			select.key(&mut event_ctx(&ctx), Key::Char('2')),
+			Flow::Event(UiEvent::Changed { id: "pick".into(), value: "second".into() }),
+			"the digit matches the numbered label rather than the row position"
+		);
+	}
+
+	#[test]
+	fn digit_moves_multi_select_cursor_without_toggling() {
+		let mut select = Select::new()
+			.with(Prop::Id, "checks")
+			.with(Prop::Multi, true)
+			.with(Prop::Filter, true)
+			.option(SelectOption::new().label("Context"))
+			.option(SelectOption::new().label("1. Lint"))
+			.option(SelectOption::new().label("2. Unit"));
+		let ctx = UiContext::default();
+
+		assert_eq!(
+			select.key(&mut event_ctx(&ctx), Key::Char('2')),
+			Flow::Event(UiEvent::Highlighted { id: "checks".into(), value: "2. Unit".into() })
+		);
+		let mut values = serde_json::Map::new();
+		select.value(&mut values);
+		assert_eq!(values["checks"], serde_json::json!([]));
+		assert_eq!(
+			select.key(&mut event_ctx(&ctx), Key::Space),
+			Flow::Event(UiEvent::Changed { id: "checks".into(), value: "2. Unit".into() })
+		);
 	}
 }

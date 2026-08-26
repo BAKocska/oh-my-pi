@@ -78,7 +78,7 @@ const LANG_ALIASES: &[(&[&str], &str)] = &[
 ];
 
 /// Semantic styles applied to parsed syntax scopes.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub(crate) struct HighlightStyles {
 	base:        Style,
 	comment:     Style,
