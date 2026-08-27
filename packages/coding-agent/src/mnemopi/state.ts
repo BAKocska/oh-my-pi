@@ -13,6 +13,7 @@ import {
 	prepareRetentionTranscript,
 	prepareUserRetentionTranscript,
 	type RetentionChunkRange,
+	sanitizeRetentionMessages,
 	stripRetentionProtocolMarkers,
 	truncateRecallQuery,
 } from "../hindsight/content";
@@ -615,13 +616,20 @@ export class MnemopiSessionState {
 		options: { extract?: boolean; retainedThroughUserTurn?: number } = {},
 	): Promise<void> {
 		const maxChars = this.config.retentionChunkMaxChars;
+		// Strip memory tags BEFORE chunking. Chunk boundaries are computed on framed length, so a
+		// recalled <memories> block can straddle one whenever the surrounding text alone exceeds the
+		// cap; neither half then matches the tag regexes and framing can no longer strip it. Every
+		// downstream use -- chunking, range resolution, framing -- must see this same array so the
+		// recorded ranges are offsets into the content that was actually stored.
+		const sanitized = sanitizeRetentionMessages(messages);
+		if (sanitized.length === 0) return;
 		if (maxChars <= 0) {
-			this.#rememberTranscriptRow(messages, messages, sourceId, options.retainedThroughUserTurn, options.extract);
+			this.#rememberTranscriptRow(sanitized, sanitized, sourceId, options.retainedThroughUserTurn, options.extract);
 			return;
 		}
-		const chunks = chunkRetentionMessages(messages, maxChars);
+		const chunks = chunkRetentionMessages(sanitized, maxChars);
 		if (chunks.length === 0) return;
-		const totalUserTurns = messages.filter(message => message.role === "user").length;
+		const totalUserTurns = sanitized.filter(message => message.role === "user").length;
 		const chunkCount = chunks.length;
 		chunks.forEach((chunk, chunkIndex) => {
 			// Crash-safe per-chunk cursor: the final input cursor minus the turns this whole
@@ -635,7 +643,7 @@ export class MnemopiSessionState {
 					: options.retainedThroughUserTurn - totalUserTurns + chunk.completedUserTurns;
 			this.#rememberTranscriptRow(
 				chunk.messages,
-				resolveChunkSourceMessages(messages, chunk.ranges),
+				resolveChunkSourceMessages(sanitized, chunk.ranges),
 				sourceId,
 				retainedThroughUserTurn,
 				options.extract,

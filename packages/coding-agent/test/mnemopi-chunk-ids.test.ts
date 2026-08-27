@@ -157,3 +157,50 @@ describe("retention chunking supplies per-chunk memory ids", () => {
 		await state.dispose({ consolidate: false });
 	});
 });
+
+/**
+ * Regression: chunk boundaries are computed on framed length, so a recalled `<memories>` block can
+ * straddle one whenever the surrounding text alone exceeds `retentionChunkMaxChars`. Neither half
+ * then matches the tag regexes, `prepareRetentionTranscript()` cannot strip them, and the recalled
+ * memories get persisted -- the recall->retain feedback loop the stripping exists to prevent.
+ */
+describe("retention chunking never persists recalled memory blocks", () => {
+	beforeEach(() => {
+		resetSettingsForTest();
+	});
+
+	it("strips a <memories> block that would straddle a chunk boundary", async () => {
+		const secret = "RECALLED-MEMORY-CANARY";
+		// Offsets chosen so a chunk boundary lands INSIDE the block. This matters: a block that
+		// happens to sit wholly within one chunk is stripped correctly by framing, so an arbitrary
+		// payload can make this test silently vacuous.
+		const content = `${"a".repeat(240)}<memories>\n- ${secret}\n</memories>${"b".repeat(600)}`;
+		const state = registerMnemopiState(makeMnemopiConfig({ retentionChunkMaxChars: 300, bank: "chunk-leak-bank" }), {
+			sessionId: "chunk-leak-session",
+			cwd: "/work/chunk-leak",
+			entries: () => [{ type: "message", message: { role: "user", content } }],
+		});
+
+		await state.forceRetainCurrentSession();
+
+		// embed_text is derived from the chunk's RANGES, sliced out of the source array. It is
+		// included here because misaligned ranges -- offsets computed on sanitized content but
+		// applied to raw messages -- would slice a torn tag straight into it.
+		const rows = state.memory.beam.db
+			.prepare(
+				"SELECT content, COALESCE(embed_text, '') AS embed_text FROM working_memory WHERE session_id = 'chunk-leak-bank'",
+			)
+			.all() as { content: string; embed_text: string }[];
+		expect(rows.length).toBeGreaterThan(1);
+		// No fragment of the recalled block survives anywhere: not the payload, and not a torn tag.
+		const stored = rows.map(row => `${row.content}\n${row.embed_text}`).join("\n");
+		expect(stored).not.toContain(secret);
+		expect(stored).not.toContain("<memories>");
+		expect(stored).not.toContain("</memories>");
+		// The surrounding conversation is still retained -- stripping must not eat the turn.
+		expect(stored).toContain("aaaa");
+		expect(stored).toContain("bbbb");
+
+		await state.dispose({ consolidate: false });
+	});
+});

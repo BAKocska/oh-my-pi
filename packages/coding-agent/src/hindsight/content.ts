@@ -461,6 +461,30 @@ function packRetentionAtoms(atoms: readonly RetentionAtom[], maxChars: number): 
  *
  * Throws when `maxChars` cannot hold even one framed code point for some message's role.
  */
+/**
+ * Strip memory tags from every message BEFORE chunking, mirroring what the per-message framing in
+ * `prepareRetentionTranscript()` does (strip, trim, drop anything non-substantive).
+ *
+ * Chunking splits on the framed length, so a `<memories>` or `<mental_models>` block can straddle a
+ * chunk boundary whenever the non-memory text alone exceeds `retentionChunkMaxChars`. Neither half
+ * then matches the tag regexes, framing cannot strip them, and recalled memories get persisted --
+ * exactly the recall->retain feedback loop the stripping exists to prevent.
+ *
+ * Sanitizing first removes the possibility rather than trying to split around it: a block larger
+ * than the cap would otherwise force a choice between an oversized chunk and a leak. Callers MUST
+ * chunk this array and resolve chunk source messages from this SAME array, so the ranges recorded
+ * for reconstruction are offsets into the content that was actually stored.
+ */
+export function sanitizeRetentionMessages(messages: readonly HindsightMessage[]): HindsightMessage[] {
+	const sanitized: HindsightMessage[] = [];
+	for (const message of messages) {
+		const content = stripMemoryTags(message.content).trim();
+		if (!hasSubstantiveContent(content)) continue;
+		sanitized.push({ ...message, content });
+	}
+	return sanitized;
+}
+
 export function chunkRetentionMessages(messages: HindsightMessage[], maxChars: number): RetentionChunk[] {
 	if (messages.length === 0) return [];
 	const segments = segmentRetentionTurns(messages);
