@@ -662,7 +662,15 @@ export class MnemopiSessionState {
 				sourceId,
 				retainedThroughUserTurn,
 				options.extract,
-				{ chunkOf: sourceId, chunkIndex, chunkCount, ranges: chunk.ranges, batchStartUserTurn },
+				{
+					chunkOf: sourceId,
+					chunkIndex,
+					chunkCount,
+					ranges: chunk.ranges,
+					// Global, batching-invariant locator for this chunk.
+					turnNumber: batchStartUserTurn === undefined ? undefined : batchStartUserTurn + chunk.turnNumber,
+					pieceIndex: chunk.pieceIndex,
+				},
 			);
 		});
 	}
@@ -686,7 +694,8 @@ export class MnemopiSessionState {
 			chunkIndex: number;
 			chunkCount: number;
 			ranges: readonly RetentionChunkRange[];
-			batchStartUserTurn?: number;
+			turnNumber?: number;
+			pieceIndex: number;
 		},
 	): void {
 		const { transcript, messageCount } = prepareRetentionTranscript(transcriptMessages, true);
@@ -708,16 +717,19 @@ export class MnemopiSessionState {
 			// `maybeRetainOnAgentEnd` builds that from `Date.now()`, so keying on it would give the
 			// same chunk a fresh id every pass and re-retention after a cursor reset would insert
 			// duplicates -- with duplicate facts, annotations and embeddings -- where content dedupe
-			// used to collapse them. The batch start cursor is needed too, because `chunkIndex`
-			// restarts at 0 each call: without it, the same text recurring at the same index in a
-			// LATER batch would take the update path and quietly replace the earlier occurrence.
+			// used to collapse them. The locator is the chunk's GLOBAL turn number plus its ordinal
+			// within that turn, never the batch-global `chunkIndex`: that index depends on how the
+			// pass happened to be sliced, so retaining turns 1 and 2 in separate passes and then
+			// replaying both in one pass gave turn 2 a different id and duplicated it. Turns are
+			// segmented before packing and packed independently, so this locator is identical
+			// however the same turns are batched.
 			...(chunkMeta === undefined
 				? {}
 				: {
 						memoryId: chunkMemoryId(
 							transcript,
-							`${this.sessionId}@${chunkMeta.batchStartUserTurn ?? "na"}`,
-							chunkMeta.chunkIndex,
+							`${this.sessionId}@t${chunkMeta.turnNumber ?? "na"}`,
+							chunkMeta.pieceIndex,
 						),
 					}),
 			metadata: {

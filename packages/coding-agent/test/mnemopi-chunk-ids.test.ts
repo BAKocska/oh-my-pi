@@ -339,3 +339,41 @@ describe("retention chunk ids separate batches but not replays", () => {
 		await state.dispose({ consolidate: false });
 	});
 });
+
+/**
+ * Regression: a chunk's identity must not depend on how a retention pass was SLICED. Keying on the
+ * batch-global `chunkIndex` meant retaining turns 1 and 2 in separate passes and then replaying both
+ * in one pass gave turn 2 a different id (index 0 alone vs index 1 in the merged pass), so the
+ * replay inserted a duplicate. The locator is the chunk's global turn number plus its ordinal within
+ * that turn, which is identical however the same turns are batched.
+ */
+describe("retention chunk ids survive re-partitioning", () => {
+	beforeEach(() => {
+		resetSettingsForTest();
+	});
+
+	it("adds nothing when incrementally retained turns are replayed as one window", async () => {
+		const config = makeMnemopiConfig({ retentionChunkMaxChars: 900, bank: "chunk-partition-bank" });
+		const state = registerMnemopiState(config, { sessionId: "chunk-partition-session", cwd: "/work/partition" });
+		const turn1 = { role: "user", content: `first turn ${"a".repeat(400)}` };
+		const turn2 = { role: "user", content: `second turn ${"b".repeat(400)}` };
+		const count = () =>
+			(
+				state.memory.beam.db
+					.prepare("SELECT COUNT(*) AS n FROM working_memory WHERE session_id = 'chunk-partition-bank'")
+					.get() as { n: number }
+			).n;
+
+		// Retained one turn at a time, as periodic retention does.
+		await state.retainMessages([turn1], "session-1756300000000", { retainedThroughUserTurn: 1 });
+		await state.retainMessages([turn2], "session-1756300001111", { retainedThroughUserTurn: 2 });
+		const afterIncremental = count();
+		expect(afterIncremental).toBe(2);
+
+		// Same turns, one pass -- a different partition of identical content.
+		await state.retainMessages([turn1, turn2], "session-1756300002222", { retainedThroughUserTurn: 2 });
+		expect(count()).toBe(afterIncremental);
+
+		await state.dispose({ consolidate: false });
+	});
+});

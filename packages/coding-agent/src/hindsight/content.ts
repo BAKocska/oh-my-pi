@@ -298,6 +298,19 @@ export interface RetentionChunk {
 	readonly ranges: readonly RetentionChunkRange[];
 	/** Cumulative user turns fully persisted by the chunks emitted so far (including this one). */
 	readonly completedUserTurns: number;
+	/**
+	 * Which user-bounded turn this chunk came from, 1-based within the input; `0` for a leading
+	 * preamble that precedes the first user message.
+	 *
+	 * Together with {@link pieceIndex} this locates a chunk in a way that does NOT depend on how the
+	 * input was batched. Turns are segmented before packing and each turn is packed independently, so
+	 * the same turn yields the same pieces whether it arrives alone or alongside its neighbours --
+	 * which is what lets a caller derive a stable identity for a chunk across differently sliced
+	 * retention passes. A plain index over the returned array does not have that property.
+	 */
+	readonly turnNumber: number;
+	/** Ordinal of this piece within its own turn, 0-based. */
+	readonly pieceIndex: number;
 }
 
 /** Synthetic frame role for a chunk that merges multiple original messages (spanning more
@@ -501,7 +514,13 @@ export function chunkRetentionMessages(messages: HindsightMessage[], maxChars: n
 		pieces.forEach((piece, pieceIndex) => {
 			const isFinalPiece = pieceIndex === lastPieceIndex;
 			const completedUserTurns = isFinalPiece && segment.turnNumber > 0 ? segment.turnNumber : cumulativeCompleted;
-			chunks.push({ messages: piece.messages, ranges: piece.ranges, completedUserTurns });
+			chunks.push({
+				messages: piece.messages,
+				ranges: piece.ranges,
+				completedUserTurns,
+				turnNumber: segment.turnNumber,
+				pieceIndex,
+			});
 		});
 		if (segment.turnNumber > 0) cumulativeCompleted = segment.turnNumber;
 	}
@@ -514,7 +533,12 @@ export function chunkRetentionMessages(messages: HindsightMessage[], maxChars: n
  * given chunk stored its pieces as separate own-role messages or merged under one `"turn"`
  * block.
  */
-export function reconstructRetentionChunks(chunks: readonly RetentionChunk[]): HindsightMessage[] {
+export function reconstructRetentionChunks(
+	// Only the framed text and its ranges are read. Narrowed deliberately: reconstruction also runs
+	// over chunks rebuilt from STORED rows, where a chunk's turn locator is not persisted and cannot
+	// be supplied honestly.
+	chunks: readonly Pick<RetentionChunk, "messages" | "ranges">[],
+): HindsightMessage[] {
 	const contentPartsByIndex = new Map<number, string[]>();
 	const roleByIndex = new Map<number, string>();
 	for (const chunk of chunks) {

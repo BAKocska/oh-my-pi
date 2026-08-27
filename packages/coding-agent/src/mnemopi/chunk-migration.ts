@@ -622,10 +622,10 @@ export function validateWorkingMemoryChunkMigration(dbPath: string, sourceId: st
 				 ORDER BY CAST(json_extract(metadata_json, '$.chunk_index') AS INTEGER)`,
 			)
 			.all(sourceId);
-		const chunks: RetentionChunk[] = children.map(child => {
+		const chunks = children.map(child => {
 			const messages = parseStoredTranscriptLosslessly(child.content) ?? [];
 			const metadata = JSON.parse(child.metadata_json) as { ranges?: RetentionChunkRange[] };
-			return { messages, ranges: metadata.ranges ?? [], completedUserTurns: 0 };
+			return { messages, ranges: metadata.ranges ?? [] };
 		});
 		const reconstructed = reconstructRetentionChunks(chunks);
 		const reconstructedTranscript = prepareRetentionTranscript(reconstructed, true).transcript ?? "";
