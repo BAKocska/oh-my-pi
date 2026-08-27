@@ -172,6 +172,38 @@ function invalidateCaches(beam: BeamMemoryState): void {
 	cache.polyphonicEngine?.invalidateDictionary?.();
 }
 
+/**
+ * Existing row with this exact id in the current session, if any.
+ *
+ * Used when the caller supplies an explicit `memoryId`. Such a caller owns identity itself, so a
+ * rerun with the same id must UPDATE its row, while two of its rows that merely share content stay
+ * distinct.
+ */
+function findById(beam: BeamMemoryState, memoryId: string, content: string): string | null {
+	using statement = beam.db.prepare("SELECT id, session_id, content FROM working_memory WHERE id = ? LIMIT 1");
+	const row = statement.get(memoryId) as { id: string; session_id: string; content: string } | null;
+	if (row === null) return null;
+	// `id` is a global PRIMARY KEY, so a caller-supplied id that belongs to another session would
+	// otherwise fall through to an INSERT and surface as a raw SQLite constraint error.
+	if (row.session_id !== beam.sessionId) {
+		throw new Error(
+			`mnemopi: memoryId ${memoryId} already exists in session ${row.session_id}; ids are globally unique`,
+		);
+	}
+	// An explicit id addresses one row, and every derived artifact -- embeddings, extracted facts,
+	// annotations, episodic gists -- was produced from that row's content. Rewriting the content in
+	// place would strand all of it (and `scheduleEmbedding` only re-runs when embed_text differs
+	// from content), so a content change under a reused id is refused rather than half-applied.
+	// Callers that derive the id from the content, as the chunk paths do via `stableMemoryId`, get a
+	// new id automatically when the content changes and never hit this.
+	if (row.content !== content) {
+		throw new Error(
+			`mnemopi: memoryId ${memoryId} already stores different content; derive a new id instead of rewriting it`,
+		);
+	}
+	return row.id;
+}
+
 function findDuplicate(beam: BeamMemoryState, content: string): string | null {
 	using statement = beam.db.prepare("SELECT id FROM working_memory WHERE content = ? AND session_id = ? LIMIT 1");
 	const row = statement.get(content, beam.sessionId) as { id: string } | null;
@@ -472,7 +504,14 @@ export function remember(beam: BeamMemoryState, content: string, options: StoreR
 	const metadata = options.metadata ?? null;
 	const embedText = embeddingText(content, options);
 
-	const existingId = findDuplicate(beam, content);
+	// Content dedupe is a convenience for callers that do not track identity. A caller that DOES
+	// supply an id owns identity itself, and two of its rows may legitimately hold identical
+	// content -- byte-identical retention chunks of one oversized message, distinguished only by
+	// `chunk_index` and `ranges`, are the motivating case. Collapsing those kept only the FIRST
+	// chunk's metadata and lost every later chunk's ranges, making exact reconstruction impossible.
+	// So an explicit id is matched by id, never by content.
+	const explicitId = options.memoryId ?? options.memory_id ?? null;
+	const existingId = explicitId !== null ? findById(beam, explicitId, content) : findDuplicate(beam, content);
 	if (existingId !== null) {
 		beam.db.run(
 			`
@@ -487,6 +526,7 @@ export function remember(beam: BeamMemoryState, content: string, options: StoreR
 					veracity = CASE WHEN ? != 'unknown' THEN ? ELSE veracity END,
 					trust_tier = COALESCE(?, trust_tier),
 					embed_text = COALESCE(?, embed_text),
+					metadata_json = COALESCE(?, metadata_json),
 					consolidated_at = NULL
 				WHERE id = ? AND session_id = ?
 			`,
@@ -504,6 +544,10 @@ export function remember(beam: BeamMemoryState, content: string, options: StoreR
 				veracity,
 				trustTier,
 				storedEmbeddingText(content, embedText),
+				// Only an explicit-id update refreshes metadata. On the content-dedupe path the caller
+				// did not address a specific row, and overwriting whatever metadata that row already
+				// carries would be a behaviour change unrelated to this fix; NULL keeps it via COALESCE.
+				explicitId !== null ? metadataJson(metadata) : null,
 				existingId,
 				beam.sessionId,
 			],
@@ -520,7 +564,7 @@ export function remember(beam: BeamMemoryState, content: string, options: StoreR
 		return existingId;
 	}
 
-	const memoryId = options.memoryId ?? options.memory_id ?? generateId(content, new Date(timestamp));
+	const memoryId = explicitId ?? generateId(content, new Date(timestamp));
 	beam.db.run(
 		`
 			INSERT INTO working_memory

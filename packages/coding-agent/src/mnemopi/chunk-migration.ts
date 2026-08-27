@@ -464,7 +464,7 @@ function migrateOneRow(db: Database, row: WorkingMemoryRow, maxChars: number): n
 		chunks.forEach((chunk: RetentionChunk, chunkIndex: number) => {
 			const { transcript, messageCount } = prepareRetentionTranscript(chunk.messages, true);
 			if (transcript === null) return;
-			const childId = stableMemoryId(transcript, `${id}:chunk:${chunkIndex}`);
+			const childId = chunkMemoryId(transcript, id, chunkIndex);
 			childRows.push({ id: childId, content: transcript });
 			const metadata: Record<string, unknown> = {
 				...parentMetadata,
@@ -589,6 +589,25 @@ export function migrateWorkingMemoryChunks(options: MigrateWorkingMemoryChunksOp
  * `ranges` metadata via {@link reconstructRetentionChunks} and hashes that, and counts any
  * remaining reference-table rows that still point at the stale (pre-migration) id.
  */
+/**
+ * Stable id for one retention chunk.
+ *
+ * A chunk's identity is its POSITION in the parent, not merely its text: two chunks of one
+ * oversized message can be byte-identical (a long repeated payload), and the store's content
+ * dedupe would otherwise collapse them into a single row carrying only the first chunk's ranges.
+ *
+ * Hashing the content together with `(parentId, chunkIndex)` gives three properties the chunk paths
+ * both need: distinct ids for identical text at different positions, the same id when the same
+ * chunk is written again (so a rerun updates in place), and a NEW id if the text at a position ever
+ * changes -- which matters because the store refuses to rewrite content under an existing id, since
+ * every derived artifact was produced from the old text.
+ *
+ * Exported and shared so live retention and the migration cannot drift apart on chunk identity.
+ */
+export function chunkMemoryId(transcript: string, parentId: string, chunkIndex: number): string {
+	return stableMemoryId(transcript, `${parentId}:chunk:${chunkIndex}`);
+}
+
 export function validateWorkingMemoryChunkMigration(dbPath: string, sourceId: string): ChunkMigrationValidation {
 	const db = new Database(dbPath, { readonly: true });
 	try {

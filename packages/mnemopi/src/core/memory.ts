@@ -57,6 +57,12 @@ export interface MnemopiOptions {
 }
 
 export interface RememberInput extends MemoryInput {
+	/**
+	 * Address a specific row instead of deduping by content. Used by the retention chunk paths,
+	 * where two chunks can be byte-identical yet must remain separate rows.
+	 */
+	readonly memoryId?: string | null;
+	readonly memory_id?: string | null;
 	readonly extract?: boolean;
 	readonly extractEntities?: boolean;
 	readonly extract_entities?: boolean;
@@ -71,6 +77,12 @@ export interface RememberInput extends MemoryInput {
 }
 
 export interface RememberFacadeOptions {
+	/**
+	 * Address a specific row instead of deduping by content. Used by the retention chunk paths,
+	 * where two chunks can be byte-identical yet must remain separate rows.
+	 */
+	readonly memoryId?: string | null;
+	readonly memory_id?: string | null;
 	readonly source?: string | null;
 	readonly importance?: number;
 	readonly metadata?: Metadata | null;
@@ -149,6 +161,7 @@ type ModuleRememberOptions = RememberFacadeOptions & { readonly bank?: string | 
 type ModuleRecallOptions = RecallFacadeOptions & { readonly bank?: string | null };
 type ModuleRecallEnhancedOptions = RecallFacadeOptions & RecallEnhancedOptions & { readonly bank?: string | null };
 type FacadeRememberOptions = {
+	memoryId?: string;
 	source: string;
 	importance: number;
 	metadata: Metadata | null;
@@ -301,6 +314,11 @@ function toRememberOptions(input: string | RememberInput, options: RememberFacad
 		memoryType: options.memoryType ?? options.memory_type ?? memory?.memoryType ?? memory?.memory_type ?? undefined,
 	};
 	if (timestamp !== null && timestamp !== undefined) rememberOptions.timestamp = timestamp;
+	// Forwarded explicitly: this function rebuilds the option bag field by field, so anything not
+	// named here is silently dropped. The chunk paths address a specific row by id, and losing the id
+	// here sent them back through content dedupe -- collapsing byte-identical chunks into one row.
+	const memoryId = options.memoryId ?? options.memory_id ?? memory?.memoryId ?? memory?.memory_id ?? null;
+	if (memoryId !== null) rememberOptions.memoryId = memoryId;
 	return rememberOptions;
 }
 

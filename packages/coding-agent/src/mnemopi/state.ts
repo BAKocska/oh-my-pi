@@ -18,6 +18,7 @@ import {
 } from "../hindsight/content";
 import { extractMessages } from "../hindsight/transcript";
 import type { AgentSession, AgentSessionEvent } from "../session/agent-session";
+import { chunkMemoryId } from "./chunk-migration";
 import type { MnemopiBackendConfig, MnemopiScoping } from "./config";
 import { mnemopiEmbedClient } from "./embed-client";
 
@@ -29,6 +30,7 @@ import { mnemopiEmbedClient } from "./embed-client";
  */
 export {
 	type ChunkMigrationValidation,
+	chunkMemoryId,
 	type MigrateWorkingMemoryChunksOptions,
 	type MigrationReceipt,
 	migrateWorkingMemoryChunks,
@@ -671,6 +673,14 @@ export class MnemopiSessionState {
 		this.rememberInScope(transcript, {
 			source: "coding-agent-transcript",
 			importance: 0.65,
+			// A chunk's identity is its POSITION in the parent, not merely its text. Two chunks of one
+			// oversized message can be byte-identical (a long repeated payload); without an explicit
+			// id the store's content dedupe collapsed them, the later chunk updated the earlier row,
+			// and only the first chunk's ranges survived. The derivation is the same one
+			// `chunk-migration.ts` already uses for migrated children, so the live and migration paths
+			// agree on a chunk's id, a rerun is idempotent, and a content change yields a new id
+			// instead of trying to rewrite a row whose derived artifacts came from the old text.
+			...(chunkMeta === undefined ? {} : { memoryId: chunkMemoryId(transcript, sourceId, chunkMeta.chunkIndex) }),
 			metadata: {
 				session_id: this.sessionId,
 				source_id: sourceId,
