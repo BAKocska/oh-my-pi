@@ -292,3 +292,50 @@ describe("retention cursor stays in one turn space", () => {
 		await state.dispose({ consolidate: false });
 	});
 });
+
+/**
+ * Regression: `chunkIndex` restarts at 0 on every `retainMessages()` call, so keying chunk identity
+ * on session + index alone made two DIFFERENT batches collide whenever the same text recurred at the
+ * same batch-local index -- and because an explicit id bypasses content dedupe, the later batch took
+ * the update path and quietly replaced the earlier occurrence's ranges. The id therefore also
+ * carries the batch's start cursor: stable when a window is replayed, distinct between batches.
+ *
+ * The start cursor rather than the end cursor because it identifies the batch's SPAN rather than its
+ * endpoint. On the production call paths the two are equivalent -- two batches share an end cursor
+ * only when no new user turn arrived between them, which means either a replay (where colliding is
+ * the point) or an assistant-only batch, whose framing differs so its text cannot collide -- so this
+ * test deliberately does not claim to distinguish them.
+ */
+describe("retention chunk ids separate batches but not replays", () => {
+	beforeEach(() => {
+		resetSettingsForTest();
+	});
+
+	it("keeps two batches of identical text apart and stays idempotent on replay", async () => {
+		const config = makeMnemopiConfig({ retentionChunkMaxChars: 500, bank: "chunk-batch-bank" });
+		const state = registerMnemopiState(config, { sessionId: "chunk-batch-session", cwd: "/work/batch" });
+		const messages = [{ role: "user", content: "z".repeat(3000) }];
+		const count = () =>
+			(
+				state.memory.beam.db
+					.prepare("SELECT COUNT(*) AS n FROM working_memory WHERE session_id = 'chunk-batch-bank'")
+					.get() as { n: number }
+			).n;
+
+		// Batch 1 covers up to turn 1.
+		await state.retainMessages(messages, "session-1756300000000", { retainedThroughUserTurn: 1 });
+		const afterFirst = count();
+		expect(afterFirst).toBeGreaterThan(1);
+
+		// Batch 2 is a LATER window that happens to hold identical text: distinct rows.
+		await state.retainMessages(messages, "session-1756300001111", { retainedThroughUserTurn: 2 });
+		expect(count()).toBe(afterFirst * 2);
+
+		// Replaying either batch under a fresh volatile sourceId adds nothing.
+		await state.retainMessages(messages, "session-1756300002222", { retainedThroughUserTurn: 1 });
+		await state.retainMessages(messages, "session-1756300003333", { retainedThroughUserTurn: 2 });
+		expect(count()).toBe(afterFirst * 2);
+
+		await state.dispose({ consolidate: false });
+	});
+});

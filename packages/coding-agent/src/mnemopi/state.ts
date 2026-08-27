@@ -638,6 +638,14 @@ export class MnemopiSessionState {
 		if (chunks.length === 0) return;
 		const totalUserTurns = sanitized.filter(message => message.role === "user").length;
 		const chunkCount = chunks.length;
+		// Where this batch STARTS in the session's turn sequence. `chunkIndex` restarts at 0 every
+		// call, so session + index alone would give two different batches the same id whenever the
+		// same text recurs at the same batch-local index -- and the explicit-id path would then update
+		// the earlier occurrence instead of storing the new one. The start cursor is stable when the
+		// same window is replayed (same input, same arithmetic) and advances between batches, which
+		// is exactly the distinction the id needs.
+		const batchStartUserTurn =
+			options.retainedThroughUserTurn === undefined ? undefined : options.retainedThroughUserTurn - totalUserTurns;
 		chunks.forEach((chunk, chunkIndex) => {
 			// Crash-safe per-chunk cursor: the final input cursor minus the turns this whole
 			// call covers, plus however many of them THIS chunk has fully persisted so far.
@@ -654,7 +662,7 @@ export class MnemopiSessionState {
 				sourceId,
 				retainedThroughUserTurn,
 				options.extract,
-				{ chunkOf: sourceId, chunkIndex, chunkCount, ranges: chunk.ranges },
+				{ chunkOf: sourceId, chunkIndex, chunkCount, ranges: chunk.ranges, batchStartUserTurn },
 			);
 		});
 	}
@@ -678,6 +686,7 @@ export class MnemopiSessionState {
 			chunkIndex: number;
 			chunkCount: number;
 			ranges: readonly RetentionChunkRange[];
+			batchStartUserTurn?: number;
 		},
 	): void {
 		const { transcript, messageCount } = prepareRetentionTranscript(transcriptMessages, true);
@@ -695,14 +704,22 @@ export class MnemopiSessionState {
 			// `chunk-migration.ts` already uses for migrated children, so a content change yields a new
 			// id instead of trying to rewrite a row whose derived artifacts came from the old text.
 			//
-			// Keyed on the SESSION, never on `sourceId`: `maybeRetainOnAgentEnd` builds that from
-			// `Date.now()`, so keying on it would give the same chunk a fresh id on every pass and
-			// re-retention after a cursor reset would insert duplicate rows -- with duplicate facts,
-			// annotations and embeddings -- where content dedupe used to collapse them. Session plus
-			// chunk position plus content is stable across passes, so a replay updates in place.
+			// Keyed on session + batch start + chunk index, never on `sourceId`:
+			// `maybeRetainOnAgentEnd` builds that from `Date.now()`, so keying on it would give the
+			// same chunk a fresh id every pass and re-retention after a cursor reset would insert
+			// duplicates -- with duplicate facts, annotations and embeddings -- where content dedupe
+			// used to collapse them. The batch start cursor is needed too, because `chunkIndex`
+			// restarts at 0 each call: without it, the same text recurring at the same index in a
+			// LATER batch would take the update path and quietly replace the earlier occurrence.
 			...(chunkMeta === undefined
 				? {}
-				: { memoryId: chunkMemoryId(transcript, this.sessionId, chunkMeta.chunkIndex) }),
+				: {
+						memoryId: chunkMemoryId(
+							transcript,
+							`${this.sessionId}@${chunkMeta.batchStartUserTurn ?? "na"}`,
+							chunkMeta.chunkIndex,
+						),
+					}),
 			metadata: {
 				session_id: this.sessionId,
 				source_id: sourceId,
