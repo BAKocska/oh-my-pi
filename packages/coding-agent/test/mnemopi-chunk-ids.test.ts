@@ -171,10 +171,12 @@ describe("retention chunking never persists recalled memory blocks", () => {
 
 	it("strips a <memories> block that would straddle a chunk boundary", async () => {
 		const secret = "RECALLED-MEMORY-CANARY";
-		// Offsets chosen so a chunk boundary lands INSIDE the block. This matters: a block that
-		// happens to sit wholly within one chunk is stripped correctly by framing, so an arbitrary
-		// payload can make this test silently vacuous.
-		const content = `${"a".repeat(240)}<memories>\n- ${secret}\n</memories>${"b".repeat(600)}`;
+		// Offsets chosen so a chunk boundary lands inside the block but AFTER the canary, so the
+		// canary survives intact in one chunk. Two subtleties make an arbitrary payload useless
+		// here: a block that happens to sit wholly inside one chunk is stripped correctly and the
+		// test passes without the fix, and a boundary that cuts through the canary itself leaves no
+		// contiguous copy of it, so only the tag assertions can ever fail.
+		const content = `${"a".repeat(191)}<memories>\n- ${secret}\n- ${"c".repeat(120)}\n</memories>${"b".repeat(600)}`;
 		const state = registerMnemopiState(makeMnemopiConfig({ retentionChunkMaxChars: 300, bank: "chunk-leak-bank" }), {
 			sessionId: "chunk-leak-session",
 			cwd: "/work/chunk-leak",
@@ -200,6 +202,92 @@ describe("retention chunking never persists recalled memory blocks", () => {
 		// The surrounding conversation is still retained -- stripping must not eat the turn.
 		expect(stored).toContain("aaaa");
 		expect(stored).toContain("bbbb");
+
+		await state.dispose({ consolidate: false });
+	});
+});
+
+/**
+ * Regression: chunk ids must not depend on the caller's `sourceId`. `maybeRetainOnAgentEnd` builds
+ * that from `Date.now()`, so keying chunk identity on it gave the same chunk a fresh id on every
+ * pass; after a cursor reset (`setSessionId`) the replay then INSERTED duplicate rows -- with
+ * duplicate facts, annotations and embeddings -- where content dedupe used to collapse them.
+ */
+describe("retention chunk ids are stable across passes", () => {
+	beforeEach(() => {
+		resetSettingsForTest();
+	});
+
+	it("reuses the same rows when the same chunks arrive under a different sourceId", async () => {
+		// `maybeRetainOnAgentEnd` passes `${sessionId}-${Date.now()}`, so consecutive passes present
+		// the SAME chunks under different sourceIds. Driving retainMessages directly reproduces that
+		// without depending on wall-clock timing.
+		const config = makeMnemopiConfig({ retentionChunkMaxChars: 500, bank: "chunk-replay-bank" });
+		const state = registerMnemopiState(config, { sessionId: "chunk-replay-session", cwd: "/work/replay" });
+		const messages = [{ role: "user", content: "y".repeat(3000) }];
+		const count = () =>
+			(
+				state.memory.beam.db
+					.prepare("SELECT COUNT(*) AS n FROM working_memory WHERE session_id = 'chunk-replay-bank'")
+					.get() as { n: number }
+			).n;
+
+		await state.retainMessages(messages, "session-1756300000000", { retainedThroughUserTurn: 1 });
+		const first = count();
+		expect(first).toBeGreaterThan(1);
+
+		await state.retainMessages(messages, "session-1756300009999", { retainedThroughUserTurn: 1 });
+		expect(count()).toBe(first);
+
+		await state.dispose({ consolidate: false });
+	});
+});
+
+/**
+ * Regression: the per-chunk crash-safe cursor must be computed in ONE turn space. Sanitizing inside
+ * retainMessages() while `userTurns` and sliceUnretainedMessages() still counted the raw array
+ * subtracted a sanitized batch total from a raw cumulative count, so every non-final chunk's cursor
+ * was inflated by each dropped user turn after it. A chunk holding the first ~276 chars of a turn
+ * then claimed that whole turn was retained, and a crash mid-loop left the remainder permanently
+ * unretained: the restored cursor skipped past it.
+ */
+describe("retention cursor stays in one turn space", () => {
+	beforeEach(() => {
+		resetSettingsForTest();
+	});
+
+	it("does not mark a partially stored turn as retained when a later turn is dropped", async () => {
+		// The trailing user turn is nothing but a recalled memory block, so sanitization drops it.
+		const state = registerMnemopiState(
+			makeMnemopiConfig({ retentionChunkMaxChars: 300, bank: "chunk-cursor-bank" }),
+			{
+				sessionId: "chunk-cursor-session",
+				cwd: "/work/cursor",
+				entries: () => [
+					{ type: "message", message: { role: "user", content: "q".repeat(900) } },
+					{ type: "message", message: { role: "assistant", content: "an answer that is long enough to keep" } },
+					{ type: "message", message: { role: "user", content: "<memories>\n- recalled thing\n</memories>" } },
+				],
+			},
+		);
+
+		await state.forceRetainCurrentSession();
+
+		const rows = state.memory.beam.db
+			.prepare(`
+				SELECT json_extract(metadata_json, '$.chunk_index') AS idx,
+				       json_extract(metadata_json, '$.retained_through_user_turn') AS cursor
+				FROM working_memory
+				WHERE session_id = 'chunk-cursor-bank'
+				  AND json_extract(metadata_json, '$.chunk_index') IS NOT NULL
+				ORDER BY idx
+			`)
+			.all() as { idx: number; cursor: number }[];
+
+		expect(rows.length).toBeGreaterThan(1);
+		// Only the LAST chunk may report the turn as fully retained.
+		for (const row of rows.slice(0, -1)) expect(row.cursor).toBe(0);
+		expect(rows.at(-1)?.cursor).toBe(1);
 
 		await state.dispose({ consolidate: false });
 	});

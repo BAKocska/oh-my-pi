@@ -120,7 +120,12 @@ describe("embedding commit invalidates the recall cache", () => {
 		try {
 			remember(beam, "a memory whose embedding batch returns nothing", { source: "conversation" });
 			counts.invalidations = 0;
-			await Promise.all([...(beam.pendingExtractions ?? [])]);
+			const pending = [...(beam.pendingExtractions ?? [])];
+			// Anti-vacuity: without this the assertions below also hold when no batch was ever
+			// scheduled -- e.g. under MNEMOPI_NO_EMBEDDINGS, where embed() returns null and
+			// runEmbedding returns before reaching its insert loop.
+			expect(pending).toHaveLength(1);
+			await Promise.all(pending);
 			const stored = beam.db.prepare("SELECT COUNT(*) AS count FROM memory_embeddings").get() as {
 				count: number;
 			};

@@ -539,7 +539,12 @@ export class MnemopiSessionState {
 
 	async maybeRetainOnAgentEnd(_messages: AgentMessage[]): Promise<void> {
 		if (!this.config.autoRetain || this.aliasOf) return;
-		const flat = extractMessages(this.session.sessionManager);
+		// Sanitized HERE, not just inside retainMessages(): `userTurns` and sliceUnretainedMessages()
+		// are computed from this array, and the per-chunk crash-safe cursor subtracts a batch total
+		// from it. Counting turns in one space and chunking in another inflates every non-final
+		// chunk's cursor whenever a turn is dropped (one wholly made of a recalled memory block),
+		// which on resume would skip the unretained remainder of a half-written turn.
+		const flat = sanitizeRetentionMessages(extractMessages(this.session.sessionManager));
 		this.#restoreRetainedTurnCursor();
 		const userTurns = flat.filter(message => message.role === "user").length;
 		if (userTurns - this.lastRetainedTurn < this.config.retainEveryNTurns) return;
@@ -600,7 +605,9 @@ export class MnemopiSessionState {
 
 	async forceRetainCurrentSession(options: { extract?: boolean } = {}): Promise<void> {
 		if (this.aliasOf) return;
-		const flat = extractMessages(this.session.sessionManager);
+		// Sanitized here for the same reason as in maybeRetainOnAgentEnd: turn counting, slicing,
+		// chunking and the per-chunk cursor must all be done in one turn space.
+		const flat = sanitizeRetentionMessages(extractMessages(this.session.sessionManager));
 		this.#restoreRetainedTurnCursor();
 		const userTurns = flat.filter(message => message.role === "user").length;
 		await this.retainMessages(sliceUnretainedMessages(flat, this.lastRetainedTurn), this.sessionId, {
@@ -685,10 +692,17 @@ export class MnemopiSessionState {
 			// oversized message can be byte-identical (a long repeated payload); without an explicit
 			// id the store's content dedupe collapsed them, the later chunk updated the earlier row,
 			// and only the first chunk's ranges survived. The derivation is the same one
-			// `chunk-migration.ts` already uses for migrated children, so the live and migration paths
-			// agree on a chunk's id, a rerun is idempotent, and a content change yields a new id
-			// instead of trying to rewrite a row whose derived artifacts came from the old text.
-			...(chunkMeta === undefined ? {} : { memoryId: chunkMemoryId(transcript, sourceId, chunkMeta.chunkIndex) }),
+			// `chunk-migration.ts` already uses for migrated children, so a content change yields a new
+			// id instead of trying to rewrite a row whose derived artifacts came from the old text.
+			//
+			// Keyed on the SESSION, never on `sourceId`: `maybeRetainOnAgentEnd` builds that from
+			// `Date.now()`, so keying on it would give the same chunk a fresh id on every pass and
+			// re-retention after a cursor reset would insert duplicate rows -- with duplicate facts,
+			// annotations and embeddings -- where content dedupe used to collapse them. Session plus
+			// chunk position plus content is stable across passes, so a replay updates in place.
+			...(chunkMeta === undefined
+				? {}
+				: { memoryId: chunkMemoryId(transcript, this.sessionId, chunkMeta.chunkIndex) }),
 			metadata: {
 				session_id: this.sessionId,
 				source_id: sourceId,

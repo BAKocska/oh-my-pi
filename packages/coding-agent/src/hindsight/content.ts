@@ -449,19 +449,6 @@ function packRetentionAtoms(atoms: readonly RetentionAtom[], maxChars: number): 
 }
 
 /**
- * Split `messages` into {@link RetentionChunk}s whose framed transcript
- * (`prepareRetentionTranscript(chunk.messages, true).transcript`) never exceeds `maxChars`.
- *
- * Turns (a `user` message through the messages preceding the next `user` message) are kept
- * together whenever they fit; a turn too large for its own frames is merged into one block,
- * and a turn too large even merged is packed message-by-message, splitting any individually
- * oversized message at Unicode-code-point-safe boundaries. Content is never truncated or
- * dropped — only re-chunked — and `completedUserTurns` only advances past a turn once every
- * message (and, for a split message, every piece) belonging to it has been emitted.
- *
- * Throws when `maxChars` cannot hold even one framed code point for some message's role.
- */
-/**
  * Strip memory tags from every message BEFORE chunking, mirroring what the per-message framing in
  * `prepareRetentionTranscript()` does (strip, trim, drop anything non-substantive).
  *
@@ -485,6 +472,19 @@ export function sanitizeRetentionMessages(messages: readonly HindsightMessage[])
 	return sanitized;
 }
 
+/**
+ * Split `messages` into {@link RetentionChunk}s whose framed transcript
+ * (`prepareRetentionTranscript(chunk.messages, true).transcript`) never exceeds `maxChars`.
+ *
+ * Turns (a `user` message through the messages preceding the next `user` message) are kept
+ * together whenever they fit; a turn too large for its own frames is merged into one block,
+ * and a turn too large even merged is packed message-by-message, splitting any individually
+ * oversized message at Unicode-code-point-safe boundaries. Content is never truncated or
+ * dropped — only re-chunked — and `completedUserTurns` only advances past a turn once every
+ * message (and, for a split message, every piece) belonging to it has been emitted.
+ *
+ * Throws when `maxChars` cannot hold even one framed code point for some message's role.
+ */
 export function chunkRetentionMessages(messages: HindsightMessage[], maxChars: number): RetentionChunk[] {
 	if (messages.length === 0) return [];
 	const segments = segmentRetentionTurns(messages);
