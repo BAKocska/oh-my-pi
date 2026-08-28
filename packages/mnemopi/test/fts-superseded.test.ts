@@ -123,6 +123,33 @@ describe("recall FTS path excludes superseded rows from candidate slots", () => 
 	});
 });
 
+describe("recall FTS path excludes EXPIRED rows from candidate slots", () => {
+	test("linear recall returns the live row even when valid_until-retired rows flood the inner pool", async () => {
+		const db = new Database(":memory:");
+		initBeam(db);
+		const beam = makeBeam(db);
+		seedWorking(db, "live0000000000bb", "corridor deployment runbook lives here");
+		// Same flood as the superseded case, but retired the way `memory_edit invalidate` actually
+		// does it: `valid_until` in the past, `superseded_by` left NULL. This drives `recall()`, the
+		// production lexical path; the helpers-level test alone would stay green if `ftsRows` in
+		// recall.ts regressed, because those helpers have no production callers.
+		const past = new Date(Date.now() - 60_000).toISOString();
+		for (let index = 0; index < 55; index++) {
+			const id = `gone${String(index).padStart(12, "0")}`;
+			seedWorking(db, id, "corridor corridor corridor deployment deployment runbook runbook details");
+			db.run("UPDATE working_memory SET valid_until = ? WHERE id = ?", [past, id]);
+		}
+		const supersededCount = (
+			db.prepare("SELECT COUNT(*) AS n FROM working_memory WHERE superseded_by IS NOT NULL").get() as { n: number }
+		).n;
+		expect(supersededCount).toBe(0);
+
+		const results = await recall(beam, "corridor deployment runbook", 1, {});
+		expect(results.map(row => row.id)).toEqual(["live0000000000bb"]);
+		db.close();
+	});
+});
+
 describe("cjk fallback excludes superseded rows", () => {
 	test("k=1 returns the live row when a superseded row matches more query characters", () => {
 		const db = new Database(":memory:");
