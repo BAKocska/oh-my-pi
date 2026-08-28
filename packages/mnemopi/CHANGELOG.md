@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- Fixed superseded working-memory rows occupying FTS candidate slots: because the fixed-size candidate window was filled before visibility was applied, a query whose top lexical matches were superseded could return fewer rows than requested, or none, while valid older rows existed. Superseded rows are now excluded in the candidate queries themselves.
+- Fixed retired working-memory rows occupying FTS candidate slots: because the fixed-size candidate window was filled before visibility was applied, a query whose top lexical matches were retired could return fewer rows than requested, or none, while valid rows existed. The candidate queries now apply the same visibility predicate as the rest of recall — excluding both superseded rows and rows past their `valid_until`, which is the shape an invalidation without a replacement id produces — and probe by key rather than materializing the live-row set.
 
 ## [18.0.0] - 2026-08-22
 
