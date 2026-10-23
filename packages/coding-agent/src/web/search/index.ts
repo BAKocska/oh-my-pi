@@ -110,6 +110,23 @@ function formatForLLM(response: SearchResponse, notes: readonly string[] = []): 
 	return parts.join("\n");
 }
 
+/**
+ * Note naming the candidates that failed before `served` answered. Without it a
+ * fallback engine's results read as the preferred provider's, e.g. web pages
+ * standing in for an X search.
+ */
+function fallbackNotes(
+	failures: readonly { provider: { id: string; label: string }; error: unknown }[],
+	served: { label: string },
+): string[] {
+	if (failures.length === 0) return [];
+	const failed = failures.map(
+		failure =>
+			`${failure.provider.label} failed (${formatSearchProviderFailure(failure.error, failure.provider).replace(/\.$/, "")})`,
+	);
+	return [`answered by ${served.label} after ${failed.join(" and ")}`];
+}
+
 function hasRenderableSearchContent(response: SearchResponse): boolean {
 	if (response.answer?.trim()) return true;
 	if (response.sources.length > 0) return true;
@@ -293,7 +310,7 @@ async function executeSearch(
 				throw new SearchProviderError(provider.id, `${provider.label} returned no renderable search content.`, 204);
 			}
 
-			const text = formatForLLM(finalResponse, constraintNotes);
+			const text = formatForLLM(finalResponse, [...fallbackNotes(failures, provider), ...constraintNotes]);
 
 			return {
 				content: [{ type: "text" as const, text }],

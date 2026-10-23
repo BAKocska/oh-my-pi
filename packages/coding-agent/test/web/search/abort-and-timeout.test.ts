@@ -312,6 +312,7 @@ describe("executeSearch abort propagation", () => {
 		expect(context.getProvider).toHaveBeenCalledTimes(1);
 		expect(context.getProvider).toHaveBeenCalledWith("exa");
 		expect(fallbackSearch).not.toHaveBeenCalled();
+		expect(result.content[0]?.text).not.toContain("Note: answered by");
 	});
 
 	it("advances through retry.fallbackChains.web after the preferred candidate fails", async () => {
@@ -331,6 +332,9 @@ describe("executeSearch abort propagation", () => {
 		expect(result.details.response.provider).toBe("brave");
 		expect(context.getProvider).toHaveBeenCalledTimes(2);
 		expect(fallbackSearch).toHaveBeenCalledTimes(1);
+		expect(result.content[0]?.text).toStartWith(
+			"Note: answered by brave after exa failed (Preferred provider failed)\n",
+		);
 	});
 
 	it("treats a request model override as a single explicit candidate", async () => {
