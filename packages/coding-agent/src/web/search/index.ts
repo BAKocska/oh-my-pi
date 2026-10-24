@@ -27,6 +27,7 @@ import {
 	getGroundedSearchProvider,
 	getSearchProvider,
 	type SearchProvider,
+	type SearchProviderFailure,
 } from "./provider";
 import { rankXAIProviders, targetsX, xaiModelChain, xSearchAvailable } from "./providers/xai";
 import { applyQueryConstraints, parseSearchQuery } from "./query";
@@ -115,10 +116,7 @@ function formatForLLM(response: SearchResponse, notes: readonly string[] = []): 
  * fallback engine's results read as the preferred provider's, e.g. web pages
  * standing in for an X search.
  */
-function fallbackNotes(
-	failures: readonly { provider: { id: string; label: string }; error: unknown }[],
-	served: { label: string },
-): string[] {
+function fallbackNotes(failures: readonly SearchProviderFailure[], served: { label: string }): string[] {
 	if (failures.length === 0) return [];
 	const failed = failures.map(
 		failure =>
@@ -225,7 +223,7 @@ async function executeSearch(
 		// Preserve the default for one-shot callers that do not initialize Settings.
 	}
 
-	const failures: Array<{ provider: { id: string; label: string }; error: unknown }> = [];
+	const failures: SearchProviderFailure[] = [];
 	let availableProviderCount = 0;
 	let lastProvider: { id: string; label: string } | undefined;
 	let failedResponseProvider: SearchResponse["provider"] = "none";
