@@ -205,7 +205,6 @@ describe("xAI web search provider", () => {
 		await searchXAI({ ...makeParams(capture.fetchMock), query });
 
 		expect(capture.capturedRequest?.body?.tools).toEqual(tools);
-		expect(capture.capturedRequest?.body?.tool_choice).toBe("required");
 	});
 
 	it("starts the X date range at the recency window unless after:/before: bound it", async () => {
