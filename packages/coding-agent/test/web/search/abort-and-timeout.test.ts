@@ -337,6 +337,28 @@ describe("executeSearch abort propagation", () => {
 		);
 	});
 
+	it("flattens and caps a long multi-line failure reason in the fallback note", async () => {
+		const htmlPage = `<html>\n<head><title>502 Bad Gateway</title></head>\n<body>${"x".repeat(2_000)}</body>\n</html>`;
+		const context = await configureProviderChain([
+			fakeProvider("searxng", async () => {
+				throw new SearchProviderError("searxng", `SearXNG API error (502): ${htmlPage}`, 502);
+			}),
+			fakeProvider("brave", async () => ({
+				provider: "brave",
+				sources: [{ title: "Fallback result", url: "https://example.com/fallback" }],
+			})),
+		]);
+
+		const result = await runSearchQuery({ query: "anything" }, context);
+
+		const [note = ""] = (result.content[0]?.text ?? "").split("\n");
+		expect(note).toStartWith(
+			"Note: answered by brave after searxng failed (SearXNG API error (502): <html> <head><title>502 Bad Gateway",
+		);
+		expect(note).toEndWith("…)");
+		expect(note.length).toBeLessThan(320);
+	});
+
 	it("treats a request model override as a single explicit candidate", async () => {
 		const fallbackSearch = vi.fn(async (): Promise<SearchResponse> => ({
 			provider: "brave",
